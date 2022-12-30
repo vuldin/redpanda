@@ -5,10 +5,9 @@ go 1.16
 require (
 	cloud.google.com/go v0.46.3
 	github.com/AlecAivazis/survey/v2 v2.3.2
-	github.com/BurntSushi/toml v0.3.1
 	github.com/Microsoft/go-winio v0.4.12 // indirect
 	github.com/avast/retry-go v2.6.0+incompatible
-	github.com/aws/aws-sdk-go v1.25.43
+	github.com/aws/aws-sdk-go v1.33.0
 	github.com/beevik/ntp v0.3.0
 	github.com/cespare/xxhash v1.1.0
 	github.com/cockroachdb/crlfmt v0.0.0-20210128092314-b3eff0b87c79
