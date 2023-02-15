@@ -10,7 +10,7 @@ require (
 	github.com/jetstack/cert-manager v1.2.0
 	github.com/onsi/ginkgo v1.16.4
 	github.com/onsi/gomega v1.15.0
-	github.com/prometheus/client_golang v1.11.0
+	github.com/prometheus/client_golang v1.11.1
 	github.com/spf13/afero v1.6.0
 	github.com/stretchr/testify v1.7.0
 	github.com/vectorizedio/redpanda/src/go/rpk v0.0.0-00010101000000-000000000000
