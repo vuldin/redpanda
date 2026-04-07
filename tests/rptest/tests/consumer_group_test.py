@@ -599,11 +599,15 @@ class ConsumerGroupTest(RedpandaTest):
                     raise
 
             async def create_groups(r):
+                # Limit to 10 concurrent connections to avoid overwhelming the broker
+                sem = asyncio.Semaphore(10)
+
+                async def throttled(i):
+                    async with sem:
+                        await asyncio.to_thread(poll_once, i + r * groups_in_round)
+
                 results = await asyncio.gather(
-                    *[
-                        asyncio.to_thread(poll_once, i + r * groups_in_round)
-                        for i in range(groups_in_round)
-                    ],
+                    *[throttled(i) for i in range(groups_in_round)],
                     return_exceptions=True,
                 )
                 for res in results:
