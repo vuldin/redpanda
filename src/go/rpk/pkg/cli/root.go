@@ -23,6 +23,7 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/acl"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/ai"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/benchmark"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/check"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/cloud"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/cluster"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/connect"
@@ -128,6 +129,7 @@ Use --print-tree to emit the full command tree as JSON.`,
 		cloud.NewCommand(fs, p, osExec),
 		cluster.NewCommand(fs, p),
 		container.NewCommand(fs, p),
+		check.NewCommand(fs, p, osExec),
 		connect.NewCommand(fs, p, osExec),
 		profile.NewCommand(fs, p),
 		debug.NewCommand(fs, p),
