@@ -890,7 +890,8 @@ void application::check_environment() {
       = "/proc/sys/crypto/fips_enabled";
     syschecks::systemd_message("checking environment (CPU, Mem)").get();
     syschecks::cpu();
-    syschecks::memory(config::node().developer_mode());
+    syschecks::memory(
+      memory_groups().total_reserved_memory(), config::node().developer_mode());
     if (config::shard_local_cfg().code_hugepages_enabled()) {
         syschecks::promote_code_to_hugepages();
     }
