@@ -1409,15 +1409,15 @@ class PandaProxyInvalidInputsTest(PandaProxyEndpoints):
                 "zIGFyZSBtdWNoIG1vcmUgdGhhbiB0aGUgcmVxdWVzdCBpdHNlbGYuIE1lc3NhZ2UgRW5kLg=="
             )
         }
-        values = [value for _ in range(50000)]
+        values = [value for _ in range(120000)]
         data = {"records": values}
         data_json = json.dumps(data)
 
         # With 512Mb available per core and the various memory reservations
         # (compaction, cloud topics, partitions), the available memory for
-        # the kafka services is well under 90Mb. We want to ensure that
+        # the kafka services should be under ~180Mb. We want to ensure that
         # this request is larger than this.
-        memory_limit = 90.4 * 1024 * 1024
+        memory_limit = 180 * 1024 * 1024
         assert len(data_json) > memory_limit, (
             f"Expected request larger than {memory_limit}b. Got {len(data_json)}b, instead"
         )

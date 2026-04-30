@@ -1574,8 +1574,7 @@ configuration::configuration()
       "storage_compaction_key_map_memory_limit_percent",
       "Limit on `storage_compaction_key_map_memory`, expressed as a percentage "
       "of memory per shard, that bounds the amount of memory used by "
-      "compaction key-offset maps. Memory per shard is computed after "
-      "`data_transforms_per_core_memory_reservation`, and only applies when "
+      "compaction key-offset maps. Only applies when "
       "`log_compaction_use_sliding_window` is set to `true`.",
       {.needs_restart = needs_restart::yes,
        .example = "12.0",

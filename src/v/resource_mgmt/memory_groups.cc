@@ -20,6 +20,10 @@
 
 namespace {
 
+bool sliding_window_compaction_enabled() {
+    return config::shard_local_cfg().log_compaction_use_sliding_window();
+}
+
 bool wasm_enabled() {
     return config::shard_local_cfg().data_transforms_enabled.value()
            && !config::node().emergency_disable_data_transforms.value();
@@ -79,6 +83,7 @@ system_memory_groups::system_memory_groups(
   compaction_memory_reservation compaction,
   cloud_topics_compaction_memory_reservation cloud_topics_compaction,
   cloud_topics_reconciler_memory_reservation cloud_topics_reconciler,
+  data_transforms_memory_reservation data_transforms,
   bool wasm_enabled,
   bool datalake_enabled,
   bool cloud_storage_enabled,
@@ -89,6 +94,7 @@ system_memory_groups::system_memory_groups(
       cloud_topics_compaction.reserved_bytes())
   , _cloud_topics_reconciler_reserved_memory(
       cloud_topics_reconciler.reserved_bytes())
+  , _data_transforms_reserved_memory(data_transforms.reserved_bytes())
   , _partitions_reserved_memory(
       partitions.reserved_bytes(total_available_memory))
   , _total_available_memory(total_available_memory)
@@ -153,7 +159,7 @@ size_t system_memory_groups::total_reserved_memory() const {
     return _compaction_reserved_memory
            + _cloud_topics_compaction_reserved_memory
            + _cloud_topics_reconciler_reserved_memory
-           + _partitions_reserved_memory;
+           + _data_transforms_reserved_memory + _partitions_reserved_memory;
 }
 
 double system_memory_groups::partitions_max_memory_share() const {
@@ -193,7 +199,8 @@ void system_memory_groups::log_memory_group_allocations(seastar::logger& log) {
       "{}, total memory minus pre-share reservations: {}, chunk cache: {}, "
       "kafka: {}, rpc: {}, recovery: {}, tiered storage: {}, admin: {}, data "
       "transforms: {}, compaction: {}, cloud topics compaction: {}, cloud "
-      "topics reconciler: {}, datalake: {}, partitions: {}",
+      "topics reconciler: {}, data transforms reserved: {}, datalake: {}, "
+      "partitions: {}",
       human::bytes(ss::memory::stats().total_memory()),
       human::bytes(total_reserved_memory()),
       human::bytes(total_memory()),
@@ -207,6 +214,7 @@ void system_memory_groups::log_memory_group_allocations(seastar::logger& log) {
       human::bytes(compaction_reserved_memory()),
       human::bytes(cloud_topics_compaction_reserved_memory()),
       human::bytes(cloud_topics_reconciler_reserved_memory()),
+      human::bytes(data_transforms_reserved_memory()),
       human::bytes(datalake_max_memory()),
       human::bytes(partitions_max_memory()));
 }
@@ -221,35 +229,44 @@ system_memory_groups& memory_groups() {
     if (groups) {
         return *groups;
     }
-    size_t total = ss::memory::stats().total_memory();
-    bool wasm = wasm_enabled();
+
+    auto sliding_window_compaction = sliding_window_compaction_enabled();
+    auto wasm = wasm_enabled();
+    auto datalake = datalake_enabled();
+    auto cloud_storage = cloud_storage_enabled();
+
     const auto& cfg = config::shard_local_cfg();
-    if (wasm) {
-        size_t wasm_memory_reservation
-          = cfg.data_transforms_per_core_memory_reservation.value();
-        total -= wasm_memory_reservation;
-    }
-    compaction_memory_reservation compaction;
-    if (cfg.log_compaction_use_sliding_window.value()) {
-        compaction.max_bytes = cfg.storage_compaction_key_map_memory.value();
-        compaction.max_limit_pct
-          = cfg.storage_compaction_key_map_memory_limit_percent.value();
-    }
+    compaction_memory_reservation compaction{
+      .max_bytes = sliding_window_compaction
+                     ? cfg.storage_compaction_key_map_memory.value()
+                     : 0,
+      .max_limit_pct
+      = cfg.storage_compaction_key_map_memory_limit_percent.value()};
+    data_transforms_memory_reservation data_transforms{
+      .max_bytes = wasm
+                     ? cfg.data_transforms_per_core_memory_reservation.value()
+                     : 0};
     cloud_topics_compaction_memory_reservation cloud_topics_compaction{
-      .max_bytes = cfg.cloud_topics_compaction_key_map_memory.value()};
+      .max_bytes = cloud_storage
+                     ? cfg.cloud_topics_compaction_key_map_memory.value()
+                         + cfg.cloud_topics_upload_part_size()
+                     : 0};
     cloud_topics_reconciler_memory_reservation cloud_topics_reconciler{
-      .max_bytes = cfg.cloud_topics_upload_part_size()
-                   * cfg.cloud_topics_reconciliation_parallelism()};
+      .max_bytes = cloud_storage
+                     ? cfg.cloud_topics_upload_part_size()
+                         * cfg.cloud_topics_reconciliation_parallelism()
+                     : 0};
     partitions_memory_reservation partitions{
       .max_limit_pct = cfg.topic_partitions_memory_allocation_percent()};
     groups.emplace(
-      total,
+      ss::memory::stats().total_memory(),
       compaction,
       cloud_topics_compaction,
       cloud_topics_reconciler,
+      data_transforms,
       wasm,
-      datalake_enabled(),
-      cloud_storage_enabled(),
+      datalake,
+      cloud_storage,
       partitions);
     return *groups;
 }
