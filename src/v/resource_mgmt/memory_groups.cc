@@ -187,14 +187,15 @@ size_t system_memory_groups::total_memory() const {
 }
 
 void system_memory_groups::log_memory_group_allocations(seastar::logger& log) {
-    log.info(
-      "Per shard memory group allocations: total memory: {}, "
-      "total memory minus pre-share reservations: {}, chunk cache: {}, kafka: "
-      "{}, rpc: {}, recovery: {}, "
-      "tiered storage: {}, admin: {}, data transforms: {}, compaction: {}, "
-      "cloud topics compaction: {}, cloud topics reconciler: {}, "
-      "datalake: {}, partitions: {}",
+    vlog(
+      log.info,
+      "Per shard memory group allocations: total memory: {}, reserved memory: "
+      "{}, total memory minus pre-share reservations: {}, chunk cache: {}, "
+      "kafka: {}, rpc: {}, recovery: {}, tiered storage: {}, admin: {}, data "
+      "transforms: {}, compaction: {}, cloud topics compaction: {}, cloud "
+      "topics reconciler: {}, datalake: {}, partitions: {}",
       human::bytes(ss::memory::stats().total_memory()),
+      human::bytes(total_reserved_memory()),
       human::bytes(total_memory()),
       human::bytes(chunk_cache_max_memory()),
       human::bytes(kafka_total_memory()),
