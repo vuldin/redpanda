@@ -123,6 +123,11 @@ public:
         return _cloud_topics_reconciler_reserved_memory;
     }
 
+    /// Sum of all per-shard memory reservations subtracted from the shard's
+    /// total before share-based allocation. This is the minimum per-shard
+    /// memory below which the share-based allocator has no memory to divide.
+    size_t total_reserved_memory() const;
+
     size_t datalake_max_memory() const;
 
     size_t cloud_topics_memory() const;
@@ -152,7 +157,7 @@ private:
     size_t _cloud_topics_compaction_reserved_memory;
     size_t _cloud_topics_reconciler_reserved_memory;
     size_t _partitions_reserved_memory;
-    size_t _total_system_memory;
+    size_t _total_available_memory;
     bool _wasm_enabled;
     bool _datalake_enabled;
     bool _cloud_storage_enabled;

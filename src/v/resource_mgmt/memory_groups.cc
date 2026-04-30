@@ -91,10 +91,7 @@ system_memory_groups::system_memory_groups(
       cloud_topics_reconciler.reserved_bytes())
   , _partitions_reserved_memory(
       partitions.reserved_bytes(total_available_memory))
-  , _total_system_memory(
-      total_available_memory - _compaction_reserved_memory
-      - _cloud_topics_compaction_reserved_memory
-      - _cloud_topics_reconciler_reserved_memory - _partitions_reserved_memory)
+  , _total_available_memory(total_available_memory)
   , _wasm_enabled(wasm_enabled)
   , _datalake_enabled(datalake_enabled)
   , _cloud_storage_enabled(cloud_storage_enabled) {}
@@ -152,6 +149,13 @@ size_t system_memory_groups::partitions_max_memory() const {
     return _partitions_reserved_memory;
 }
 
+size_t system_memory_groups::total_reserved_memory() const {
+    return _compaction_reserved_memory
+           + _cloud_topics_compaction_reserved_memory
+           + _cloud_topics_reconciler_reserved_memory
+           + _partitions_reserved_memory;
+}
+
 double system_memory_groups::partitions_max_memory_share() const {
     return _partitions_reserved_memory
            / static_cast<double>(ss::memory::stats().total_memory());
@@ -168,7 +172,18 @@ size_t system_memory_groups::subsystem_memory() const {
 }
 
 size_t system_memory_groups::total_memory() const {
-    return _total_system_memory;
+    size_t reserved_memory = total_reserved_memory();
+    size_t available_memory = _total_available_memory;
+    if (reserved_memory > available_memory) {
+        dassert(
+          false,
+          "Reserved memory {} is greater than the memory available to the "
+          "system {}",
+          human::bytes(reserved_memory),
+          human::bytes(available_memory));
+        return 0;
+    }
+    return available_memory - reserved_memory;
 }
 
 void system_memory_groups::log_memory_group_allocations(seastar::logger& log) {
