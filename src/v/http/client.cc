@@ -245,6 +245,7 @@ ss::future<reconnect_result_t> client::get_connected(
         if (_as != nullptr) {
             _as->check();
         }
+        bool connect_succeeded = false;
         // Reconnect attempts have to stop if:
         // - shutdown method was called
         // - abort was requested
@@ -258,12 +259,17 @@ ss::future<reconnect_result_t> client::get_connected(
             // this loop with the `stop` call.
             ss::gate::holder gg(_connect_gate);
             co_await connect(current + interval);
-            break;
+            connect_succeeded = true;
         } catch (const std::system_error& err) {
             vlog(ctxlog.trace, "connection refused {}", err);
         } catch (const ss::timed_out_error&) {
             vlog(ctxlog.trace, "connection timeout");
         }
+        // Checked on the success path too: shutdown_now() called while
+        // the connection was being established may have missed it (the
+        // socket is local to do_connect until the very end), so a
+        // successful connect must be dropped here instead of being
+        // handed back to the caller.
         if (_shutdown_as.abort_requested()) {
             vlog(
               ctxlog.debug,
@@ -274,6 +280,9 @@ ss::future<reconnect_result_t> client::get_connected(
                 shutdown();
             }
             co_return reconnect_result_t::timed_out;
+        }
+        if (connect_succeeded) {
+            break;
         }
         current = ss::lowres_clock::now();
         // Any TLS error have to be propagated because it's not
