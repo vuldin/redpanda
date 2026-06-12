@@ -204,6 +204,13 @@ base_transport::base_transport(configuration c, seastar::logger* log)
     }
 }
 
+ss::future<ss::connected_socket> base_transport::dial(
+  const unresolved_address& target, clock_type::time_point deadline) {
+    auto resolved_address = co_await net::resolve_dns(target);
+    vlog(_log->trace, "Resolved address {}", resolved_address);
+    co_return co_await connect_with_timeout(resolved_address, deadline, _log);
+}
+
 ss::future<> base_transport::do_connect(clock_type::time_point timeout) {
     // hold invariant of having an always valid dispatch gate
     // and make sure we don't have a live connection already
@@ -218,10 +225,7 @@ ss::future<> base_transport::do_connect(clock_type::time_point timeout) {
         reset_state();
         const auto& tcp_target = _proxy.has_value() ? _proxy->address
                                                     : server_address();
-        auto resolved_address = co_await net::resolve_dns(tcp_target);
-        vlog(_log->trace, "Resolved address {}", resolved_address);
-        ss::connected_socket fd = co_await connect_with_timeout(
-          resolved_address, timeout, _log);
+        ss::connected_socket fd = co_await dial(tcp_target, timeout);
 
         if (_proxy.has_value() && _proxy->credentials) {
             // https:// proxy: TLS-wrap to the proxy before CONNECT.
