@@ -36,6 +36,7 @@
 
 #include <chrono>
 #include <exception>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -114,6 +115,13 @@ public:
       const ss::abort_source* as,
       ss::shared_ptr<client_probe> probe,
       ss::lowres_clock::duration max_idle_time);
+
+    // Request and response streams and in-flight continuations hold
+    // back-pointers to the client.
+    client(const client&) = delete;
+    client& operator=(const client&) = delete;
+    client(client&&) = delete;
+    client& operator=(client&&) = delete;
 
     /// Stop must be called before destroying the client object.
     ss::future<> stop();
@@ -347,15 +355,16 @@ inline ss::future<> client::forward(client* client, BufferSeq&& seq) {
 /// Helper to close an http client after a function has been called on it.
 /// Modeled after ss::with_file
 template<typename Func>
-auto with_client(client&& cl, Func func) {
+auto with_client(std::unique_ptr<client> cl, Func func) {
     static_assert(
       std::is_nothrow_move_constructible_v<Func>,
       "Func's move constructor must not throw");
     return ss::do_with(
-      std::move(cl), [func = std::move(func)](client& cl) mutable {
-          return ss::futurize_invoke(func, cl).finally([&cl] {
-              return cl.stop().then([&cl] {
-                  cl.shutdown();
+      std::move(cl),
+      [func = std::move(func)](std::unique_ptr<client>& cl) mutable {
+          return ss::futurize_invoke(func, *cl).finally([&cl] {
+              return cl->stop().then([&cl] {
+                  cl->shutdown();
                   return ss::make_ready_future<>();
               });
           });

@@ -578,7 +578,8 @@ iobuf serialize_metrics_snapshot(
     return out;
 }
 
-ss::future<http::client> details::metrics_http_client::make_http_client() {
+ss::future<std::unique_ptr<http::client>>
+details::metrics_http_client::make_http_client() {
     net::base_transport::configuration client_configuration;
     client_configuration.server_addr = net::unresolved_address(
       ss::sstring(_conf.addr.host), _conf.addr.port);
@@ -600,7 +601,7 @@ ss::future<http::client> details::metrics_http_client::make_http_client() {
             std::move(builder), "metrics_reporter", "httpclient");
         client_configuration.tls_sni_hostname = _conf.addr.host;
     }
-    co_return http::client(client_configuration, _conf.as);
+    co_return std::make_unique<http::client>(client_configuration, _conf.as);
 }
 
 ss::future<>
