@@ -224,8 +224,9 @@ ss::future<client::request_response_t> client::make_request(
 
 ss::future<reconnect_result_t> client::get_connected(
   ss::lowres_clock::duration timeout, prefix_logger ctxlog) {
-    auto clear_shutdown_signal = ss::defer(
-      [this]() noexcept { _shutdown_now = false; });
+    // A fresh abort source so that a shutdown_now() from a previous
+    // connection attempt can't affect this one.
+    _shutdown_as = {};
     if (unlikely(_stopped)) {
         co_await ss::coroutine::return_exception(
           std::runtime_error("client is stopped"));
@@ -263,11 +264,7 @@ ss::future<reconnect_result_t> client::get_connected(
         } catch (const ss::timed_out_error&) {
             vlog(ctxlog.trace, "connection timeout");
         }
-        // on the off chance that shutdown_now flag got set outside this loop,
-        // we allow for one successful connect attempt. the alternative to this
-        // heuristic would be to add reset interfaces and plumb that down
-        // through the http client pool / storage client interfaces.
-        if (_shutdown_now) {
+        if (_shutdown_as.abort_requested()) {
             vlog(
               ctxlog.debug,
               "Stopping connect attempts due to shutdown request");
