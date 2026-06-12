@@ -120,7 +120,7 @@ void client::check() const {
 
 ss::future<client::request_response_t> client::make_request(
   client::request_header&& header, ss::lowres_clock::duration timeout) {
-    if (unlikely(_stopped)) {
+    if (unlikely(_connect_gate.is_closed())) {
         std::runtime_error err("client is stopped");
         return ss::make_exception_future<client::request_response_t>(err);
     }
@@ -227,7 +227,7 @@ ss::future<reconnect_result_t> client::get_connected(
     // A fresh abort source so that a shutdown_now() from a previous
     // connection attempt can't affect this one.
     _shutdown_as = {};
-    if (unlikely(_stopped)) {
+    if (unlikely(_connect_gate.is_closed())) {
         co_await ss::coroutine::return_exception(
           std::runtime_error("client is stopped"));
     }
@@ -294,13 +294,12 @@ ss::future<reconnect_result_t> client::get_connected(
 }
 
 ss::future<> client::stop() {
-    if (_stopped) {
+    if (_connect_gate.is_closed()) {
         // Prevent double call to stop() as constructs such as with_client()
         // will unconditionally call stop(), while exception handlers in this
         // file may also call stop()
         co_return;
     }
-    _stopped = true;
     co_await _connect_gate.close();
     // Can safely stop base_transport
     co_return co_await base_transport::stop();

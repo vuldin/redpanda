@@ -327,7 +327,6 @@ private:
     void check() const;
 
     prefix_logger _ctxlog;
-    bool _stopped{false};
     /// Recreated at the start of every connection attempt;
     /// shutdown_now() aborts it.
     ss::abort_source _shutdown_as;
