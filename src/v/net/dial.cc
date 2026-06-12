@@ -62,4 +62,9 @@ ss::future<ss::connected_socket> dial_single(
       });
 }
 
+std::exception_ptr dial_deadline_exceeded(const ss::socket_address& address) {
+    return std::make_exception_ptr(timed_out_error(
+      ssx::sformat("connection to {} - deadline exceeded", address)));
+}
+
 } // namespace net::detail
