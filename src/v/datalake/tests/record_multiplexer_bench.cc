@@ -399,7 +399,7 @@ public:
       , _schema_mgr(catalog, &_features)
       , _type_resolver(registry, _schema_cache, _resolved_type_cache)
       , _record_gen(&registry)
-      , _table_creator(_type_resolver, _schema_mgr) {
+      , _table_creator(_schema_mgr) {
         _features.testing_activate_all();
     }
 

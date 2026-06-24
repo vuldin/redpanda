@@ -497,7 +497,6 @@ coordinator::sync_ensure_table_exists(
                                .properties.schema_registry_context.value_or(
                                  pandaproxy::schema_registry::default_context)
                            : pandaproxy::schema_registry::default_context;
-
     auto res_fut = co_await ss::coroutine::as_future(do_ensure_table_exists(
       topic,
       topic_revision,

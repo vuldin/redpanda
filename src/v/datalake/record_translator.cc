@@ -125,28 +125,40 @@ record_type record_translator::build_type(
           = iceberg::string_type{};
     }
 
+    using value_layout = model::iceberg_mode::value_layout;
+
     std::optional<schema_identifier> val_id;
     if (val_type.has_value()) {
         val_id = val_type.value()->id;
         auto struct_type = std::get<iceberg::struct_type>(
           iceberg::make_copy(val_type.value()->type));
         relax_field_requirements(struct_type);
-        for (auto& field : struct_type.fields) {
-            if (field->name == rp_struct_name) {
-                // To avoid collisions, move user fields named "redpanda" into
-                // the nested "redpanda" system field.
-                auto& system_fields = rp_struct_type(ret_type);
-                // Use the next id of the system defaults.
-                system_fields.fields.emplace_back(
-                  iceberg::nested_field::create(
-                    rp_base_next_field_id,
-                    "data",
-                    field->required,
-                    std::move(field->type)));
-                continue;
+        switch (_val_cfg.layout) {
+        case value_layout::nested:
+            ret_type.fields.emplace_back(
+              iceberg::nested_field::create(
+                rp_base_next_field_id,
+                "value",
+                iceberg::field_required::no,
+                std::move(struct_type)));
+            break;
+        case value_layout::flat:
+            for (auto& field : struct_type.fields) {
+                if (field->name == rp_struct_name) {
+                    // To avoid collisions, move user fields named "redpanda"
+                    // into the nested "redpanda" system field.
+                    auto& system_fields = rp_struct_type(ret_type);
+                    system_fields.fields.emplace_back(
+                      iceberg::nested_field::create(
+                        rp_base_next_field_id,
+                        "data",
+                        field->required,
+                        std::move(field->type)));
+                    continue;
+                }
+                ret_type.fields.emplace_back(std::move(field));
             }
-            // Add the extra user-defined fields.
-            ret_type.fields.emplace_back(std::move(field));
+            break;
         }
     } else {
         iceberg::field_type val_field_type
@@ -254,20 +266,30 @@ record_translator::translate_data(
             co_return errc::translation_error;
         }
 
-        auto redpanda_field_idx = get_redpanda_idx(
-          std::get<iceberg::struct_type>(resolved.type));
-        // Unwrap the struct fields.
-        auto& val_struct = std::get<std::unique_ptr<iceberg::struct_value>>(
-          translated_val.value().value());
-        for (size_t i = 0; i < val_struct->fields.size(); ++i) {
-            auto& field = val_struct->fields[i];
-            if (redpanda_field_idx == i) {
-                // To avoid collisions, move user fields named "redpanda" into
-                // the nested "redpanda" system field.
-                rp_struct_value(ret_data).fields.emplace_back(std::move(field));
-                continue;
+        auto val_struct = std::move(
+          std::get<std::unique_ptr<iceberg::struct_value>>(
+            translated_val.value().value()));
+
+        using value_layout = model::iceberg_mode::value_layout;
+        switch (_val_cfg.layout) {
+        case value_layout::nested:
+            ret_data.fields.emplace_back(
+              std::make_optional<iceberg::value>(std::move(val_struct)));
+            break;
+        case value_layout::flat: {
+            auto redpanda_field_idx = get_redpanda_idx(
+              std::get<iceberg::struct_type>(resolved.type));
+            for (size_t i = 0; i < val_struct->fields.size(); ++i) {
+                auto& field = val_struct->fields[i];
+                if (redpanda_field_idx == i) {
+                    rp_struct_value(ret_data).fields.emplace_back(
+                      std::move(field));
+                    continue;
+                }
+                ret_data.fields.emplace_back(std::move(field));
             }
-            ret_data.fields.emplace_back(std::move(field));
+            break;
+        }
         }
     } else {
         if (parsable_val.has_value()) {

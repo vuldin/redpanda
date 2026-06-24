@@ -38,7 +38,7 @@ using namespace datalake;
 namespace {
 simple_schema_manager simple_schema_mgr(iceberg::uri("s3://bucket/test"));
 binary_type_resolver bin_resolver;
-direct_table_creator t_creator{bin_resolver, simple_schema_mgr};
+direct_table_creator t_creator{simple_schema_mgr};
 const model::ntp
   ntp(model::ns{"rp"}, model::topic{"t"}, model::partition_id{0});
 const model::revision_id rev{123};
@@ -256,7 +256,7 @@ public:
     RecordMultiplexerParquetTest()
       : schema_mgr(catalog, &features)
       , type_resolver(registry)
-      , t_creator(type_resolver, schema_mgr) {
+      , t_creator(schema_mgr) {
         features.testing_activate_all();
     }
 
