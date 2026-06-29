@@ -238,7 +238,7 @@ struct add_translated_data_files_request
 struct fetch_latest_translated_offset_reply
   : serde::envelope<
       fetch_latest_translated_offset_reply,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
     fetch_latest_translated_offset_reply() = default;
     explicit fetch_latest_translated_offset_reply(errc err)
@@ -249,6 +249,14 @@ struct fetch_latest_translated_offset_reply
       : last_added_offset(last_added)
       , last_iceberg_committed_offset(last_committed)
       , errc(errc::ok) {}
+    explicit fetch_latest_translated_offset_reply(
+      std::optional<kafka::offset> last_added,
+      std::optional<kafka::offset> last_committed,
+      bool backpressure)
+      : last_added_offset(last_added)
+      , last_iceberg_committed_offset(last_committed)
+      , errc(errc::ok)
+      , backpressure(backpressure) {}
 
     // The offset of the latest data file added to the coordinator.
     std::optional<kafka::offset> last_added_offset;
@@ -258,13 +266,23 @@ struct fetch_latest_translated_offset_reply
     // If not ok, the request processing has a problem.
     errc errc;
 
+    // The coordinator has too many pending files. The offsets above are still
+    // valid (and worth reporting as lag), but the translator should hold off on
+    // translating new data until the coordinator drains its backlog.
+    bool backpressure{false};
+
     fmt::iterator format_to(fmt::iterator it) const {
         return fmt::format_to(
-          it, "{{errc: {}, offset: {}}}", errc, last_added_offset);
+          it,
+          "{{errc: {}, offset: {}, backpressure: {}}}",
+          errc,
+          last_added_offset,
+          backpressure);
     }
 
     auto serde_fields() {
-        return std::tie(last_added_offset, errc, last_iceberg_committed_offset);
+        return std::tie(
+          last_added_offset, errc, last_iceberg_committed_offset, backpressure);
     }
 };
 
