@@ -46,6 +46,25 @@ full_sync_interval(const model::schema_registry_sync_config& cfg) {
 
 } // namespace
 
+ss::future<inventory> scan_destination_inventory(
+  schema::registry& destination,
+  ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope,
+  ss::abort_source& as) {
+    as.check();
+    auto versions = co_await destination.list_subject_versions(
+      std::move(in_scope), ppsr::include_deleted::yes);
+    inventory inv;
+    inv.all.reserve(versions.size());
+    for (const auto& sv : versions) {
+        auto node = ppsr::subject_version{sv.sub, sv.version};
+        if (sv.deleted == ppsr::is_deleted::no) {
+            inv.active.insert(node);
+        }
+        inv.all.insert(std::move(node));
+    }
+    co_return inv;
+}
+
 mirroring_task::mirroring_task(
   link* link,
   const model::metadata& link_metadata,

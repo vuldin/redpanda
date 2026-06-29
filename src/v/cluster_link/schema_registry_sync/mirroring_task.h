@@ -13,9 +13,31 @@
 
 #include "cluster_link/schema_registry_sync/source_reader.h"
 #include "cluster_link/task.h"
+#include "container/chunked_hash_map.h"
 #include "schema/registry.h"
 
+#include <seastar/core/abort_source.hh>
+#include <seastar/util/noncopyable_function.hh>
+
 namespace cluster_link::schema_registry_sync {
+
+/// A snapshot of the destination Schema Registry's in-scope (subject, version)
+/// nodes, retained for diffing against the source during reconciliation.
+struct inventory {
+    /// Non-deleted (subject, version) nodes.
+    chunked_hash_set<ppsr::subject_version> active;
+    /// Non-deleted and soft-deleted nodes; a superset of `active`.
+    chunked_hash_set<ppsr::subject_version> all;
+};
+
+/// Scans the destination registry for every in-scope (subject, version) node.
+/// A single include_deleted scan reports each version's soft-delete state, so
+/// `active` is the non-deleted subset of `all` from one snapshot. `in_scope`
+/// must be pure; it runs on each registry shard.
+ss::future<inventory> scan_destination_inventory(
+  schema::registry& destination,
+  ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope,
+  ss::abort_source& as);
 
 /// Shadows a source Schema Registry into the local (destination) Schema
 /// Registry. Runs on the shard leading `_schemas/0`, a cluster-wide singleton.
