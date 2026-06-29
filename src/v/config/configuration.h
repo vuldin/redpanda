@@ -682,6 +682,8 @@ struct configuration final : public config_store {
     property<bool> schema_registry_always_normalize;
     deprecated_property schema_registry_avro_use_named_references;
     property<bool> schema_registry_enable_qualified_subjects;
+    bounded_property<size_t> schema_registry_sync_memory_bytes;
+    bounded_property<size_t> schema_registry_sync_parallelism;
     property<std::optional<uint32_t>> pp_sr_smp_max_non_local_requests;
     bounded_property<size_t> max_in_flight_schema_registry_requests_per_shard;
     bounded_property<size_t> max_in_flight_pandaproxy_requests_per_shard;
