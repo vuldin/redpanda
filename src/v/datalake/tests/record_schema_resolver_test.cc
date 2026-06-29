@@ -611,8 +611,8 @@ public:
     ss::future<
       chunked_vector<pandaproxy::schema_registry::subject_version_deleted>>
     list_subject_versions(
-      std::function<bool(const pandaproxy::schema_registry::context_subject&)>
-        filter,
+      ss::noncopyable_function<
+        bool(const pandaproxy::schema_registry::context_subject&)> filter,
       pandaproxy::schema_registry::include_deleted inc_del) const override {
         return _registry.list_subject_versions(std::move(filter), inc_del);
     }

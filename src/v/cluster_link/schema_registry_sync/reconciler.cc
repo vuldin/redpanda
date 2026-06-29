@@ -74,7 +74,7 @@ void adjust_units(
 reconciler::reconciler(
   source_reader* source,
   schema::registry* destination,
-  std::function<bool(const ppsr::context_subject&)> in_scope,
+  ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope,
   limits lim)
   : _source(source)
   , _destination(destination)

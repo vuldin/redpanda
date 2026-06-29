@@ -14,8 +14,8 @@
 #include "schema/registry.h"
 
 #include <seastar/core/future.hh>
+#include <seastar/util/noncopyable_function.hh>
 
-#include <functional>
 #include <map>
 
 namespace schema {
@@ -67,8 +67,8 @@ public:
     ss::future<
       chunked_vector<pandaproxy::schema_registry::subject_version_deleted>>
     list_subject_versions(
-      std::function<bool(const pandaproxy::schema_registry::context_subject&)>
-        filter,
+      ss::noncopyable_function<
+        bool(const pandaproxy::schema_registry::context_subject&)> filter,
       pandaproxy::schema_registry::include_deleted inc_del) const override;
 
     ss::future<pandaproxy::schema_registry::context_schema_id> create_schema(

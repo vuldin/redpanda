@@ -23,9 +23,9 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/util/noncopyable_function.hh>
 
 #include <cstdint>
-#include <functional>
 
 namespace cluster_link::schema_registry_sync {
 
@@ -89,7 +89,7 @@ public:
     reconciler(
       source_reader* source,
       schema::registry* destination,
-      std::function<bool(const ppsr::context_subject&)> in_scope,
+      ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope,
       limits lim);
 
     /// Imports `work_set.upserts` referent-first.
@@ -176,7 +176,7 @@ private:
 
     source_reader* _source;
     schema::registry* _destination;
-    std::function<bool(const ppsr::context_subject&)> _in_scope;
+    ss::noncopyable_function<bool(const ppsr::context_subject&)> _in_scope;
     limits _limits;
 
     chunked_hash_set<ppsr::subject_version> _replicated;

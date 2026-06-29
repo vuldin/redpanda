@@ -24,8 +24,8 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/util/noncopyable_function.hh>
 
-#include <functional>
 #include <memory>
 #include <vector>
 
@@ -273,7 +273,7 @@ struct reconcile_harness {
     srs::reconciler::limits lim{.memory_bytes = 1u << 20, .parallelism = 1};
 
     srs::reconciler make(
-      std::function<bool(const ppsr::context_subject&)> in_scope =
+      ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope =
         [](const ppsr::context_subject&) { return true; }) {
         return srs::reconciler{&reader, &destination, std::move(in_scope), lim};
     }
@@ -325,7 +325,7 @@ public:
     }
     ss::future<chunked_vector<ppsr::subject_version_deleted>>
     list_subject_versions(
-      std::function<bool(const ppsr::context_subject&)> filter,
+      ss::noncopyable_function<bool(const ppsr::context_subject&)> filter,
       ppsr::include_deleted inc) const override {
         return _inner->list_subject_versions(std::move(filter), inc);
     }

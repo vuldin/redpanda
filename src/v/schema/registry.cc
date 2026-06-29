@@ -79,7 +79,7 @@ public:
     }
     ss::future<chunked_vector<ppsr::subject_version_deleted>>
     list_subject_versions(
-      std::function<bool(const ppsr::context_subject&)> filter,
+      ss::noncopyable_function<bool(const ppsr::context_subject&)> filter,
       ppsr::include_deleted inc_del) const override {
         auto [reader, _] = co_await service();
         co_return co_await reader->list_subject_versions(
@@ -213,7 +213,7 @@ public:
     }
     ss::future<chunked_vector<ppsr::subject_version_deleted>>
     list_subject_versions(
-      std::function<bool(const ppsr::context_subject&)>,
+      ss::noncopyable_function<bool(const ppsr::context_subject&)>,
       ppsr::include_deleted) const override {
         throw std::logic_error(
           "invalid attempted usage of a disabled schema registry");
