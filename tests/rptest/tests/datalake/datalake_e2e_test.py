@@ -973,6 +973,87 @@ class DatalakeE2ETests(RedpandaTest):
             assert rows[0][0] is True, f"key.id SQL check failed: {rows[0]}"
             assert rows[0][1] is True, f"name SQL check failed: {rows[0]}"
 
+    @cluster(num_nodes=3)
+    @matrix(
+        cloud_storage_type=supported_storage_types(),
+        query_engine=[QueryEngineType.SPARK],
+        catalog_type=[CatalogType.REST_JDBC],
+    )
+    def test_string_mode(self, cloud_storage_type, query_engine, catalog_type):
+        """Verify that key:mode=string and value:mode=string store plain
+        bytes as UTF-8 strings in Iceberg, sanitizing invalid sequences
+        to U+FFFD."""
+        topic = "string_mode"
+        table = f"redpanda.{topic}"
+        with DatalakeServices(
+            self.test_ctx,
+            redpanda=self.redpanda,
+            include_query_engines=[query_engine],
+            catalog_type=catalog_type,
+        ) as dl:
+            dl.create_iceberg_enabled_topic(
+                topic,
+                iceberg_mode="key:mode=string;value:mode=string",
+            )
+            producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+            # Record with valid UTF-8 key and value.
+            producer.produce(topic, key=b"hello-key", value=b"hello-val")
+            # Record with invalid UTF-8 in key and value (bare continuation
+            # byte) to verify sanitization fires end-to-end.
+            producer.produce(topic, key=b"\x80key", value=b"\x80val")
+            producer.flush()
+            dl.wait_for_translation(topic, msg_count=2)
+
+            # pyiceberg: verify types and values.
+            tbl = dl.catalog_client().load_table(("redpanda", topic))
+            pydict = tbl.scan().to_arrow().to_pydict()
+
+            # Key column should be string (not bytes).
+            keys = sorted([row["key"] for row in pydict["redpanda"]])
+            assert all(isinstance(k, str) for k in keys), (
+                f"expected string keys, got {keys!r}"
+            )
+            assert "hello-key" in keys, f"missing valid key: {keys!r}"
+            assert "\ufffdkey" in keys, f"missing sanitized key: {keys!r}"
+
+            # Value column should be string (not bytes).
+            vals = sorted(pydict["value"])
+            assert all(isinstance(v, str) for v in vals), (
+                f"expected string values, got {vals!r}"
+            )
+            assert "hello-val" in vals, f"missing valid value: {vals!r}"
+            assert "\ufffdval" in vals, f"missing sanitized value: {vals!r}"
+
+            # Verify table structure: key should be string, value should be
+            # string.
+            spark = dl.spark()
+            spark_expected_out = [
+                (
+                    "redpanda",
+                    "struct<partition:int,offset:bigint,timestamp:timestamp,"
+                    "headers:array<struct<key:string,value:binary>>,"
+                    "key:string,timestamp_type:int>",
+                    None,
+                ),
+                ("value", "string", None),
+                ("", "", ""),
+                ("# Partitioning", "", ""),
+                ("Part 0", "hours(redpanda.timestamp)", ""),
+            ]
+            spark_describe_out = spark.run_query_fetch_all(f"describe {table}")
+            assert spark_describe_out == spark_expected_out, str(spark_describe_out)
+
+            # SQL engine: verify key and value are queryable as string
+            # literals.
+            engine = dl.query_engine(query_engine)
+            rows = engine.run_query_fetch_all(
+                f"SELECT redpanda.key, value FROM {table}"
+                f" WHERE redpanda.key = 'hello-key'"
+            )
+            assert len(rows) == 1
+            assert rows[0][0] == "hello-key", f"key SQL check failed: {rows[0]}"
+            assert rows[0][1] == "hello-val", f"value SQL check failed: {rows[0]}"
+
     # Note: nothing unique about this test so run it with single catalog/query engine.
     @cluster(num_nodes=3)
     @matrix(
