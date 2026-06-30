@@ -337,6 +337,7 @@ metrics_reporter::build_metrics_snapshot() {
         if (!iceberg.is_disabled()) {
             switch (iceberg.value().mode) {
             case model::iceberg_mode::schema_mode::binary:
+            case model::iceberg_mode::schema_mode::string:
                 ++snapshot.topics_with_iceberg_kv;
                 break;
             case model::iceberg_mode::schema_mode::schema_id_prefix:

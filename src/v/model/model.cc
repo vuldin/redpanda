@@ -659,6 +659,8 @@ constexpr std::string_view to_sv(iceberg_mode::schema_mode m) {
         return "schema_id_prefix";
     case iceberg_mode::schema_mode::schema_latest:
         return "schema_latest";
+    case iceberg_mode::schema_mode::string:
+        return "string";
     }
     __builtin_unreachable();
 }
@@ -762,6 +764,7 @@ parse_extended_iceberg_mode(std::string_view str) {
                            .match("binary", sm::binary)
                            .match("schema_id_prefix", sm::schema_id_prefix)
                            .match("schema_latest", sm::schema_latest)
+                           .match("string", sm::string)
                            .default_match(std::nullopt);
                 if (!m) {
                     return std::unexpected(
@@ -851,6 +854,8 @@ void write_nested(iobuf& out, const iceberg_mode& m) {
             write(out, e.value.protobuf_name);
             write(out, e.value.subject);
             return;
+        case iceberg_mode::schema_mode::string:
+            break; // no legacy wire format; fall through to discriminant 4
         }
     }
     // Discriminant 4: the encoded form is the canonicalized config string.
@@ -913,7 +918,7 @@ fmt::iterator iceberg_mode::format_to(fmt::iterator it) const {
             return fmt::format_to(it, "key_value");
         case schema_mode::schema_id_prefix:
             return fmt::format_to(it, "value_schema_id_prefix");
-        case schema_mode::schema_latest:
+        case schema_mode::schema_latest: {
             it = fmt::format_to(it, "value_schema_latest");
             bool delim = false;
             auto emit = [&]() {
@@ -930,6 +935,9 @@ fmt::iterator iceberg_mode::format_to(fmt::iterator it) const {
                 it = fmt::format_to(it, "subject={}", e.value.subject);
             }
             return it;
+        }
+        case schema_mode::string:
+            break; // no legacy string format; fall through to section format
         }
     }
 
