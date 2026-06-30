@@ -81,7 +81,7 @@ mirroring_task::mirroring_task(
   , _config(link_metadata.configuration.schema_registry_sync_cfg.copy())
   , _destination(destination)
   , _source_factory(source_factory)
-  , _reader(_source_factory->create()) {}
+  , _reader(_source_factory->create(_config.api_mode())) {}
 
 void mirroring_task::update_config(const model::metadata& link_metadata) {
     _config = link_metadata.configuration.schema_registry_sync_cfg.copy();

@@ -12,6 +12,7 @@
 #pragma once
 
 #include "base/seastarx.h"
+#include "cluster_link/model/types.h"
 #include "container/chunked_vector.h"
 #include "pandaproxy/schema_registry/types.h"
 
@@ -85,7 +86,13 @@ public:
     source_reader_factory& operator=(source_reader_factory&&) = delete;
     virtual ~source_reader_factory() = default;
 
-    virtual std::unique_ptr<source_reader> create() = 0;
+    /// \param api_cfg the link's Schema-Registry-API shadowing config, or
+    ///        nullptr when the link is not in SR-API mode. The HTTP-backed
+    ///        reader builds its transport (source URL, auth, TLS) from it;
+    ///        readers that do not talk to a remote source ignore it.
+    virtual std::unique_ptr<source_reader> create(
+      const model::schema_registry_sync_config::shadow_schema_registry_api*
+        api_cfg) = 0;
 };
 
 } // namespace cluster_link::schema_registry_sync

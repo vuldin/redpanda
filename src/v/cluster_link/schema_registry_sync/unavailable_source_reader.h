@@ -38,7 +38,9 @@ public:
 
 class unavailable_source_reader_factory final : public source_reader_factory {
 public:
-    std::unique_ptr<source_reader> create() override;
+    std::unique_ptr<source_reader> create(
+      const model::schema_registry_sync_config::shadow_schema_registry_api*)
+      override;
 };
 
 } // namespace cluster_link::schema_registry_sync

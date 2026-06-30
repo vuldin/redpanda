@@ -252,7 +252,9 @@ public:
     explicit fake_source_reader_factory(fake_source_state* state)
       : _state(state) {}
 
-    std::unique_ptr<srs::source_reader> create() override {
+    std::unique_ptr<srs::source_reader> create(
+      const cluster_link::model::schema_registry_sync_config::
+        shadow_schema_registry_api*) override {
         return std::make_unique<fake_source_reader>(_state);
     }
 
