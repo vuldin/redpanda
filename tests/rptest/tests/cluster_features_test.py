@@ -1210,6 +1210,7 @@ PERTURB_ACKNOWLEDGED_FEATURES = frozenset(
     {
         # Cluster-linking features, out of scope for this single-cluster test.
         "shadow_link_sr_api_sync",
+        "shadow_link_role_sync",
         "batch_mirror_topic_status",
         # Iceberg extended-mode topic-config gate; exercising it needs Iceberg
         # topic setup orthogonal to the finalization behavior under test.
