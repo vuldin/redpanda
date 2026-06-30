@@ -8,6 +8,7 @@ redpanda_cc_gtest(
     ],
     cpu = 1,
     deps = [
+        ":sr_sync_test_fixtures",
         "//src/v/cluster:cluster_link_table",
         "//src/v/cluster:fwd",
         "//src/v/cluster_link:impl",

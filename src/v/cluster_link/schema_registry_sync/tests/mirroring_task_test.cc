@@ -11,6 +11,7 @@
 
 #include "cluster_link/schema_registry_sync/mirroring_task.h"
 #include "cluster_link/schema_registry_sync/source_reader.h"
+#include "cluster_link/schema_registry_sync/tests/sr_sync_test_fixtures.h"
 #include "cluster_link/tests/deps.h"
 #include "container/chunked_vector.h"
 #include "model/namespace.h"
@@ -20,29 +21,17 @@
 #include "test_utils/test.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/sleep.hh>
 
 using namespace std::chrono_literals;
 
 namespace cluster_link::tests {
-
-namespace ppsr = pandaproxy::schema_registry;
-namespace srs = cluster_link::schema_registry_sync;
 
 namespace {
 
 static const model::name_t link_name{"test_sr_link"};
 constexpr auto tail_interval = 1s;
 constexpr auto wait_interval = 5s;
-
-ppsr::stored_schema make_schema(
-  const ppsr::context_subject& sub, int32_t version, std::string_view def) {
-    return ppsr::stored_schema{
-      .schema = ppsr::
-        subject_schema{sub, ppsr::schema_definition{ppsr::schema_definition::raw_string{def}, ppsr::schema_type::avro}},
-      .version = ppsr::schema_version{version},
-      .id = ppsr::schema_id{version},
-      .deleted = ppsr::is_deleted::no};
-}
 
 model::metadata get_default_metadata() {
     model::metadata metadata{
@@ -61,98 +50,6 @@ model::metadata get_default_metadata() {
     metadata.configuration.schema_registry_sync_cfg.sync_mode = std::move(api);
     return metadata;
 }
-
-/// Test-owned source-of-truth that the injected source reader serves from.
-struct fake_source_state {
-    chunked_vector<ppsr::stored_schema> schemas;
-    std::optional<srs::source_error> list_subjects_error;
-
-    void add(const ppsr::context_subject& sub, int32_t version) {
-        schemas.push_back(
-          make_schema(sub, version, fmt::format("{{\"v\":{}}}", version)));
-    }
-};
-
-class fake_source_reader final : public srs::source_reader {
-public:
-    explicit fake_source_reader(fake_source_state* state)
-      : _state(state) {}
-
-    ss::future<srs::source_result<chunked_vector<ppsr::context>>>
-    list_contexts(ss::abort_source&) override {
-        chunked_hash_set<ppsr::context> seen;
-        chunked_vector<ppsr::context> contexts;
-        for (const auto& s : _state->schemas) {
-            if (seen.insert(s.schema.sub().ctx).second) {
-                contexts.push_back(s.schema.sub().ctx);
-            }
-        }
-        co_return contexts;
-    }
-
-    ss::future<srs::source_result<chunked_vector<ppsr::context_subject>>>
-    list_subjects(ppsr::context ctx, ss::abort_source&) override {
-        if (_state->list_subjects_error.has_value()) {
-            co_return std::unexpected(*_state->list_subjects_error);
-        }
-        chunked_hash_set<ppsr::context_subject> seen;
-        chunked_vector<ppsr::context_subject> subjects;
-        for (const auto& s : _state->schemas) {
-            if (s.schema.sub().ctx != ctx) {
-                continue;
-            }
-            if (seen.insert(s.schema.sub()).second) {
-                subjects.push_back(s.schema.sub());
-            }
-        }
-        co_return subjects;
-    }
-
-    ss::future<srs::source_result<chunked_vector<ppsr::schema_version>>>
-    list_subject_versions(
-      ppsr::context_subject sub,
-      ppsr::include_deleted,
-      ss::abort_source&) override {
-        chunked_vector<ppsr::schema_version> versions;
-        for (const auto& s : _state->schemas) {
-            if (s.schema.sub() == sub) {
-                versions.push_back(s.version);
-            }
-        }
-        co_return versions;
-    }
-
-    ss::future<srs::source_result<ppsr::stored_schema>> read_subject_version(
-      ppsr::context_subject sub,
-      ppsr::schema_version version,
-      ss::abort_source&) override {
-        for (const auto& s : _state->schemas) {
-            if (s.schema.sub() == sub && s.version == version) {
-                co_return s.share();
-            }
-        }
-        co_return std::unexpected(
-          srs::source_error{
-            .kind = srs::source_error_kind::operation_failed,
-            .message = "not found in source"});
-    }
-
-private:
-    fake_source_state* _state;
-};
-
-class fake_source_reader_factory final : public srs::source_reader_factory {
-public:
-    explicit fake_source_reader_factory(fake_source_state* state)
-      : _state(state) {}
-
-    std::unique_ptr<srs::source_reader> create() override {
-        return std::make_unique<fake_source_reader>(_state);
-    }
-
-private:
-    fake_source_state* _state;
-};
 
 } // namespace
 
