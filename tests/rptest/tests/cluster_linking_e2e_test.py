@@ -253,6 +253,47 @@ class ShadowLinkBasicTests(ShadowLinkTestBase):
             self.update_link(shadow_link=shadow_link, update_mask=update_mask)
 
     @cluster(num_nodes=6)
+    def test_role_sync_rejected_when_feature_inactive(self):
+        self.target_cluster_service.set_feature_active("shadow_link_role_sync", False)
+
+        role_sync_options = shadow_link_pb2.RoleSyncOptions(
+            role_name_filters=[
+                shadow_link_pb2.NameFilter(
+                    pattern_type=shadow_link_pb2.PATTERN_TYPE_PREFIX,
+                    filter_type=shadow_link_pb2.FILTER_TYPE_INCLUDE,
+                    name="app-",
+                )
+            ]
+        )
+
+        create_req = self.create_default_link_request(
+            link_name="role-sync-link",
+            mirror_all_acls=False,
+            mirror_all_groups=False,
+            mirror_all_topics=False,
+        )
+        create_req.shadow_link.configurations.role_sync_options.CopyFrom(
+            role_sync_options
+        )
+
+        with self._expect_connect_error(ConnectErrorCode.FAILED_PRECONDITION):
+            self.create_link_with_request(req=create_req)
+
+        shadow_link = self.create_link(
+            "test-link",
+            mirror_all_acls=False,
+            mirror_all_groups=False,
+            mirror_all_topics=False,
+        )
+        shadow_link.configurations.role_sync_options.CopyFrom(role_sync_options)
+        update_mask = google.protobuf.field_mask_pb2.FieldMask(
+            paths=["configurations.role_sync_options"]
+        )
+
+        with self._expect_connect_error(ConnectErrorCode.FAILED_PRECONDITION):
+            self.update_link(shadow_link=shadow_link, update_mask=update_mask)
+
+    @cluster(num_nodes=6)
     def test_create_default_link(self):
         """
         This test creates a Shadow Link with all default values and
