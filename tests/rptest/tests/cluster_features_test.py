@@ -11,12 +11,16 @@ import json
 import time
 
 from connectrpc.errors import ConnectError, ConnectErrorCode
+import google.protobuf.duration_pb2 as duration_pb2
 from ducktape.errors import TimeoutError as DucktapeTimeoutError
 from ducktape.mark import parametrize
 from ducktape.utils.util import wait_until
 from requests.exceptions import HTTPError
 
-from rptest.clients.admin.proto.redpanda.core.admin.v2 import features_pb2
+from rptest.clients.admin.proto.redpanda.core.admin.v2 import (
+    features_pb2,
+    shadow_link_pb2,
+)
 from rptest.clients.admin.v2 import Admin as AdminV2
 from rptest.clients.kafka_cli_tools import KafkaCliTools
 from rptest.clients.rpk import RpkException, RpkTool
@@ -1205,12 +1209,11 @@ PERTURB_RECORD_SIZE = 128
 # exercise or an explicit acknowledgement. Add a feature's name here when you
 # cover it or knowingly skip it; entries for features no longer gated by the
 # current upgrade are harmless extras, so no per-major pruning is needed.
-PERTURB_EXERCISED_FEATURES = frozenset({"tiered_cloud_topics"})
+PERTURB_EXERCISED_FEATURES = frozenset({"tiered_cloud_topics", "shadow_link_role_sync"})
 PERTURB_ACKNOWLEDGED_FEATURES = frozenset(
     {
         # Cluster-linking features, out of scope for this single-cluster test.
         "shadow_link_sr_api_sync",
-        "shadow_link_role_sync",
         "batch_mirror_topic_status",
         # Iceberg extended-mode topic-config gate; exercising it needs Iceberg
         # topic setup orthogonal to the finalization behavior under test.
@@ -1245,6 +1248,12 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
     is set on the old binary (which also exercises the backported knob) and the
     status/finalize RPCs are only invoked once every node is on HEAD.
     """
+
+    # DescribeRedpandaRoles occupies the reserved Redpanda Kafka API key range
+    # (>= 15000); api_versions.cc strips it from ApiVersions until the
+    # shadow_link_role_sync feature is active.
+    DESCRIBE_REDPANDA_ROLES_API_KEY = 15000
+    _ROLE_SYNC_GATE_MESSAGE = "Role sync cannot be configured"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, num_brokers=3, **kwargs)
@@ -1445,6 +1454,7 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
         if "upgraded" not in phase:
             return
         self._exercise_tiered_cloud_topics()
+        self._exercise_shadow_link_role_sync()
         # The other two v26.2-gated features are not exercised by this
         # single-cluster perturbation: shadow_link_sr_api_sync and
         # batch_mirror_topic_status are both cluster-linking features
@@ -1482,6 +1492,62 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
                 "creating a tiered_cloud topic should be gated while unfinalized"
             )
 
+    def _validate_role_sync_config(self):
+        """Issue a validate-only CreateShadowLink with role sync configured to
+        exercise the config gate (check_role_sync_supported in shadow_link.cc).
+        role_name_filters must be non-empty -- it's the field the gate keys on;
+        callers interpret the gated vs ungated result."""
+        client = self.admin_v2.shadow_link()
+        req = shadow_link_pb2.CreateShadowLinkRequest(validate_only=True)
+        req.shadow_link.name = "perturb-role-sync"
+        req.shadow_link.configurations.client_options.bootstrap_servers.extend(
+            self.redpanda.brokers().split(",")
+        )
+        req.shadow_link.configurations.role_sync_options.CopyFrom(
+            shadow_link_pb2.RoleSyncOptions(
+                interval=duration_pb2.Duration(seconds=1),
+                role_name_filters=[
+                    shadow_link_pb2.NameFilter(
+                        pattern_type=shadow_link_pb2.PATTERN_TYPE_PREFIX,
+                        filter_type=shadow_link_pb2.FILTER_TYPE_INCLUDE,
+                        name="synced-",
+                    )
+                ],
+            )
+        )
+        self._call_with_leader_retry(lambda: client.create_shadow_link(req=req))
+
+    def _exercise_shadow_link_role_sync(self):
+        """shadow_link_role_sync gates two surfaces while the upgrade is
+        unfinalized: the DescribeRedpandaRoles Kafka API is not advertised in
+        ApiVersions, and configuring role sync on a shadow link is refused.
+        Exercise both."""
+        assert self._feature_state("shadow_link_role_sync") == "unavailable", (
+            "shadow_link_role_sync should be unavailable while unfinalized"
+        )
+        # Wire gate: "(<key>)" appears only when the broker advertises the key,
+        # which the client renders as UNKNOWN(<key>); its absence means it's gated.
+        api_versions = KafkaCliTools(self.redpanda).get_api_versions()
+        assert f"({self.DESCRIBE_REDPANDA_ROLES_API_KEY})" not in api_versions, (
+            "DescribeRedpandaRoles should not be advertised while unfinalized:\n"
+            f"{api_versions}"
+        )
+        # Config gate: confirm it's the role-sync gate and not an unrelated
+        # precondition failure by checking both the error code and the message.
+        try:
+            self._validate_role_sync_config()
+        except ConnectError as e:
+            assert e.code == ConnectErrorCode.FAILED_PRECONDITION, (
+                f"role-sync config should be gated by a precondition, got {e}"
+            )
+            assert self._ROLE_SYNC_GATE_MESSAGE in str(e), (
+                f"role-sync config rejected, but not via the feature gate: {e}"
+            )
+        else:
+            raise AssertionError(
+                "configuring role sync should be gated while unfinalized"
+            )
+
     def _verify_tiered_cloud_topics_working(self):
         """After finalize the active version has advanced past the feature's
         require_version, so the gate opens: the feature moves from unavailable to
@@ -1503,10 +1569,35 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
             err_msg="tiered_cloud_topics did not activate after being enabled",
         )
 
+    def _verify_shadow_link_role_sync_working(self):
+        """After finalize both gates open: shadow_link_role_sync auto-activates
+        (available_policy::always, so no explicit enable), DescribeRedpandaRoles is
+        advertised, and the role-sync config gate no longer rejects. Any
+        non-gate outcome of the validate call is acceptable -- the connection test
+        may pass or fail, but it must not be the feature precondition."""
+        wait_until(
+            lambda: self._feature_state("shadow_link_role_sync") == "active",
+            timeout_sec=30,
+            backoff_sec=1,
+            err_msg="shadow_link_role_sync did not activate after finalize",
+        )
+        api_versions = KafkaCliTools(self.redpanda).get_api_versions()
+        assert f"({self.DESCRIBE_REDPANDA_ROLES_API_KEY})" in api_versions, (
+            "DescribeRedpandaRoles should be advertised after finalize:\n"
+            f"{api_versions}"
+        )
+        try:
+            self._validate_role_sync_config()
+        except ConnectError as e:
+            assert self._ROLE_SYNC_GATE_MESSAGE not in str(e), (
+                f"role-sync config still gated after finalize: {e}"
+            )
+
     def _verify_v26_2_features_working(self):
         """After the upgrade is finalized, confirm each v26.2 feature's gate has
         opened and the feature actually works (simple per-feature predicates)."""
         self._verify_tiered_cloud_topics_working()
+        self._verify_shadow_link_role_sync_working()
 
     def _feature_state(self, name):
         for f in self.admin.get_features()["features"]:
