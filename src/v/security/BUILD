@@ -178,6 +178,7 @@ redpanda_cc_library(
         "//src/v/serde:named_type",
         "//src/v/serde:optional",
         "//src/v/serde:variant",
+        "//src/v/ssx:async_algorithm",
         "//src/v/ssx:future_util",
         "//src/v/ssx:sformat",
         "//src/v/ssx:thread_worker",
