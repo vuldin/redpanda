@@ -48,6 +48,7 @@ static std::unique_ptr<type_resolver> make_field_type_resolver(
   resolved_type_cache& type_cache) {
     switch (field_mode) {
     case model::iceberg_mode::schema_mode::binary:
+    case model::iceberg_mode::schema_mode::string:
         return std::make_unique<binary_type_resolver>();
     case model::iceberg_mode::schema_mode::schema_id_prefix:
         return std::make_unique<record_schema_resolver>(

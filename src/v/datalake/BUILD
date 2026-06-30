@@ -430,6 +430,7 @@ redpanda_cc_library(
         "//src/v/iceberg/conversion:values_json",
         "//src/v/iceberg/conversion:values_protobuf",
         "//src/v/metrics",
+        "//src/v/strings:utf8",
         "@abseil-cpp//absl/container:flat_hash_set",
         "@avro",
         "@protobuf",
