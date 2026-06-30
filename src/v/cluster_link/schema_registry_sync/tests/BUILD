@@ -69,7 +69,9 @@ redpanda_cc_gtest(
     srcs = ["scope_test.cc"],
     cpu = 1,
     deps = [
+        "//src/v/cluster_link/model",
         "//src/v/cluster_link/schema_registry_sync:mirroring_task",
+        "//src/v/container:chunked_hash_map",
         "//src/v/pandaproxy/schema_registry:types",
         "//src/v/test_utils:gtest",
         "@googletest//:gtest",

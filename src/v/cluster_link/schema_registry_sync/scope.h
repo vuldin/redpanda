@@ -11,10 +11,14 @@
 
 #pragma once
 
+#include "cluster_link/model/types.h"
 #include "container/chunked_hash_map.h"
 #include "pandaproxy/schema_registry/types.h"
 
+#include <seastar/core/sstring.hh>
 #include <seastar/util/noncopyable_function.hh>
+
+#include <optional>
 
 namespace cluster_link::schema_registry_sync {
 
@@ -32,5 +36,14 @@ namespace ppsr = pandaproxy::schema_registry;
 ss::noncopyable_function<bool(const ppsr::context_subject&)> make_in_scope(
   chunked_hash_set<ppsr::context> contexts,
   chunked_hash_set<ppsr::context_subject> subjects);
+
+/// Returns a fault reason if the configuration would write a non-default
+/// context to the destination while `qualified_subjects_enabled` is off (the
+/// destination can then only represent the default context), else nullopt. The
+/// flag is injected to keep the check pure and testable.
+std::optional<ss::sstring> check_preconditions(
+  const model::schema_registry_sync_config& config,
+  const chunked_hash_set<ppsr::context>& in_scope_contexts,
+  bool qualified_subjects_enabled);
 
 } // namespace cluster_link::schema_registry_sync
