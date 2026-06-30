@@ -41,9 +41,10 @@ struct reconcile_stats {
     uint64_t errors{0};
 };
 
-/// The set of changes a reconcile applies. Create-only: every upsert is a
-/// (context, subject, version) node present on the source but absent from the
-/// destination's active set.
+/// The set of changes a reconcile applies: each upsert is a (context, subject,
+/// version) node imported from the source with its source deleted state. The
+/// caller selects which nodes to upsert (create, reactivate, or propagate a
+/// soft-delete); the reconciler imports them in reference order.
 struct work_set {
     chunked_vector<ppsr::subject_version> upserts;
 };

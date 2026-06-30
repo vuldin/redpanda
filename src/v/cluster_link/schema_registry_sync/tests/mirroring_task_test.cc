@@ -279,14 +279,21 @@ TEST_F(mirroring_task_test, populates_source_and_destination_inventory) {
     ASSERT_TRUE(status.has_value());
     EXPECT_EQ(status->inventory.selected_source_subjects, 1);
     EXPECT_EQ(status->inventory.selected_source_subject_versions, 2);
-    EXPECT_EQ(status->inventory.destination_subjects, 1);
-    EXPECT_EQ(status->inventory.destination_subject_versions, 1);
-    // Nothing is imported yet, so the destination is unchanged.
-    EXPECT_EQ(status->totals_since_task_start.subject_versions_changed, 0);
+    // The destination counters are refreshed after the import, so they reflect
+    // the post-sync state: the seeded payments-value plus the two imported
+    // orders-value versions.
+    EXPECT_EQ(status->inventory.destination_subjects, 2);
+    EXPECT_EQ(status->inventory.destination_subject_versions, 3);
+    // The two source versions are absent from the destination, so the reconcile
+    // imports both.
+    EXPECT_EQ(status->totals_since_task_start.subject_versions_changed, 2);
     EXPECT_EQ(status->last_full_sync->errors, 0);
 }
 
 TEST_F(mirroring_task_test, source_unavailable_is_unavailable) {
+    // A context must exist for discovery to reach list_subjects, where the
+    // source reports itself unavailable.
+    _source_state.add(ppsr::context_subject::unqualified("orders-value"), 1);
     _source_state.list_subjects_error = srs::source_error{
       .kind = srs::source_error_kind::source_unavailable,
       .message = "source down"};
