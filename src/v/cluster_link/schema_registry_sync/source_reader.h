@@ -74,6 +74,11 @@ public:
     /// schema-body fetch path: called for every node it discovers and imports.
     virtual ss::future<source_result<ppsr::stored_schema>> read_subject_version(
       ppsr::context_subject, ppsr::schema_version, ss::abort_source&) = 0;
+
+    /// Releases any resources the reader holds (e.g. an HTTP transport). Called
+    /// once before the reader is destroyed; the default is a no-op for readers
+    /// that hold nothing. After stop() no other method may be called.
+    virtual ss::future<> stop() { return ss::make_ready_future<>(); }
 };
 
 /// \brief Creates one `source_reader` per link.
