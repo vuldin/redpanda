@@ -66,6 +66,8 @@ public:
 
     void update_config(const model::metadata& link_metadata) override;
 
+    ss::future<cl_result<void>> stop() noexcept override;
+
     model::enabled_t is_enabled() const final;
 
     model::task_status_report get_status_report() const override;
@@ -79,6 +81,11 @@ protected:
 
 private:
     bool leads_schema_registry_partition() const;
+
+    /// Rebuilds the source reader from the current API-mode config, releasing
+    /// the previous reader's transport first. Called on a config change so a
+    /// new source URL, auth, or TLS setting takes effect on the next run.
+    ss::future<> reset_reader();
 
     /// Whether a periodic full scan is due (first run, or the full-sync
     /// interval has elapsed). A config change additionally forces one via

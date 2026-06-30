@@ -30,8 +30,8 @@
 #include "cluster_link/replication/mux_remote_consumer.h"
 #include "cluster_link/replication/types.h"
 #include "cluster_link/roles_migrator.h"
+#include "cluster_link/schema_registry_sync/http_source_reader.h"
 #include "cluster_link/schema_registry_sync/mirroring_task.h"
-#include "cluster_link/schema_registry_sync/unavailable_source_reader.h"
 #include "cluster_link/security_migrator.h"
 #include "cluster_link/shadow_linking_rpc_service.h"
 #include "cluster_link/source_topic_syncer.h"
@@ -1305,12 +1305,12 @@ ss::future<> service::maybe_start_manager() {
     co_await _manager->register_task_factory<roles_migrator_factory>();
 
     // The destination Schema Registry and source reader factory are owned by
-    // the service so they outlive the tasks. The source reader is unavailable
-    // until the real HTTP client is wired.
+    // the service so they outlive the tasks. Each link's mirroring task asks
+    // the factory for an HTTP-backed reader bound to its configured source.
     _schema_registry_dest = schema::registry::make_default(
       _schema_registry_api);
-    _source_reader_factory = std::make_unique<
-      schema_registry_sync::unavailable_source_reader_factory>();
+    _source_reader_factory
+      = std::make_unique<schema_registry_sync::http_source_reader_factory>();
     co_await _manager
       ->register_task_factory<schema_registry_sync::mirroring_task_factory>(
         _schema_registry_dest.get(), _source_reader_factory.get());

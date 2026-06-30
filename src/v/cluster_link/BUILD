@@ -260,6 +260,7 @@ redpanda_cc_library(
         "//src/v/cluster:plugin_backend",
         "//src/v/cluster:topic_metrics_watcher",
         "//src/v/cluster_link/model",
+        "//src/v/cluster_link/schema_registry_sync:http_source_reader",
         "//src/v/cluster_link/schema_registry_sync:mirroring_task",
         "//src/v/cluster_link/schema_registry_sync:source_reader",
         "//src/v/config",

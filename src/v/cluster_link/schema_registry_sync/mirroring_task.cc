@@ -22,6 +22,7 @@
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/coroutine/as_future.hh>
 #include <seastar/util/defer.hh>
 
 #include <utility>
@@ -91,6 +92,37 @@ void mirroring_task::update_config(const model::metadata& link_metadata) {
     // _status/_last_full_sync would race an in-flight run_impl that resumes and
     // overwrites it.
     _config_changed = true;
+}
+
+ss::future<cl_result<void>> mirroring_task::stop() noexcept {
+    auto res = co_await task::stop();
+    // The run loop has stopped, so no fiber is using the reader; release its
+    // HTTP transport. as_future guards the noexcept contract.
+    if (_reader) {
+        auto stopped = co_await ss::coroutine::as_future(_reader->stop());
+        if (stopped.failed()) {
+            auto ex = stopped.get_exception();
+            vlog(
+              logger().warn,
+              "Error stopping Schema Registry source reader: {}",
+              ex);
+        }
+    }
+    co_return res;
+}
+
+ss::future<> mirroring_task::reset_reader() {
+    if (_reader) {
+        auto stopped = co_await ss::coroutine::as_future(_reader->stop());
+        if (stopped.failed()) {
+            auto ex = stopped.get_exception();
+            vlog(
+              logger().warn,
+              "Error stopping previous Schema Registry source reader: {}",
+              ex);
+        }
+    }
+    _reader = _source_factory->create(_config.api_mode());
 }
 
 model::enabled_t mirroring_task::is_enabled() const {
@@ -388,8 +420,14 @@ ss::future<task::state_transition>
 mirroring_task::run_impl(ss::abort_source& as) {
     // Consume the config-changed flag before any co_await so a concurrent
     // update_config during this run is not lost (it re-arms for the next run).
-    const bool long_sync = std::exchange(_config_changed, false)
-                           || should_long_sync();
+    const bool config_changed = std::exchange(_config_changed, false);
+    const bool long_sync = config_changed || should_long_sync();
+
+    // A config change may have altered the source connection (URL, auth, TLS),
+    // so rebuild the reader before this run reads from the source.
+    if (config_changed) {
+        co_await reset_reader();
+    }
 
     _status.current_sync = model::schema_registry_current_sync{
       .sync_type = long_sync ? model::schema_registry_sync_type::full
