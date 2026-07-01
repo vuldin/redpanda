@@ -621,6 +621,176 @@ TEST(registry_compatibility_level_test, to_string_view_and_format) {
     EXPECT_EQ(fmt::format("{}", cl::unknown), "{unknown}");
 }
 
+TEST_CORO(parse_schema_id_subject_versions_test, basic) {
+    auto res = co_await parse_schema_id_subject_versions(
+      iobuf::from(
+        R"([{"subject": "s1", "version": 1}, {"subject": "s2", "version": 3}])"),
+      qualified_subjects_enabled::yes);
+    ASSERT_TRUE_CORO(res.has_value());
+    const auto& v = res.value();
+    ASSERT_EQ_CORO(v.size(), size_t{2});
+    ASSERT_EQ_CORO(v[0].sub, context_subject(default_context, subject{"s1"}));
+    ASSERT_EQ_CORO(v[0].version, schema_version{1});
+    ASSERT_EQ_CORO(v[1].sub, context_subject(default_context, subject{"s2"}));
+    ASSERT_EQ_CORO(v[1].version, schema_version{3});
+}
+
+TEST_CORO(parse_schema_id_subject_versions_test, qualified_subject) {
+    // A non-default context comes back context-qualified and is split under the
+    // qualified policy, exactly like parse_subjects.
+    auto res = co_await parse_schema_id_subject_versions(
+      iobuf::from(R"([{"subject": ":.ctx:orders", "version": 2}])"),
+      qualified_subjects_enabled::yes);
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res.value().size(), size_t{1});
+    ASSERT_EQ_CORO(
+      res.value()[0].sub, context_subject(context{".ctx"}, subject{"orders"}));
+    ASSERT_EQ_CORO(res.value()[0].version, schema_version{2});
+}
+
+TEST_CORO(
+  parse_schema_id_subject_versions_test, qualified_disabled_is_literal) {
+    auto res = co_await parse_schema_id_subject_versions(
+      iobuf::from(R"([{"subject": ":.ctx:orders", "version": 2}])"),
+      qualified_subjects_enabled::no);
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(
+      res.value()[0].sub,
+      context_subject(default_context, subject{":.ctx:orders"}));
+}
+
+TEST_CORO(parse_schema_id_subject_versions_test, empty_array) {
+    // A valid outcome: the id exists but no pair matches the filters.
+    auto res = co_await parse_schema_id_subject_versions(
+      iobuf::from("[]"), qualified_subjects_enabled::yes);
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_TRUE_CORO(res.value().empty());
+}
+
+TEST_CORO(parse_schema_id_subject_versions_test, unknown_keys_are_skipped) {
+    // Extra keys (in any order) are tolerated; subject/version still parse.
+    auto res = co_await parse_schema_id_subject_versions(
+      iobuf::from(
+        R"([{"guid": "g", "version": 5, "subject": "s", "ruleSet": {"x": [1]}}])"),
+      qualified_subjects_enabled::yes);
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res.value().size(), size_t{1});
+    ASSERT_EQ_CORO(
+      res.value()[0].sub, context_subject(default_context, subject{"s"}));
+    ASSERT_EQ_CORO(res.value()[0].version, schema_version{5});
+}
+
+TEST_CORO(parse_schema_id_subject_versions_test, missing_field_is_error) {
+    // Both subject and version must be present.
+    for (std::string_view body :
+         {R"([{"subject": "s"}])", R"([{"version": 1}])", R"([{}])"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_schema_id_subject_versions(
+          iobuf::from(body), qualified_subjects_enabled::yes);
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_schema_id_subject_versions_test, not_an_array_is_error) {
+    for (std::string_view body :
+         {R"({"subject": "s", "version": 1})", R"("s")", "42", "null"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_schema_id_subject_versions(
+          iobuf::from(body), qualified_subjects_enabled::yes);
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_schema_id_subject_versions_test, non_object_element_is_error) {
+    for (std::string_view body :
+         {R"(["s"])", R"([1])", R"([{"subject": "s", "version": 1}, 2])"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_schema_id_subject_versions(
+          iobuf::from(body), qualified_subjects_enabled::yes);
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_schema_id_subject_versions_test, wrong_typed_field_is_error) {
+    for (std::string_view body :
+         {R"([{"subject": 5, "version": 1}])",
+          R"([{"subject": "s", "version": "1"}])",
+          R"([{"subject": "s", "version": 1.5}])"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_schema_id_subject_versions(
+          iobuf::from(body), qualified_subjects_enabled::yes);
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(
+  parse_schema_id_subject_versions_test, out_of_range_version_is_error) {
+    // version must be >= 1.
+    for (std::string_view body :
+         {R"([{"subject": "s", "version": 0}])",
+          R"([{"subject": "s", "version": -1}])"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_schema_id_subject_versions(
+          iobuf::from(body), qualified_subjects_enabled::yes);
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_schema_id_subject_versions_test, trailing_content_is_error) {
+    for (std::string_view body :
+         {R"([{"subject": "s", "version": 1}] "x")",
+          R"([{"subject": "s", "version": 1}]{})",
+          R"([{"subject": "s", "version": 1}],)"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_schema_id_subject_versions(
+          iobuf::from(body), qualified_subjects_enabled::yes);
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_schema_id_subject_versions_test, trailing_whitespace_is_ok) {
+    auto res = co_await parse_schema_id_subject_versions(
+      iobuf::from("[{\"subject\": \"s\", \"version\": 1}]  \n\t "),
+      qualified_subjects_enabled::yes);
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res.value().size(), size_t{1});
+}
+
+TEST_CORO(parse_schema_id_subject_versions_test, fragmented_input) {
+    // One byte per fragment forces the objects, their keys, and the array
+    // structure to span parser fragment boundaries.
+    auto res = co_await parse_schema_id_subject_versions(
+      fragmented_iobuf(
+        R"([{"subject": ":.ctx:orders", "version": 2}, {"subject": "s", "version": 1}])",
+        1),
+      qualified_subjects_enabled::yes);
+    ASSERT_TRUE_CORO(res.has_value());
+    const auto& v = res.value();
+    ASSERT_EQ_CORO(v.size(), size_t{2});
+    ASSERT_EQ_CORO(
+      v[0].sub, context_subject(context{".ctx"}, subject{"orders"}));
+    ASSERT_EQ_CORO(v[0].version, schema_version{2});
+    ASSERT_EQ_CORO(v[1].sub, context_subject(default_context, subject{"s"}));
+    ASSERT_EQ_CORO(v[1].version, schema_version{1});
+}
+
+TEST_CORO(
+  parse_schema_id_subject_versions_test, malformed_or_truncated_is_error) {
+    for (std::string_view body :
+         {"",
+          "[",
+          R"([{)",
+          R"([{"subject")",
+          R"([{"subject": "s", "version": 1)",
+          R"([{"subject": "s", "version": 1})",
+          "not json"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_schema_id_subject_versions(
+          iobuf::from(body), qualified_subjects_enabled::yes);
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
 TEST_CORO(parse_subject_versions_test, basic) {
     auto res = co_await parse_subject_versions(iobuf::from("[1, 2, 3]"));
     ASSERT_TRUE_CORO(res.has_value());

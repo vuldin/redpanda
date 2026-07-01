@@ -358,6 +358,62 @@ FIXTURE_TEST(sr_rest_client_integration, pandaproxy_test_fixture) {
           std::holds_alternative<rc::version_not_found>(res.error()));
     }
 
+    // Kept before the delete section, while multi/v1 and solo/v1 are both live.
+    auto sv_contains = [](
+                         const auto& range,
+                         const pps::context_subject& s,
+                         pps::schema_version v) {
+        return std::ranges::any_of(range, [&](const pps::subject_version& sv) {
+            return sv.sub == s && sv.version == v;
+        });
+    };
+
+    info(
+      "get_schema_id_subject_versions enumerates every subject sharing an id");
+    {
+        // "multi" v1 and "solo" v1 registered identical content (schema_v1), so
+        // they share one schema id in the default context; the lookup returns
+        // both pairs.
+        auto v1
+          = sut.get_schema_by_version(multi, pps::schema_version{1}, rtc).get();
+        BOOST_REQUIRE(v1.has_value());
+
+        auto res = sut.get_schema_id_subject_versions(v1->schema.id, rtc).get();
+        BOOST_REQUIRE(res.has_value());
+        // Order is not guaranteed; check membership.
+        BOOST_REQUIRE(sv_contains(res.value(), multi, pps::schema_version{1}));
+        BOOST_REQUIRE(sv_contains(res.value(), solo, pps::schema_version{1}));
+    }
+
+    info(
+      "get_schema_id_subject_versions yields schema_id_not_found for a missing "
+      "id (real 40403)");
+    {
+        auto res
+          = sut.get_schema_id_subject_versions(pps::schema_id{123456}, rtc)
+              .get();
+        BOOST_REQUIRE(!res.has_value());
+        BOOST_REQUIRE(
+          std::holds_alternative<rc::schema_id_not_found>(res.error()));
+    }
+
+    info("get_schema_id_subject_versions resolves an id in a named context");
+    {
+        // ctx-sub lives in .myctx; passing it as the subject parameter resolves
+        // the id within that context (%3A path/query encoding end-to-end).
+        auto cs = sut
+                    .get_schema_by_version(ctx_sub, pps::schema_version{1}, rtc)
+                    .get();
+        BOOST_REQUIRE(cs.has_value());
+
+        auto res
+          = sut.get_schema_id_subject_versions(cs->schema.id, rtc, ctx_sub)
+              .get();
+        BOOST_REQUIRE(res.has_value());
+        BOOST_REQUIRE(
+          sv_contains(res.value(), ctx_sub, pps::schema_version{1}));
+    }
+
     info("deleted=true surfaces soft-deleted versions and subjects");
     {
         // Soft-delete version 1 of "multi" (v2 remains, so the subject stays

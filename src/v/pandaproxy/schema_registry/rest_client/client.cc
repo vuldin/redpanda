@@ -38,6 +38,7 @@ constexpr std::string_view accept_json = "application/json";
 // Schema Registry error_codes for the not-found conditions.
 constexpr int32_t error_code_subject_not_found = 40401;
 constexpr int32_t error_code_version_not_found = 40402;
+constexpr int32_t error_code_schema_id_not_found = 40403;
 constexpr int32_t error_code_subject_config_not_found = 40408;
 constexpr int32_t error_code_subject_mode_not_found = 40409;
 
@@ -151,6 +152,29 @@ domain_error translate_subject_config_not_found(
       status->error_code == error_code_subject_config_not_found
       || status->error_code == error_code_subject_not_found) {
         return domain_error{subject_config_not_found{subject}};
+    }
+    return err;
+}
+
+// Translate a terminal 404 from GET /schemas/ids/{id}/versions into the typed
+// schema_id_not_found: error_code 40403 (the schema-not-found code) means the
+// id does not resolve in the searched context. Unlike the subject/config
+// endpoints this uses only 40403 — a bare 404 (unknown path), other statuses,
+// and non-http errors all pass through unchanged.
+domain_error translate_schema_id_not_found(domain_error err, schema_id id) {
+    auto* call = std::get_if<http_call_error>(&err);
+    if (call == nullptr) {
+        return err;
+    }
+    auto* status = std::get_if<http_status_error>(call);
+    if (status == nullptr) {
+        return err;
+    }
+    if (status->status != boost::beast::http::status::not_found) {
+        return err;
+    }
+    if (status->error_code == error_code_schema_id_not_found) {
+        return domain_error{schema_id_not_found{id}};
     }
     return err;
 }
@@ -547,6 +571,41 @@ client::get_schema_by_version(
           translate_not_found(std::move(response.error()), subject, version));
     }
     auto parsed = co_await parse_subject_version(
+      std::move(response.value()), _qualified);
+    if (!parsed.has_value()) {
+        co_return std::unexpected(domain_error{std::move(parsed.error())});
+    }
+    co_return std::move(parsed.value());
+}
+
+ss::future<std::expected<chunked_vector<subject_version>, domain_error>>
+client::get_schema_id_subject_versions(
+  schema_id id, retry_chain_node& rtc, std::optional<context_subject> subject) {
+    auto gate = maybe_gate();
+    if (!gate.has_value()) {
+        co_return std::unexpected(std::move(gate.error()));
+    }
+    // TODO: deleted/offset/limit are unimplemented. Redpanda's server ignores
+    // them on this endpoint (it always returns the live pairs unpaginated), and
+    // the report notes pagination here is unstable because the result is
+    // unordered.
+    auto request = http::request_builder{}
+                     .method(boost::beast::http::verb::get)
+                     .path(fmt::format("/schemas/ids/{}/versions", id()))
+                     .header("accept", accept_json);
+    if (subject.has_value()) {
+        // Selects the context to resolve the id in. query_param_kv
+        // percent-encodes the value (":" -> "%3A").
+        request.query_param_kv("subject", subject->to_string());
+    }
+    maybe_add_basic_auth(request);
+
+    auto response = co_await perform_request(rtc, std::move(request));
+    if (!response.has_value()) {
+        co_return std::unexpected(
+          translate_schema_id_not_found(std::move(response.error()), id));
+    }
+    auto parsed = co_await parse_schema_id_subject_versions(
       std::move(response.value()), _qualified);
     if (!parsed.has_value()) {
         co_return std::unexpected(domain_error{std::move(parsed.error())});

@@ -112,6 +112,24 @@ ss::future<std::expected<config_info, parse_error>> parse_config(iobuf body);
 ss::future<std::expected<chunked_vector<schema_version>, parse_error>>
 parse_subject_versions(iobuf body);
 
+/// Parse the body of a `GET /schemas/ids/{id}/versions` response into a list of
+/// (subject, version) pairs.
+///
+/// The body must be a JSON array of objects, each with a `subject` string and a
+/// `version` integer in [1, INT32_MAX] (e.g. `[{"subject":"s","version":1}]`).
+/// Each subject is decoded with context_subject::from_string under \p qualified
+/// (a non-default context comes back context-qualified, e.g. ":.ctx:s"), just
+/// like parse_subjects. Unknown keys within an object are tolerated and
+/// skipped, but both `subject` and `version` must be present; a non-array, a
+/// non-object element, a wrong-typed or out-of-range field, a missing field, or
+/// trailing content after the array yields a parse_error. The result order
+/// follows the wire order, which the Schema Registry does not guarantee for
+/// this endpoint. The function does not throw: malformed input is reported via
+/// the returned std::expected.
+ss::future<std::expected<chunked_vector<subject_version>, parse_error>>
+parse_schema_id_subject_versions(
+  iobuf body, qualified_subjects_enabled qualified);
+
 /// The outcome of parsing a get-schema-by-version response: the schema, plus
 /// the names of any top-level response fields the parser did not model.
 ///

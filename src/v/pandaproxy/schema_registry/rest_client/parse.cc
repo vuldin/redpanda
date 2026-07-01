@@ -347,6 +347,92 @@ parse_subject_versions(iobuf body) {
     }
 }
 
+ss::future<std::expected<chunked_vector<subject_version>, parse_error>>
+parse_schema_id_subject_versions(
+  iobuf body, qualified_subjects_enabled qualified) {
+    using token = serde::json::token;
+    // Firewall exceptions from the parser: malformed input is reported via the
+    // returned std::expected, not thrown.
+    try {
+        serde::json::parser p(std::move(body));
+
+        if (!co_await p.next() || p.token() != token::start_array) {
+            co_return std::unexpected(
+              parse_error{
+                .reason = "expected a JSON array of subject-version objects"});
+        }
+
+        chunked_vector<subject_version> result;
+        while (co_await p.next()) {
+            if (p.token() == token::end_array) {
+                // The body is exactly a JSON array: reject any trailing content
+                // rather than ignoring it.
+                co_await p.next();
+                if (p.token() != token::eof) {
+                    co_return std::unexpected(
+                      parse_error{
+                        .reason
+                        = "trailing content after subject-versions array"});
+                }
+                co_return std::move(result);
+            }
+            if (p.token() != token::start_object) {
+                co_return std::unexpected(
+                  parse_error{.reason = "expected a subject-version object"});
+            }
+            // Each element is a {subject, version} object. Unknown keys are
+            // tolerated and skipped, but both modeled fields must be present.
+            std::optional<context_subject> sub;
+            std::optional<schema_version> version;
+            while (co_await p.next() && p.token() != token::end_object) {
+                auto key = p.value_string().linearize_to_string();
+                if (!co_await p.next()) {
+                    co_return std::unexpected(
+                      parse_error{
+                        .reason = "truncated JSON in subject-version object"});
+                }
+                if (key == "subject") {
+                    if (p.token() != token::value_string) {
+                        co_return std::unexpected(
+                          parse_error{.reason = "subject must be a string"});
+                    }
+                    sub = context_subject::from_string(
+                      p.value_string().linearize_to_string(), qualified);
+                } else if (key == "version") {
+                    if (p.token() != token::value_int) {
+                        co_return std::unexpected(
+                          parse_error{.reason = "version must be an integer"});
+                    }
+                    auto v = checked_positive_i32(p.value_int());
+                    if (!v) {
+                        co_return std::unexpected(
+                          parse_error{.reason = "version number out of range"});
+                    }
+                    version = schema_version{*v};
+                } else {
+                    co_await p.skip_value();
+                }
+            }
+            if (!sub.has_value() || !version.has_value()) {
+                co_return std::unexpected(
+                  parse_error{
+                    .reason
+                    = "subject-version object missing subject or version"});
+            }
+            result.emplace_back(std::move(*sub), *version);
+        }
+
+        // next() returned false before the closing ']' was seen.
+        co_return std::unexpected(
+          parse_error{.reason = "truncated or malformed JSON"});
+    } catch (const std::exception& e) {
+        co_return std::unexpected(
+          parse_error{
+            .reason = ssx::sformat(
+              "failed to parse subject-versions: {}", e.what())});
+    }
+}
+
 namespace {
 
 // Parse a JSON array of {name, subject, version} reference objects. Entered

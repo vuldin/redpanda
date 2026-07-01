@@ -1558,3 +1558,259 @@ TEST(rest_client, get_schema_by_version_invalid_version_not_translated) {
       std::get<rc::http_status_error>(call).status,
       bh::status::unprocessable_entity);
 }
+
+TEST(rest_client, get_schema_id_subject_versions_request_shape_and_success) {
+    auto check_and_respond = [](
+                               bh::request_header<>&& r,
+                               std::optional<iobuf>,
+                               ss::lowres_clock::duration) {
+        EXPECT_EQ(r.method(), bh::verb::get);
+        // No subject query param -> the default context.
+        EXPECT_EQ(r.target(), "/schemas/ids/100001/versions");
+        EXPECT_EQ(r.at(bh::field::accept), "application/json");
+        // base64("user:pass") == "dXNlcjpwYXNz"
+        EXPECT_EQ(r.at(bh::field::authorization), "Basic dXNlcjpwYXNz");
+        return ss::make_ready_future<
+          http::downloaded_response>(http::downloaded_response{
+          .status = bh::status::ok,
+          .body = iobuf::from(
+            R"([{"subject": "orders", "version": 1}, {"subject": "orders-copy", "version": 3}])")});
+    };
+    rc::client client{
+      make_http_client([&](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(check_and_respond);
+      }),
+      endpoint,
+      rc::basic_auth_credentials{.username = "user", .password = "pass"}};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client
+                 .get_schema_id_subject_versions(pps::schema_id{100001}, rtc)
+                 .get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_THAT(
+      *res,
+      ElementsAre(
+        pps::subject_version(
+          pps::context_subject::unqualified("orders"), pps::schema_version{1}),
+        pps::subject_version(
+          pps::context_subject::unqualified("orders-copy"),
+          pps::schema_version{3})));
+}
+
+TEST(
+  rest_client, get_schema_id_subject_versions_subject_param_selects_context) {
+    // A context_subject is sent verbatim as the `subject` query param,
+    // percent-encoded (":" -> "%3A").
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce([](
+                        bh::request_header<>&& r,
+                        std::optional<iobuf>,
+                        ss::lowres_clock::duration) {
+                EXPECT_EQ(
+                  r.target(),
+                  "/schemas/ids/7/versions?subject=%3A.ctx%3Aorders");
+                return ss::make_ready_future<http::downloaded_response>(
+                  http::downloaded_response{
+                    .status = bh::status::ok,
+                    .body = iobuf::from(
+                      R"([{"subject": ":.ctx:orders", "version": 1}])")});
+            });
+      }),
+      endpoint,
+      std::nullopt,
+      pps::qualified_subjects_enabled::yes};
+
+    pps::context_subject subject{pps::context{".ctx"}, pps::subject{"orders"}};
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res
+      = client.get_schema_id_subject_versions(pps::schema_id{7}, rtc, subject)
+          .get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_THAT(
+      *res,
+      ElementsAre(
+        pps::subject_version(
+          pps::context_subject(pps::context{".ctx"}, pps::subject{"orders"}),
+          pps::schema_version{1})));
+}
+
+TEST(rest_client, get_schema_id_subject_versions_empty_array) {
+    // The id exists but no live pair matches: a valid empty result, not a 404.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(bh::status::ok, "[]"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res
+      = client.get_schema_id_subject_versions(pps::schema_id{1}, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_THAT(*res, IsEmpty());
+}
+
+TEST(rest_client, get_schema_id_subject_versions_not_found) {
+    // 404 / 40403 (schema-not-found) becomes the typed schema_id_not_found.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(
+              bh::status::not_found,
+              R"({"error_code": 40403, "message": "Schema 999 not found"})"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res
+      = client.get_schema_id_subject_versions(pps::schema_id{999}, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    ASSERT_TRUE(std::holds_alternative<rc::schema_id_not_found>(res.error()));
+    EXPECT_EQ(
+      std::get<rc::schema_id_not_found>(res.error()).id, pps::schema_id{999});
+}
+
+TEST(rest_client, get_schema_id_subject_versions_bare_404_passes_through) {
+    // A bare 404 (e.g. the singular /version path) is not 40403, so it stays a
+    // generic http error rather than schema_id_not_found.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(
+              bh::status::not_found,
+              R"({"error_code": 404, "message": "not found"})"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res
+      = client.get_schema_id_subject_versions(pps::schema_id{1}, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::http_call_error>(res.error()));
+}
+
+TEST(rest_client, get_schema_id_subject_versions_bad_request_passes_through) {
+    // A 400 (e.g. a non-integer id/offset on the server) is not a 404, so it
+    // stays a generic http error rather than schema_id_not_found.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(
+              bh::status::bad_request,
+              R"({"error_code": 400, "message": "bad"})"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res
+      = client.get_schema_id_subject_versions(pps::schema_id{1}, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::http_call_error>(res.error()));
+}
+
+TEST(
+  rest_client,
+  get_schema_id_subject_versions_transport_exception_passes_through) {
+    // A connection-level failure is a string http_call_error (no status), so
+    // translation cannot classify it and passes it through unchanged.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce([](
+                        bh::request_header<>&&,
+                        std::optional<iobuf>,
+                        ss::lowres_clock::duration) {
+                return ss::make_exception_future<http::downloaded_response>(
+                  std::runtime_error("connection refused"));
+            });
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res
+      = client.get_schema_id_subject_versions(pps::schema_id{1}, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    ASSERT_TRUE(std::holds_alternative<rc::http_call_error>(res.error()));
+    EXPECT_TRUE(
+      std::holds_alternative<ss::sstring>(
+        std::get<rc::http_call_error>(res.error())));
+}
+
+TEST(rest_client, get_schema_id_subject_versions_retries_exhausted) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillRepeatedly(respond(bh::status::service_unavailable, "busy"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 100ms, 10ms);
+    auto res
+      = client.get_schema_id_subject_versions(pps::schema_id{1}, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::retries_exhausted>(res.error()));
+}
+
+TEST(rest_client, get_schema_id_subject_versions_parse_error_surfaced) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(bh::status::ok, R"({"not": "an array"})"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res
+      = client.get_schema_id_subject_versions(pps::schema_id{1}, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::parse_error>(res.error()));
+}
+
+TEST(rest_client, get_schema_id_subject_versions_after_shutdown_is_aborted) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _)).Times(0);
+      }),
+      endpoint};
+
+    client.shutdown().get();
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res
+      = client.get_schema_id_subject_versions(pps::schema_id{1}, rtc).get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::aborted_error>(res.error()));
+}

@@ -192,6 +192,43 @@ public:
       retry_chain_node& rtc,
       include_deleted deleted = include_deleted::no);
 
+    /// GET /schemas/ids/{id}/versions — list every (subject, version) pair
+    /// backed by the schema with numeric \p id. One schema's content can be
+    /// registered under many subjects; this enumerates all of them within one
+    /// context. An id that does not resolve yields schema_id_not_found (HTTP
+    /// 404 / error_code 40403 — the schema-not-found code, not the 40401/40402
+    /// used elsewhere).
+    ///
+    /// Schema ids are namespaced PER CONTEXT, so \p subject selects the context
+    /// to resolve \p id in; it is sent verbatim as the `subject` query
+    /// parameter. It only LOCATES the schema — it never filters the output: the
+    /// result always lists every subject in the resolved context that shares
+    /// the content, regardless of \p subject. The four forms:
+    ///   - std::nullopt (default): resolve \p id in the DEFAULT context.
+    ///   - a bare context, e.g. context_subject{context{".ctx"}, subject{""}}
+    ///     (wire ":.ctx:"): resolve \p id in ".ctx" whichever subject holds it.
+    ///     The recommended way to target a named context.
+    ///   - a context-qualified subject, e.g. {context{".ctx"}, subject{"s"}}
+    ///     (wire ":.ctx:s"): resolves \p id in ".ctx" ONLY IF "s" carries it,
+    ///     else schema_id_not_found even when \p id exists in ".ctx" under
+    ///     other subjects. Rarely useful.
+    ///   - a plain subject, e.g. context_subject::unqualified("s"): tries the
+    ///     default context, then falls back to searching other contexts for a
+    ///     subject of that name holding \p id. Surprising; avoid.
+    /// Prefer std::nullopt or the bare-context form.
+    ///
+    /// Returned subjects are context-qualified for a non-default context. The
+    /// pairs are UNORDERED (the endpoint does not guarantee an order); sort
+    /// client-side if you need determinism. Soft-deleted pairs are excluded:
+    /// the `deleted`, `offset`, and `limit` query parameters are unimplemented
+    /// because Redpanda's server ignores them here (it always returns the live
+    /// pairs in a single unpaginated response).
+    ss::future<std::expected<chunked_vector<subject_version>, domain_error>>
+    get_schema_id_subject_versions(
+      schema_id id,
+      retry_chain_node& rtc,
+      std::optional<context_subject> subject = std::nullopt);
+
     /// Stops the transport and drains in-flight requests. Must be called before
     /// destroying the client.
     ss::future<> shutdown();
