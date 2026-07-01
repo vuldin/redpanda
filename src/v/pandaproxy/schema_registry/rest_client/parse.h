@@ -13,6 +13,7 @@
 #include "base/seastarx.h"
 #include "bytes/iobuf.h"
 #include "container/chunked_vector.h"
+#include "pandaproxy/schema_registry/rest_client/config.h"
 #include "pandaproxy/schema_registry/rest_client/mode.h"
 #include "pandaproxy/schema_registry/types.h"
 
@@ -79,6 +80,21 @@ parse_contexts(iobuf body);
 /// beyond `mode`. The function does not throw: malformed input is reported via
 /// the returned std::expected.
 ss::future<std::expected<mode_info, parse_error>> parse_mode(iobuf body);
+
+/// Parse the body of a `GET /config` response into a config_info.
+///
+/// The body is a JSON object. Only `compatibilityLevel` (a string) is modeled,
+/// as an open enum (see config.h) with the verbatim wire string kept in
+/// config_info::raw. Every other top-level field is unmodeled: its name is
+/// recorded in config_info::unknown_fields and its value skipped, so a caller
+/// can tell config content was dropped without this client modeling the rich
+/// object. As with parse_mode the shape is strict — a non-object body, a
+/// missing or non-string `compatibilityLevel`, or trailing content after the
+/// object yields a parse_error — while the compatibilityLevel value is open: an
+/// unrecognized string maps to registry_compatibility_level::unknown rather
+/// than being rejected. The function does not throw: malformed input is
+/// reported via the returned std::expected.
+ss::future<std::expected<config_info, parse_error>> parse_config(iobuf body);
 
 /// Parse the body of a `GET /subjects/{subject}/versions` response into a list
 /// of versions.

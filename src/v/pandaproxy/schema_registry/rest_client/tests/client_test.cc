@@ -892,6 +892,184 @@ TEST(rest_client, get_subject_mode_after_shutdown_is_aborted) {
     EXPECT_TRUE(std::holds_alternative<rc::aborted_error>(res.error()));
 }
 
+TEST(rest_client, get_config_request_shape_and_success) {
+    auto check_and_respond = [](
+                               bh::request_header<>&& r,
+                               std::optional<iobuf>,
+                               ss::lowres_clock::duration) {
+        EXPECT_EQ(r.method(), bh::verb::get);
+        EXPECT_EQ(r.target(), "/config");
+        EXPECT_EQ(r.at(bh::field::accept), "application/json");
+        // base64("user:pass") == "dXNlcjpwYXNz"
+        EXPECT_EQ(r.at(bh::field::authorization), "Basic dXNlcjpwYXNz");
+        return ss::make_ready_future<http::downloaded_response>(
+          http::downloaded_response{
+            .status = bh::status::ok,
+            .body = iobuf::from(R"({"compatibilityLevel": "BACKWARD"})")});
+    };
+    rc::client client{
+      make_http_client([&](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(check_and_respond);
+      }),
+      endpoint,
+      rc::basic_auth_credentials{.username = "user", .password = "pass"}};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_config(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->level, rc::registry_compatibility_level::backward);
+    EXPECT_EQ(res->raw, "BACKWARD");
+    EXPECT_TRUE(res->unknown_fields.empty());
+}
+
+TEST(rest_client, get_config_open_enum_tolerates_unknown_value) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(
+              respond(bh::status::ok, R"({"compatibilityLevel": "SIDEWAYS"})"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_config(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->level, rc::registry_compatibility_level::unknown);
+    EXPECT_EQ(res->raw, "SIDEWAYS");
+}
+
+TEST(rest_client, get_config_records_unmodeled_fields) {
+    // A Confluent registry may return a rich object; the client models only
+    // compatibilityLevel and names the rest in unknown_fields.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(
+              bh::status::ok,
+              R"({"compatibilityLevel": "FULL", "normalize": true, "validateFields": false})"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_config(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->level, rc::registry_compatibility_level::full);
+    EXPECT_THAT(
+      res->unknown_fields, ElementsAre("normalize", "validateFields"));
+}
+
+TEST(rest_client, get_config_no_credentials_omits_auth_header) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce([](
+                        bh::request_header<>&& r,
+                        std::optional<iobuf>,
+                        ss::lowres_clock::duration) {
+                EXPECT_EQ(r.count(bh::field::authorization), 0);
+                return ss::make_ready_future<http::downloaded_response>(
+                  http::downloaded_response{
+                    .status = bh::status::ok,
+                    .body = iobuf::from(R"({"compatibilityLevel": "NONE"})")});
+            });
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_config(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->level, rc::registry_compatibility_level::none);
+}
+
+TEST(rest_client, get_config_storage_error_is_retried) {
+    // The report's one operation-specific failure, 500 / error_code 50001
+    // (backend storage), is transient: the client retries and recovers.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(
+              bh::status::internal_server_error,
+              R"({"error_code": 50001, "message": "Failed to get compatibility level"})"))
+            .WillOnce(
+              respond(bh::status::ok, R"({"compatibilityLevel": "BACKWARD"})"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 30s, 10ms);
+    auto res = client.get_config(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->level, rc::registry_compatibility_level::backward);
+}
+
+TEST(rest_client, get_config_retries_exhausted_surfaces_error) {
+    // A persistently failing transient status exhausts the retry budget;
+    // get_config propagates the terminal error rather than parsing a body.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillRepeatedly(respond(bh::status::service_unavailable, "busy"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 100ms, 10ms);
+    auto res = client.get_config(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::retries_exhausted>(res.error()));
+}
+
+TEST(rest_client, get_config_parse_error_surfaced) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(bh::status::ok, R"(["not", "an", "object"])"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_config(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::parse_error>(res.error()));
+}
+
+TEST(rest_client, get_config_after_shutdown_is_aborted) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _)).Times(0);
+      }),
+      endpoint};
+
+    client.shutdown().get();
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_config(rtc).get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::aborted_error>(res.error()));
+}
+
 TEST(rest_client, list_subject_versions_success_and_encodes_subject) {
     rc::client client{
       make_http_client([](mock_client& m) {

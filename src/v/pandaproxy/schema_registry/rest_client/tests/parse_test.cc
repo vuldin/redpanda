@@ -442,6 +442,185 @@ TEST(registry_mode_test, to_string_view_and_format) {
     EXPECT_EQ(fmt::format("{}", registry_mode::unknown), "{unknown}");
 }
 
+TEST_CORO(parse_config_test, compatibility_level_only) {
+    // Redpanda's server emits just compatibilityLevel; nothing is recorded as
+    // an unknown field.
+    auto res = co_await parse_config(
+      iobuf::from(R"({"compatibilityLevel": "BACKWARD"})"));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res->level, registry_compatibility_level::backward);
+    ASSERT_EQ_CORO(res->raw, "BACKWARD");
+    ASSERT_TRUE_CORO(res->unknown_fields.empty());
+}
+
+TEST_CORO(parse_config_test, all_known_levels_map_to_enumerators) {
+    const std::pair<std::string_view, registry_compatibility_level> cases[] = {
+      {"NONE", registry_compatibility_level::none},
+      {"BACKWARD", registry_compatibility_level::backward},
+      {"BACKWARD_TRANSITIVE",
+       registry_compatibility_level::backward_transitive},
+      {"FORWARD", registry_compatibility_level::forward},
+      {"FORWARD_TRANSITIVE", registry_compatibility_level::forward_transitive},
+      {"FULL", registry_compatibility_level::full},
+      {"FULL_TRANSITIVE", registry_compatibility_level::full_transitive},
+    };
+    for (const auto& [wire, expected] : cases) {
+        SCOPED_TRACE(wire);
+        auto res = co_await parse_config(
+          iobuf::from(ssx::sformat(R"({{"compatibilityLevel": "{}"}})", wire)));
+        ASSERT_TRUE_CORO(res.has_value());
+        ASSERT_EQ_CORO(res->level, expected);
+        ASSERT_EQ_CORO(res->raw, ss::sstring{wire});
+    }
+}
+
+TEST_CORO(parse_config_test, unknown_level_is_open_enum) {
+    // An unrecognized level is tolerated, not rejected: it maps to `unknown`
+    // with the verbatim wire string preserved.
+    auto res = co_await parse_config(
+      iobuf::from(R"({"compatibilityLevel": "SIDEWAYS"})"));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res->level, registry_compatibility_level::unknown);
+    ASSERT_EQ_CORO(res->raw, "SIDEWAYS");
+}
+
+TEST_CORO(parse_config_test, empty_level_is_unknown_not_error) {
+    // Shape is strict, value is open: a present-but-empty string maps to
+    // `unknown` (raw="") rather than failing.
+    auto res = co_await parse_config(
+      iobuf::from(R"({"compatibilityLevel": ""})"));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res->level, registry_compatibility_level::unknown);
+    ASSERT_EQ_CORO(res->raw, "");
+}
+
+TEST_CORO(parse_config_test, records_unmodeled_fields) {
+    // A Confluent registry may return a rich object. Only compatibilityLevel is
+    // modeled; every other top-level field's name is recorded (in encounter
+    // order) and its value skipped, whatever its shape (scalar, object, null).
+    auto res = co_await parse_config(
+      iobuf::from(
+        R"({"compatibilityLevel": "FULL", "normalize": true, )"
+        R"("validateFields": false, )"
+        R"("defaultMetadata": {"properties": {"o": "a"}}, )"
+        R"("defaultRuleSet": null})"));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res->level, registry_compatibility_level::full);
+    ASSERT_EQ_CORO(res->unknown_fields.size(), size_t{4});
+    ASSERT_EQ_CORO(res->unknown_fields[0], "normalize");
+    ASSERT_EQ_CORO(res->unknown_fields[1], "validateFields");
+    ASSERT_EQ_CORO(res->unknown_fields[2], "defaultMetadata");
+    ASSERT_EQ_CORO(res->unknown_fields[3], "defaultRuleSet");
+}
+
+TEST_CORO(parse_config_test, compatibility_level_need_not_come_first) {
+    auto res = co_await parse_config(
+      iobuf::from(R"({"normalize": true, "compatibilityLevel": "FORWARD"})"));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res->level, registry_compatibility_level::forward);
+    ASSERT_EQ_CORO(res->unknown_fields.size(), size_t{1});
+    ASSERT_EQ_CORO(res->unknown_fields[0], "normalize");
+}
+
+TEST_CORO(parse_config_test, missing_compatibility_level_is_error) {
+    // compatibilityLevel is the one field a config response must carry.
+    for (std::string_view body : {R"({})", R"({"normalize": true})"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_config(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_config_test, non_object_is_error) {
+    for (std::string_view body :
+         {R"(["BACKWARD"])", R"("BACKWARD")", "42", "null", "true"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_config(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_config_test, non_string_compatibility_level_is_error) {
+    for (std::string_view body :
+         {R"({"compatibilityLevel": 5})",
+          R"({"compatibilityLevel": null})",
+          R"({"compatibilityLevel": ["BACKWARD"]})",
+          R"({"compatibilityLevel": {}})",
+          R"({"compatibilityLevel": true})"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_config(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_config_test, trailing_content_after_object_is_error) {
+    for (std::string_view body :
+         {R"({"compatibilityLevel": "NONE"} "more")",
+          R"({"compatibilityLevel": "NONE"}{})",
+          R"({"compatibilityLevel": "NONE"}garbage)",
+          R"({"compatibilityLevel": "NONE"},)"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_config(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_config_test, trailing_whitespace_is_ok) {
+    auto res = co_await parse_config(
+      iobuf::from("{\"compatibilityLevel\": \"FULL\"}  \n\t "));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res->level, registry_compatibility_level::full);
+}
+
+TEST_CORO(parse_config_test, fragmented_input) {
+    // One byte per fragment forces the object structure, the level value, and
+    // an unmodeled field to span parser fragment boundaries.
+    auto res = co_await parse_config(fragmented_iobuf(
+      R"({"compatibilityLevel": "BACKWARD_TRANSITIVE", "normalize": true})",
+      1));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(
+      res->level, registry_compatibility_level::backward_transitive);
+    ASSERT_EQ_CORO(res->raw, "BACKWARD_TRANSITIVE");
+    ASSERT_EQ_CORO(res->unknown_fields.size(), size_t{1});
+    ASSERT_EQ_CORO(res->unknown_fields[0], "normalize");
+}
+
+TEST_CORO(parse_config_test, malformed_or_truncated_is_error) {
+    for (std::string_view body :
+         {"",
+          "{",
+          R"({"compatibilityLevel")",
+          R"({"compatibilityLevel":)",
+          R"({"compatibilityLevel": "BACKWARD)",
+          R"({"compatibilityLevel": "BACKWARD")",
+          R"({"normalize": true, "compatibilityLevel")",
+          "not json"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_config(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST(registry_compatibility_level_test, to_string_view_and_format) {
+    // The display/log form of every level, including the open-enum `unknown`
+    // sentinel. Known arms are also hit via
+    // registry_compatibility_level_from_wire, but this pins the full contract
+    // and the format_to path.
+    using cl = registry_compatibility_level;
+    EXPECT_EQ(to_string_view(cl::none), "NONE");
+    EXPECT_EQ(to_string_view(cl::backward), "BACKWARD");
+    EXPECT_EQ(to_string_view(cl::backward_transitive), "BACKWARD_TRANSITIVE");
+    EXPECT_EQ(to_string_view(cl::forward), "FORWARD");
+    EXPECT_EQ(to_string_view(cl::forward_transitive), "FORWARD_TRANSITIVE");
+    EXPECT_EQ(to_string_view(cl::full), "FULL");
+    EXPECT_EQ(to_string_view(cl::full_transitive), "FULL_TRANSITIVE");
+    EXPECT_EQ(to_string_view(cl::unknown), "{unknown}");
+    // The fmt formatter (via format_to) mirrors to_string_view.
+    EXPECT_EQ(fmt::format("{}", cl::full_transitive), "FULL_TRANSITIVE");
+    EXPECT_EQ(fmt::format("{}", cl::unknown), "{unknown}");
+}
+
 TEST_CORO(parse_subject_versions_test, basic) {
     auto res = co_await parse_subject_versions(iobuf::from("[1, 2, 3]"));
     ASSERT_TRUE_CORO(res.has_value());

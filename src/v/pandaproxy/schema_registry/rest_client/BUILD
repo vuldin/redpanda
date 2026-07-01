@@ -8,6 +8,7 @@ redpanda_cc_library(
         "parse.cc",
     ],
     hdrs = [
+        "config.h",
         "mode.h",
         "parse.h",
     ],

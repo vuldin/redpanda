@@ -210,6 +210,81 @@ ss::future<std::expected<mode_info, parse_error>> parse_mode(iobuf body) {
     }
 }
 
+ss::future<std::expected<config_info, parse_error>> parse_config(iobuf body) {
+    using token = serde::json::token;
+    // Firewall exceptions from the parser: malformed input is reported via the
+    // returned std::expected, not thrown.
+    try {
+        serde::json::parser p(std::move(body));
+
+        if (!co_await p.next() || p.token() != token::start_object) {
+            co_return std::unexpected(
+              parse_error{.reason = "expected a JSON object"});
+        }
+
+        std::optional<registry_compatibility_level> level;
+        ss::sstring raw;
+        chunked_vector<ss::sstring> unknown_fields;
+        while (co_await p.next()) {
+            if (p.token() == token::end_object) {
+                // The body is exactly one JSON object: reject any trailing
+                // content rather than ignoring it.
+                co_await p.next();
+                if (p.token() != token::eof) {
+                    co_return std::unexpected(
+                      parse_error{
+                        .reason = "trailing content after config object"});
+                }
+                if (!level.has_value()) {
+                    // compatibilityLevel is the one field a config response is
+                    // documented to always carry.
+                    co_return std::unexpected(
+                      parse_error{
+                        .reason = "missing compatibilityLevel field"});
+                }
+                co_return config_info{
+                  .level = *level,
+                  .raw = std::move(raw),
+                  .unknown_fields = std::move(unknown_fields)};
+            }
+            if (p.token() != token::key) {
+                co_return std::unexpected(
+                  parse_error{.reason = "expected an object key"});
+            }
+            auto key = p.value_string().linearize_to_string();
+            if (!co_await p.next()) {
+                co_return std::unexpected(
+                  parse_error{.reason = "truncated JSON after key"});
+            }
+            if (key == "compatibilityLevel") {
+                if (p.token() != token::value_string) {
+                    co_return std::unexpected(
+                      parse_error{
+                        .reason = "compatibilityLevel must be a string"});
+                }
+                // Shape is strict but the value is open: map the recognized
+                // wire strings and keep the verbatim value, so an unrecognized
+                // (open-enum) level is preserved rather than rejected.
+                raw = p.value_string().linearize_to_string();
+                level = registry_compatibility_level_from_wire(raw);
+            } else {
+                // Any other top-level field is unmodeled: record its name so a
+                // caller can tell config was dropped, then skip its value.
+                unknown_fields.push_back(std::move(key));
+                co_await p.skip_value();
+            }
+        }
+
+        // next() returned false before the closing '}'.
+        co_return std::unexpected(
+          parse_error{.reason = "truncated or malformed JSON"});
+    } catch (const std::exception& e) {
+        co_return std::unexpected(
+          parse_error{
+            .reason = ssx::sformat("failed to parse config: {}", e.what())});
+    }
+}
+
 ss::future<std::expected<chunked_vector<schema_version>, parse_error>>
 parse_subject_versions(iobuf body) {
     using token = serde::json::token;

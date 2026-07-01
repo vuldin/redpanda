@@ -14,6 +14,7 @@
 #include "bytes/iobuf.h"
 #include "container/chunked_vector.h"
 #include "http/client.h"
+#include "pandaproxy/schema_registry/rest_client/config.h"
 #include "pandaproxy/schema_registry/rest_client/credentials.h"
 #include "pandaproxy/schema_registry/rest_client/error.h"
 #include "pandaproxy/schema_registry/rest_client/mode.h"
@@ -126,6 +127,23 @@ public:
       const context_subject& subject,
       retry_chain_node& rtc,
       default_to_global fallback = default_to_global::no);
+
+    /// GET /config — read the registry-wide (global / default) configuration.
+    /// Like get_mode this always resolves to a value: a registry with no global
+    /// config set reports the built-in default compatibility level (BACKWARD),
+    /// so there is no operation-specific not-found (only a transient 500 /
+    /// error_code 50001 storage failure, handled by the retry policy).
+    ///
+    /// Only the compatibility level is modeled (see config.h): it is an open
+    /// enum, so a value a newer server reports is surfaced as
+    /// registry_compatibility_level::unknown with the verbatim string in
+    /// config_info::raw. Any other top-level config fields present (validation
+    /// flags, metadata, rule sets — which Redpanda's own server does not emit)
+    /// are named in config_info::unknown_fields rather than modeled. The
+    /// `defaultToGlobal` query parameter is omitted: on the subject-less global
+    /// endpoint it has no observable effect.
+    ss::future<std::expected<config_info, domain_error>>
+    get_config(retry_chain_node& rtc);
 
     /// GET /subjects/{subject}/versions — list the version numbers registered
     /// under \p subject. With \p deleted set to yes, soft-deleted versions are

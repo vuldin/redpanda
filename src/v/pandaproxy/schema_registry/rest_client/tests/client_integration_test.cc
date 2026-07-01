@@ -113,6 +113,20 @@ void put_subject_mode(
     BOOST_REQUIRE_EQUAL(res.headers.result(), bh::status::ok);
 }
 
+// Set the registry-wide (global) compatibility via PUT /config on the seed
+// client. Note the request field is "compatibility", whereas GET /config
+// returns it as "compatibilityLevel".
+void put_global_config(http::client& client, std::string_view compat) {
+    auto res = http_request(
+      client,
+      "/config",
+      iobuf::from(fmt::format(R"({{"compatibility": "{}"}})", compat)),
+      bh::verb::put,
+      serialization_format::schema_registry_v1_json,
+      serialization_format::schema_registry_v1_json);
+    BOOST_REQUIRE_EQUAL(res.headers.result(), bh::status::ok);
+}
+
 } // namespace
 
 // Drives the rest_client against the in-tree Schema Registry server: seeds
@@ -195,6 +209,18 @@ FIXTURE_TEST(sr_rest_client_integration, pandaproxy_test_fixture) {
         BOOST_REQUIRE(res.has_value());
         BOOST_REQUIRE(res->mode == rc::registry_mode::read_write);
         BOOST_REQUIRE_EQUAL(res->raw, "READWRITE");
+    }
+
+    info("get_config returns the default BACKWARD compatibility level");
+    {
+        // No global config has been set, so the registry reports its built-in
+        // default. The real server emits {"compatibilityLevel":"BACKWARD"} and
+        // nothing else, so unknown_fields is empty.
+        auto res = sut.get_config(rtc).get();
+        BOOST_REQUIRE(res.has_value());
+        BOOST_REQUIRE(res->level == rc::registry_compatibility_level::backward);
+        BOOST_REQUIRE_EQUAL(res->raw, "BACKWARD");
+        BOOST_REQUIRE(res->unknown_fields.empty());
     }
 
     info(
@@ -378,6 +404,16 @@ FIXTURE_TEST(sr_rest_client_integration, pandaproxy_test_fixture) {
           = sut.get_subject_mode(multi, rtc, pps::default_to_global::yes).get();
         BOOST_REQUIRE(effective.has_value());
         BOOST_REQUIRE(effective->mode == rc::registry_mode::read_only);
+    }
+
+    info("get_config reflects a compatibility change made via PUT /config");
+    {
+        // PUT uses the "compatibility" field; GET returns "compatibilityLevel".
+        put_global_config(seed, "FULL");
+        auto res = sut.get_config(rtc).get();
+        BOOST_REQUIRE(res.has_value());
+        BOOST_REQUIRE(res->level == rc::registry_compatibility_level::full);
+        BOOST_REQUIRE_EQUAL(res->raw, "FULL");
     }
 
     // Kept last: switching the global mode to READONLY would reject the schema
