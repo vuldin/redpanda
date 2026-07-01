@@ -106,6 +106,27 @@ public:
     ss::future<std::expected<mode_info, domain_error>>
     get_mode(retry_chain_node& rtc);
 
+    /// GET /mode/{subject} — read the mode of a single subject (or a context,
+    /// when \p subject names one). \p fallback selects which of two questions
+    /// is asked:
+    ///   - no (default): the subject's OWN explicitly-set mode. A subject with
+    ///     no override yields subject_mode_not_found (HTTP 404 / error_code
+    ///     40409; a 40401 from some server versions is treated the same). Use
+    ///     this to read back an override or detect its absence.
+    ///   - yes: the EFFECTIVE mode, resolving subject -> context -> global ->
+    ///     built-in default. This always resolves, so subject_mode_not_found
+    ///     cannot occur. Use this for the mode that actually governs the
+    ///     subject.
+    ///
+    /// The result is the same open enum as get_mode (see mode.h). Targeting: a
+    /// plain/qualified subject reads that subject; a context string (":.ctx:")
+    /// reads that context's mode; the explicit default context (":.:") behaves
+    /// like the global get_mode.
+    ss::future<std::expected<mode_info, domain_error>> get_subject_mode(
+      const context_subject& subject,
+      retry_chain_node& rtc,
+      default_to_global fallback = default_to_global::no);
+
     /// GET /subjects/{subject}/versions — list the version numbers registered
     /// under \p subject. With \p deleted set to yes, soft-deleted versions are
     /// included. A missing subject yields subject_not_found.
