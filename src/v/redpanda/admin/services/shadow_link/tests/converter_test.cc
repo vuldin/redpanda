@@ -1534,11 +1534,12 @@ TEST(converter_test, create_with_schema_registry_api_sync_options) {
     api.set_destination(std::move(destination));
     api.set_unsupported_schema_feature_policy(
       proto::admin::unsupported_schema_feature_policy::remove);
+    api.set_paused(true);
 
-    req.get_shadow_link()
-      .get_configurations()
-      .get_schema_registry_sync_options()
-      .set_shadow_schema_registry_api(std::move(api));
+    auto& sr_options = req.get_shadow_link()
+                         .get_configurations()
+                         .get_schema_registry_sync_options();
+    sr_options.set_shadow_schema_registry_api(std::move(api));
 
     auto now = model::to_time_point(model::timestamp::now());
     auto md = admin::convert_create_to_metadata(std::move(req));
@@ -1548,6 +1549,7 @@ TEST(converter_test, create_with_schema_registry_api_sync_options) {
     ASSERT_NE(mode, nullptr);
 
     const auto& sr_api = *mode;
+    EXPECT_EQ(sr_api.is_enabled, cluster_link::model::enabled_t::no);
     EXPECT_EQ(sr_api.source_url, "https://schema-registry.example.com");
     ASSERT_TRUE(sr_api.auth_config.has_value());
     ASSERT_TRUE(
@@ -1893,6 +1895,7 @@ TEST(converter_test, metadata_to_shadow_link_schema_registry_api_options) {
       identity_context_mapping{};
     api.feature_policy = cluster_link::model::schema_registry_sync_config::
       unsupported_feature_policy::remove;
+    api.is_enabled = cluster_link::model::enabled_t::no;
     md->configuration.schema_registry_sync_cfg.sync_mode = std::move(api);
 
     auto sl = admin::metadata_to_shadow_link(std::move(md), {});
@@ -1901,6 +1904,7 @@ TEST(converter_test, metadata_to_shadow_link_schema_registry_api_options) {
       = sl.get_configurations().get_schema_registry_sync_options();
     ASSERT_TRUE(options.has_shadow_schema_registry_api());
     const auto& proto_api = options.get_shadow_schema_registry_api();
+    EXPECT_TRUE(proto_api.get_paused());
     EXPECT_EQ(
       proto_api.get_source_url(), "https://schema-registry.example.com");
     ASSERT_TRUE(proto_api.get_auth_options().has_basic());
