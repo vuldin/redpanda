@@ -145,6 +145,28 @@ public:
     ss::future<std::expected<config_info, domain_error>>
     get_config(retry_chain_node& rtc);
 
+    /// GET /config/{subject} — read the configuration of a single subject (or a
+    /// context, when \p subject names one). \p fallback selects which of two
+    /// questions is asked:
+    ///   - no (default): the subject's OWN config. A subject with no
+    ///     override yields subject_config_not_found (HTTP 404 / error_code
+    ///     40408; a 40401 from some server versions is treated the same). Use
+    ///     this to read back an override or detect its absence.
+    ///   - yes: the EFFECTIVE config, resolving subject -> context -> global ->
+    ///     built-in default. This always resolves, so subject_config_not_found
+    ///     cannot occur. Use this for the config that actually governs the
+    ///     subject.
+    ///
+    /// The result is the same config_info as get_config (see config.h).
+    /// Targeting: a plain/qualified subject reads that subject; a context
+    /// string
+    /// (":.ctx:") reads that context's config; the explicit default context
+    /// (":.:") behaves like the global get_config.
+    ss::future<std::expected<config_info, domain_error>> get_subject_config(
+      const context_subject& subject,
+      retry_chain_node& rtc,
+      default_to_global fallback = default_to_global::no);
+
     /// GET /subjects/{subject}/versions — list the version numbers registered
     /// under \p subject. With \p deleted set to yes, soft-deleted versions are
     /// included. A missing subject yields subject_not_found.

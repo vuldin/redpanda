@@ -1070,6 +1070,269 @@ TEST(rest_client, get_config_after_shutdown_is_aborted) {
     EXPECT_TRUE(std::holds_alternative<rc::aborted_error>(res.error()));
 }
 
+TEST(rest_client, get_subject_config_request_shape_and_success) {
+    auto check_and_respond = [](
+                               bh::request_header<>&& r,
+                               std::optional<iobuf>,
+                               ss::lowres_clock::duration) {
+        EXPECT_EQ(r.method(), bh::verb::get);
+        // No defaultToGlobal by default: this asks for the subject's own
+        // config.
+        EXPECT_EQ(r.target(), "/config/orders");
+        EXPECT_EQ(r.at(bh::field::accept), "application/json");
+        // base64("user:pass") == "dXNlcjpwYXNz"
+        EXPECT_EQ(r.at(bh::field::authorization), "Basic dXNlcjpwYXNz");
+        return ss::make_ready_future<http::downloaded_response>(
+          http::downloaded_response{
+            .status = bh::status::ok,
+            .body = iobuf::from(R"({"compatibilityLevel": "NONE"})")});
+    };
+    rc::client client{
+      make_http_client([&](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(check_and_respond);
+      }),
+      endpoint,
+      rc::basic_auth_credentials{.username = "user", .password = "pass"}};
+
+    auto subject = pps::context_subject::unqualified("orders");
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_subject_config(subject, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->level, rc::registry_compatibility_level::none);
+    EXPECT_EQ(res->raw, "NONE");
+    EXPECT_TRUE(res->unknown_fields.empty());
+}
+
+TEST(rest_client, get_subject_config_encodes_qualified_subject) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce([](
+                        bh::request_header<>&& r,
+                        std::optional<iobuf>,
+                        ss::lowres_clock::duration) {
+                // ":.ctx:orders" percent-encoded exactly once.
+                EXPECT_EQ(r.target(), "/config/%3A.ctx%3Aorders");
+                return ss::make_ready_future<http::downloaded_response>(
+                  http::downloaded_response{
+                    .status = bh::status::ok,
+                    .body = iobuf::from(R"({"compatibilityLevel": "FULL"})")});
+            });
+      }),
+      endpoint,
+      std::nullopt,
+      pps::qualified_subjects_enabled::yes};
+
+    pps::context_subject subject{pps::context{".ctx"}, pps::subject{"orders"}};
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_subject_config(subject, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->level, rc::registry_compatibility_level::full);
+}
+
+TEST(rest_client, get_subject_config_default_to_global_adds_query_param) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce([](
+                        bh::request_header<>&& r,
+                        std::optional<iobuf>,
+                        ss::lowres_clock::duration) {
+                EXPECT_EQ(r.target(), "/config/orders?defaultToGlobal=true");
+                return ss::make_ready_future<http::downloaded_response>(
+                  http::downloaded_response{
+                    .status = bh::status::ok,
+                    .body = iobuf::from(
+                      R"({"compatibilityLevel": "BACKWARD"})")});
+            });
+      }),
+      endpoint};
+
+    auto subject = pps::context_subject::unqualified("orders");
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client
+                 .get_subject_config(subject, rtc, pps::default_to_global::yes)
+                 .get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->level, rc::registry_compatibility_level::backward);
+}
+
+TEST(rest_client, get_subject_config_no_subject_level_config) {
+    // The operation-specific outcome: 404 / 40408 becomes
+    // subject_config_not_found rather than a generic http error.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(
+              bh::status::not_found,
+              R"({"error_code": 40408, "message": "Subject 'orders' does not have subject-level compatibility configured"})"));
+      }),
+      endpoint};
+
+    auto subject = pps::context_subject::unqualified("orders");
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_subject_config(subject, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    ASSERT_TRUE(
+      std::holds_alternative<rc::subject_config_not_found>(res.error()));
+    EXPECT_EQ(
+      std::get<rc::subject_config_not_found>(res.error()).subject, subject);
+}
+
+TEST(rest_client, get_subject_config_40401_also_maps_to_not_configured) {
+    // Some server versions use 40401 for the missing-subject-config case; the
+    // client treats it the same as 40408 (the report's defensive guidance).
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(
+              bh::status::not_found,
+              R"({"error_code": 40401, "message": "Subject 'orders' not found"})"));
+      }),
+      endpoint};
+
+    auto subject = pps::context_subject::unqualified("orders");
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_subject_config(subject, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(
+      std::holds_alternative<rc::subject_config_not_found>(res.error()));
+}
+
+TEST(rest_client, get_subject_config_other_errors_pass_through_untranslated) {
+    // Only 404/40408 (and 40401) map to subject_config_not_found. A 404 for an
+    // unknown path (bare error_code 404) and a non-404 status both stay generic
+    // http errors, so a bad URL is not mistaken for a missing subject config.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(
+              bh::status::not_found,
+              R"({"error_code": 404, "message": "not found"})"))
+            .WillOnce(respond(
+              bh::status::unprocessable_entity,
+              R"({"error_code": 42200, "message": "bad"})"));
+      }),
+      endpoint};
+
+    auto subject = pps::context_subject::unqualified("orders");
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+
+    auto bad_path = client.get_subject_config(subject, rtc).get();
+    ASSERT_FALSE(bad_path.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::http_call_error>(bad_path.error()));
+
+    auto unprocessable = client.get_subject_config(subject, rtc).get();
+    ASSERT_FALSE(unprocessable.has_value());
+    EXPECT_TRUE(
+      std::holds_alternative<rc::http_call_error>(unprocessable.error()));
+
+    client.shutdown().get();
+}
+
+TEST(rest_client, get_subject_config_retries_exhausted_surfaces_error) {
+    // A non-http terminal error (retries_exhausted) is not an
+    // http_status_error, so translation leaves it untouched and it surfaces
+    // as-is.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillRepeatedly(respond(bh::status::service_unavailable, "busy"));
+      }),
+      endpoint};
+
+    auto subject = pps::context_subject::unqualified("orders");
+    ss::abort_source as;
+    retry_chain_node rtc(as, 100ms, 10ms);
+    auto res = client.get_subject_config(subject, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::retries_exhausted>(res.error()));
+}
+
+TEST(rest_client, get_subject_config_transport_exception_passes_through) {
+    // A connection-level failure is a string http_call_error (no status), so
+    // translation cannot classify it and passes it through unchanged.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce([](
+                        bh::request_header<>&&,
+                        std::optional<iobuf>,
+                        ss::lowres_clock::duration) {
+                return ss::make_exception_future<http::downloaded_response>(
+                  std::runtime_error("connection refused"));
+            });
+      }),
+      endpoint};
+
+    auto subject = pps::context_subject::unqualified("orders");
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_subject_config(subject, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    ASSERT_TRUE(std::holds_alternative<rc::http_call_error>(res.error()));
+    EXPECT_TRUE(
+      std::holds_alternative<ss::sstring>(
+        std::get<rc::http_call_error>(res.error())));
+}
+
+TEST(rest_client, get_subject_config_parse_error_surfaced) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(bh::status::ok, R"(["not", "an", "object"])"));
+      }),
+      endpoint};
+
+    auto subject = pps::context_subject::unqualified("orders");
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_subject_config(subject, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::parse_error>(res.error()));
+}
+
+TEST(rest_client, get_subject_config_after_shutdown_is_aborted) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _)).Times(0);
+      }),
+      endpoint};
+
+    client.shutdown().get();
+
+    auto subject = pps::context_subject::unqualified("orders");
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_subject_config(subject, rtc).get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::aborted_error>(res.error()));
+}
+
 TEST(rest_client, list_subject_versions_success_and_encodes_subject) {
     rc::client client{
       make_http_client([](mock_client& m) {

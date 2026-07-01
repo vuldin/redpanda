@@ -145,6 +145,19 @@ struct subject_mode_not_found {
     }
 };
 
+// The subject (or context) has no explicitly-configured compatibility config
+// (HTTP 404 / error_code 40408; some server versions instead use 40401, which
+// this client treats the same). Only produced by get_subject_config with
+// default_to_global::no; with yes the effective config always resolves, so
+// this never occurs.
+struct subject_config_not_found {
+    context_subject subject;
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(it, "subject config not configured: {}", subject);
+    }
+};
+
 // Represents the sum of all error types which can be encountered during
 // rest-client operations. The JSON-decode arm reuses parse_error from parse.h.
 using domain_error = std::variant<
@@ -155,6 +168,7 @@ using domain_error = std::variant<
   subject_not_found,
   version_not_found,
   subject_mode_not_found,
+  subject_config_not_found,
   aborted_error>;
 
 } // namespace pandaproxy::schema_registry::rest_client
@@ -208,6 +222,9 @@ struct fmt::formatter<pandaproxy::schema_registry::rest_client::domain_error>
               return fmt::format_to(ctx.out(), "{}", value);
           },
           [&](const rc::subject_mode_not_found& value) {
+              return fmt::format_to(ctx.out(), "{}", value);
+          },
+          [&](const rc::subject_config_not_found& value) {
               return fmt::format_to(ctx.out(), "{}", value);
           },
           [&](const rc::aborted_error& value) {

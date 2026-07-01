@@ -127,6 +127,22 @@ void put_global_config(http::client& client, std::string_view compat) {
     BOOST_REQUIRE_EQUAL(res.headers.result(), bh::status::ok);
 }
 
+// Set a subject's (or context's) compatibility via PUT /config/{subject} on the
+// seed client. As with PUT /config the request field is "compatibility".
+void put_subject_config(
+  http::client& client,
+  std::string_view subject_path,
+  std::string_view compat) {
+    auto res = http_request(
+      client,
+      fmt::format("/config/{}", subject_path),
+      iobuf::from(fmt::format(R"({{"compatibility": "{}"}})", compat)),
+      bh::verb::put,
+      serialization_format::schema_registry_v1_json,
+      serialization_format::schema_registry_v1_json);
+    BOOST_REQUIRE_EQUAL(res.headers.result(), bh::status::ok);
+}
+
 } // namespace
 
 // Drives the rest_client against the in-tree Schema Registry server: seeds
@@ -221,6 +237,27 @@ FIXTURE_TEST(sr_rest_client_integration, pandaproxy_test_fixture) {
         BOOST_REQUIRE(res->level == rc::registry_compatibility_level::backward);
         BOOST_REQUIRE_EQUAL(res->raw, "BACKWARD");
         BOOST_REQUIRE(res->unknown_fields.empty());
+    }
+
+    info(
+      "get_subject_config: an un-overridden subject is not configured, but "
+      "defaultToGlobal resolves the effective config");
+    {
+        // "multi" was seeded without a subject-level config, so its own config
+        // is the real 40408 (mapped to subject_config_not_found).
+        auto own = sut.get_subject_config(multi, rtc).get();
+        BOOST_REQUIRE(!own.has_value());
+        BOOST_REQUIRE(
+          std::holds_alternative<rc::subject_config_not_found>(own.error()));
+
+        // With defaultToGlobal the effective config resolves down to the global
+        // default (BACKWARD) rather than 40408.
+        auto effective
+          = sut.get_subject_config(multi, rtc, pps::default_to_global::yes)
+              .get();
+        BOOST_REQUIRE(effective.has_value());
+        BOOST_REQUIRE(
+          effective->level == rc::registry_compatibility_level::backward);
     }
 
     info(
@@ -384,6 +421,30 @@ FIXTURE_TEST(sr_rest_client_integration, pandaproxy_test_fixture) {
             BOOST_REQUIRE(all.has_value());
             BOOST_REQUIRE(contains(all.value(), solo));
         }
+    }
+
+    // Kept after the delete section but before the subject mode is set to
+    // READONLY below: a subject in read-only mode rejects config writes too.
+    info(
+      "get_subject_config reflects a subject config set via "
+      "PUT /config/<subject>");
+    {
+        // A subject-level override, distinct from the global compatibility.
+        put_subject_config(seed, "multi", "NONE");
+
+        // Without defaultToGlobal we read the subject's own override back.
+        auto own = sut.get_subject_config(multi, rtc).get();
+        BOOST_REQUIRE(own.has_value());
+        BOOST_REQUIRE(own->level == rc::registry_compatibility_level::none);
+        BOOST_REQUIRE_EQUAL(own->raw, "NONE");
+
+        // The effective config agrees: a subject override wins over the global.
+        auto effective
+          = sut.get_subject_config(multi, rtc, pps::default_to_global::yes)
+              .get();
+        BOOST_REQUIRE(effective.has_value());
+        BOOST_REQUIRE(
+          effective->level == rc::registry_compatibility_level::none);
     }
 
     // Kept after the delete section: setting "multi" READONLY would block the
