@@ -95,12 +95,11 @@ private:
 
     /// Full source scan and create-only reconcile: discovers the active source
     /// nodes (across `contexts`), imports those missing from the destination's
-    /// active set in reference order, and folds the result into `summary` and
-    /// the task status. Returns the resulting task state (active, or
-    /// link_unavailable if the source becomes unreachable).
+    /// active set in reference order, and folds the result into the in-progress
+    /// sync summary and the task status. Returns the resulting task state
+    /// (active, or link_unavailable if the source becomes unreachable).
     ss::future<state_transition> full_source_sync(
       ss::abort_source&,
-      model::schema_registry_sync_summary&,
       const chunked_hash_set<ppsr::context>& contexts,
       const ss::noncopyable_function<bool(const ppsr::context_subject&)>&
         in_scope);
@@ -120,8 +119,7 @@ private:
       ss::abort_source& as,
       chunked_hash_set<ppsr::subject_version>& source_active,
       chunked_hash_set<ppsr::subject_version>& source_deleted,
-      std::optional<source_error>& unavailable,
-      model::schema_registry_sync_summary& summary);
+      std::optional<source_error>& unavailable);
 
     /// One source version listing with shared error handling: returns the
     /// versions on success, or nullopt after capturing a source_unavailable in
@@ -133,8 +131,10 @@ private:
       const ppsr::context_subject& subject,
       ppsr::include_deleted include_deleted,
       ss::abort_source& as,
-      std::optional<source_error>& unavailable,
-      model::schema_registry_sync_summary& summary);
+      std::optional<source_error>& unavailable);
+
+    // Requires a sync in progress (`current_sync` engaged).
+    void record_error(std::string_view what);
 
     [[nodiscard]] state_transition make_unavailable(const ss::sstring& reason);
     [[nodiscard]] state_transition make_active();

@@ -162,13 +162,19 @@ ss::future<> mirroring_task::refresh_destination_inventory(
       _destination_inventory.active.size());
 }
 
+void mirroring_task::record_error(std::string_view what) {
+    ++_status.current_sync->summary.errors;
+    ++_status.totals_since_task_start.errors;
+    _status.last_error_message = ss::sstring{what};
+    vlog(logger().warn, "Schema Registry sync error: {}", what);
+}
+
 ss::future<std::optional<chunked_vector<ppsr::schema_version>>>
 mirroring_task::list_versions_once(
   const ppsr::context_subject& subject,
   ppsr::include_deleted include_deleted,
   ss::abort_source& as,
-  std::optional<source_error>& unavailable,
-  model::schema_registry_sync_summary& summary) {
+  std::optional<source_error>& unavailable) {
     as.check();
     auto res = co_await _reader->list_subject_versions(
       subject, include_deleted, as);
@@ -184,11 +190,7 @@ mirroring_task::list_versions_once(
     // Reachable but failed (rare delete race): count and skip. Counters are
     // touched only between co_awaits, so sharing them across the concurrent
     // fibers is safe on one reactor.
-    ++summary.errors;
-    ++_status.totals_since_task_start.errors;
-    _status.last_error_message = res.error().message;
-    _status.current_sync->summary = summary;
-    vlog(logger().warn, "Schema Registry sync error: {}", res.error().message);
+    record_error(res.error().message);
     co_return std::nullopt;
 }
 
@@ -197,8 +199,7 @@ ss::future<> mirroring_task::list_one_subject(
   ss::abort_source& as,
   chunked_hash_set<ppsr::subject_version>& source_active,
   chunked_hash_set<ppsr::subject_version>& source_deleted,
-  std::optional<source_error>& unavailable,
-  model::schema_registry_sync_summary& summary) {
+  std::optional<source_error>& unavailable) {
     // A peer fiber already hit source_unavailable; skip the remaining work.
     if (unavailable.has_value()) {
         co_return;
@@ -208,12 +209,12 @@ ss::future<> mirroring_task::list_one_subject(
     // `all` are soft-deleted. Short-circuit on the first failure so a failing
     // subject counts at most one error.
     auto active = co_await list_versions_once(
-      subject, ppsr::include_deleted::no, as, unavailable, summary);
+      subject, ppsr::include_deleted::no, as, unavailable);
     if (!active.has_value()) {
         co_return;
     }
     auto all = co_await list_versions_once(
-      subject, ppsr::include_deleted::yes, as, unavailable, summary);
+      subject, ppsr::include_deleted::yes, as, unavailable);
     if (!all.has_value()) {
         co_return;
     }
@@ -231,18 +232,9 @@ ss::future<> mirroring_task::list_one_subject(
 
 ss::future<task::state_transition> mirroring_task::full_source_sync(
   ss::abort_source& as,
-  model::schema_registry_sync_summary& summary,
   const chunked_hash_set<ppsr::context>& contexts,
   const ss::noncopyable_function<bool(const ppsr::context_subject&)>&
     in_scope) {
-    auto record_error = [this, &summary](std::string_view what) {
-        ++summary.errors;
-        ++_status.totals_since_task_start.errors;
-        _status.last_error_message = ss::sstring{what};
-        _status.current_sync->summary = summary;
-        vlog(logger().warn, "Schema Registry sync error: {}", what);
-    };
-
     // Cluster-global, so safe to read mid-sync (unlike the per-link config a
     // concurrent update_config can swap). The one parallelism bound governs
     // both the version-listing fan-out and the reconcile's import concurrency.
@@ -290,7 +282,7 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
       std::max<size_t>(1, limits.parallelism),
       [&](const ppsr::context_subject& subject) {
           return list_one_subject(
-            subject, as, source_active, source_deleted, unavailable, summary);
+            subject, as, source_active, source_deleted, unavailable);
       });
     if (unavailable.has_value()) {
         co_return make_unavailable(unavailable->message);
@@ -362,12 +354,12 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
     // Fold once into persistent state, then clear so the report-time reflection
     // cannot double-count.
     _reconcile_stats = reconcile_stats{};
-    summary.subject_versions_changed += stats.versions_changed;
-    summary.errors += stats.errors;
+    _status.current_sync->summary.subject_versions_changed
+      += stats.versions_changed;
+    _status.current_sync->summary.errors += stats.errors;
     _status.totals_since_task_start.subject_versions_changed
       += stats.versions_changed;
     _status.totals_since_task_start.errors += stats.errors;
-    _status.current_sync->summary = summary;
 
     // Re-scan now that imports have landed so the reported destination counts
     // reflect the post-sync state, not the pre-import baseline the diff used.
@@ -383,8 +375,8 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
       stats.versions_changed,
       stats.errors);
 
-    summary.finish_time = ::model::timestamp::now();
-    _status.last_full_sync = summary;
+    _status.current_sync->summary.finish_time = ::model::timestamp::now();
+    _status.last_full_sync = _status.current_sync->summary;
     // Completed (best-effort, per-item failures counted), so advance the timer
     // and retry on the normal interval.
     _last_full_sync = ss::lowres_clock::now();
@@ -398,12 +390,10 @@ mirroring_task::run_impl(ss::abort_source& as) {
     const bool long_sync = std::exchange(_config_changed, false)
                            || should_long_sync();
 
-    model::schema_registry_sync_summary summary;
-    summary.start_time = ::model::timestamp::now();
     _status.current_sync = model::schema_registry_current_sync{
       .sync_type = long_sync ? model::schema_registry_sync_type::full
                              : model::schema_registry_sync_type::tail,
-      .summary = summary};
+      .summary = {.start_time = ::model::timestamp::now()}};
     // current_sync reflects an in-progress sync only; clear it on every exit
     // (success, unavailable, or a fault that throws out of run_impl) so a stale
     // partial summary is never reported between runs.
@@ -424,14 +414,7 @@ mirroring_task::run_impl(ss::abort_source& as) {
           contexts_res.error().kind == source_error_kind::source_unavailable) {
             co_return make_unavailable(contexts_res.error().message);
         }
-        ++summary.errors;
-        ++_status.totals_since_task_start.errors;
-        _status.last_error_message = contexts_res.error().message;
-        _status.current_sync->summary = summary;
-        vlog(
-          logger().warn,
-          "Schema Registry sync error: {}",
-          contexts_res.error().message);
+        record_error(contexts_res.error().message);
         co_return make_active();
     }
     // Filter has union semantics: filter.contexts selects whole contexts,
@@ -488,7 +471,7 @@ mirroring_task::run_impl(ss::abort_source& as) {
       std::move(filter_contexts), std::move(filter_subjects));
 
     co_await refresh_destination_inventory(in_scope, as);
-    co_return co_await full_source_sync(as, summary, contexts, in_scope);
+    co_return co_await full_source_sync(as, contexts, in_scope);
 }
 
 task::state_transition
