@@ -71,6 +71,25 @@ public:
     list_subjects(
       retry_chain_node& rtc, include_deleted deleted = include_deleted::no);
 
+    /// GET /contexts — list the contexts that currently exist in the registry.
+    /// The default context is always present, returned as the one-character
+    /// context ".". Each element is the bare, dot-prefixed context name (e.g.
+    /// ".dev"); to reuse one as a context-qualified subject prefix elsewhere,
+    /// wrap it in colons (".dev" -> ":.dev:"). There is no operation-specific
+    /// not-found: an empty registry still lists ["."].
+    ///
+    /// When \p context_prefix is set, only contexts whose (dot-prefixed) name
+    /// begins with it are returned — e.g. ".prod" matches ".prod" and
+    /// ".prod-eu", and "." matches every context. The prefix is both sent as
+    /// the `contextPrefix` query parameter (so a server that supports it
+    /// filters at the source) AND applied client-side, so the result is
+    /// correctly filtered even against a server that ignores the parameter
+    /// (Redpanda's own server does). nullopt (the default) applies no filter.
+    ss::future<std::expected<chunked_vector<context>, domain_error>>
+    list_contexts(
+      retry_chain_node& rtc,
+      std::optional<ss::sstring> context_prefix = std::nullopt);
+
     /// GET /subjects/{subject}/versions — list the version numbers registered
     /// under \p subject. With \p deleted set to yes, soft-deleted versions are
     /// included. A missing subject yields subject_not_found.

@@ -87,8 +87,9 @@ void soft_delete(http::client& client, std::string_view subject_path) {
 } // namespace
 
 // Drives the rest_client against the in-tree Schema Registry server: seeds
-// schemas over the real REST API, then exercises all three read calls plus the
-// real not-found (40401/40402) responses through a real http::client. This is
+// schemas over the real REST API, then exercises its read calls (list_subjects,
+// list_contexts, list_subject_versions, get_schema_by_version) plus the real
+// not-found (40401/40402) responses through a real http::client. This is
 // the fidelity counterpart to the mock-based client_test — it proves the wire
 // shape, qualified-subject %3A path encoding, and error-code classification
 // against actual server responses. (References are covered by the parser unit
@@ -125,6 +126,36 @@ FIXTURE_TEST(sr_rest_client_integration, pandaproxy_test_fixture) {
         BOOST_REQUIRE(contains(multi));
         BOOST_REQUIRE(contains(solo));
         BOOST_REQUIRE(contains(ctx_sub));
+    }
+
+    info("list_contexts returns the default and the seeded named context");
+    {
+        auto res = sut.list_contexts(rtc).get();
+        BOOST_REQUIRE(res.has_value());
+        const auto& ctxs = res.value();
+        auto contains = [&ctxs](const pps::context& c) {
+            return std::ranges::find(ctxs, c) != ctxs.end();
+        };
+        // The default context is always present; registering :.myctx:ctx-sub
+        // above materialized ".myctx".
+        BOOST_REQUIRE(contains(pps::default_context));
+        BOOST_REQUIRE(contains(pps::context{".myctx"}));
+    }
+
+    info(
+      "list_contexts filters by prefix client-side (the server ignores the "
+      "contextPrefix param)");
+    {
+        // Redpanda returns every context; the client filters, so only ".myctx"
+        // — not the default "." — comes back for the ".myctx" prefix.
+        auto res = sut.list_contexts(rtc, ss::sstring{".myctx"}).get();
+        BOOST_REQUIRE(res.has_value());
+        const auto& ctxs = res.value();
+        auto contains = [&ctxs](const pps::context& c) {
+            return std::ranges::find(ctxs, c) != ctxs.end();
+        };
+        BOOST_REQUIRE(contains(pps::context{".myctx"}));
+        BOOST_REQUIRE(!contains(pps::default_context));
     }
 
     info("list_subject_versions returns [1, 2]");

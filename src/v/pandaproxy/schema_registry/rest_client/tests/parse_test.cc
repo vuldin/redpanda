@@ -184,6 +184,106 @@ TEST_CORO(parse_subjects_test, round_trip) {
     }
 }
 
+TEST_CORO(parse_contexts_test, basic) {
+    // The default context (".") sorts first, followed by named, dot-prefixed
+    // contexts. Each string is wrapped verbatim; order is preserved.
+    auto res = co_await parse_contexts(
+      iobuf::from(R"([".", ".dev", ".prod-eu"])"));
+    ASSERT_TRUE_CORO(res.has_value());
+    const auto& c = res.value();
+    ASSERT_EQ_CORO(c.size(), size_t{3});
+    ASSERT_EQ_CORO(c[0], default_context);
+    ASSERT_EQ_CORO(c[1], context{".dev"});
+    ASSERT_EQ_CORO(c[2], context{".prod-eu"});
+}
+
+TEST_CORO(parse_contexts_test, default_only) {
+    // A brand-new/empty registry still reports the default context.
+    auto res = co_await parse_contexts(iobuf::from(R"(["."])"));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res.value().size(), size_t{1});
+    ASSERT_EQ_CORO(res.value()[0], default_context);
+}
+
+TEST_CORO(parse_contexts_test, empty_array) {
+    // A contextPrefix that matches nothing yields []; the parser accepts it
+    // even though a live registry always has at least the default context.
+    auto res = co_await parse_contexts(iobuf::from("[]"));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_TRUE_CORO(res.value().empty());
+}
+
+TEST_CORO(parse_contexts_test, colon_form_taken_verbatim) {
+    // Contexts are never colon-qualified in this response; a ":.ctx:"-looking
+    // element is not split, it is wrapped verbatim as a context.
+    auto res = co_await parse_contexts(iobuf::from(R"([":.ctx:"])"));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res.value().size(), size_t{1});
+    ASSERT_EQ_CORO(res.value()[0], context{":.ctx:"});
+}
+
+TEST_CORO(parse_contexts_test, fragmented_input) {
+    // One byte per fragment: forces context names and the array structure to
+    // span fragment boundaries.
+    constexpr std::string_view body = R"([".", ".dev", ".prod-eu"])";
+    auto res = co_await parse_contexts(fragmented_iobuf(body, 1));
+    ASSERT_TRUE_CORO(res.has_value());
+    const auto& c = res.value();
+    ASSERT_EQ_CORO(c.size(), size_t{3});
+    ASSERT_EQ_CORO(c[0], default_context);
+    ASSERT_EQ_CORO(c[1], context{".dev"});
+    ASSERT_EQ_CORO(c[2], context{".prod-eu"});
+}
+
+TEST_CORO(parse_contexts_test, not_an_array_is_error) {
+    for (std::string_view body :
+         {R"({})", R"("just-a-string")", "42", "null", "true"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_contexts(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_contexts_test, non_string_element_is_error) {
+    for (std::string_view body :
+         {R"([".", 42])",
+          R"([".", null])",
+          R"([".", {}])",
+          R"([".", ["x"]])"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_contexts(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_contexts_test, trailing_content_after_array_is_error) {
+    // The contexts body is exactly one array; content after the closing ']' is
+    // rejected, not ignored.
+    for (std::string_view body :
+         {R"(["."] "more")", R"(["."][])", R"(["."]garbage)", R"(["."],)"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_contexts(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_contexts_test, trailing_whitespace_is_ok) {
+    auto res = co_await parse_contexts(iobuf::from("[\".\"]  \n\t "));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res.value().size(), size_t{1});
+    ASSERT_EQ_CORO(res.value()[0], default_context);
+}
+
+TEST_CORO(parse_contexts_test, malformed_or_truncated_is_error) {
+    // Missing close bracket, dangling comma, unterminated string, non-JSON.
+    for (std::string_view body :
+         {"", "[", "[\".\"", "[\".\",", "[\".unterminated", "not json"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_contexts(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
 TEST_CORO(parse_subject_versions_test, basic) {
     auto res = co_await parse_subject_versions(iobuf::from("[1, 2, 3]"));
     ASSERT_TRUE_CORO(res.has_value());

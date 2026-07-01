@@ -48,6 +48,23 @@ struct parse_error {
 ss::future<std::expected<chunked_vector<context_subject>, parse_error>>
 parse_subjects(iobuf body, qualified_subjects_enabled qualified);
 
+/// Parse the body of a `GET /contexts` response into a list of contexts.
+///
+/// The response is a JSON array of context-name strings (see the Schema
+/// Registry REST API). Each element is a bare, dot-prefixed context name: the
+/// default context is exactly ".", and a named context is "." + name (e.g.
+/// ".dev"). These are NOT the ":.name:" colon-qualified forms used by
+/// context-qualified subjects, so — unlike parse_subjects — there is no
+/// qualified/unqualified policy: each string is wrapped verbatim into a
+/// `context`.
+///
+/// The body must be exactly a JSON array of strings: a non-array, a non-string
+/// element, or any trailing content after the array yields a parse_error (same
+/// strict, fixed shape as parse_subjects). The function does not throw:
+/// malformed input is reported via the returned std::expected.
+ss::future<std::expected<chunked_vector<context>, parse_error>>
+parse_contexts(iobuf body);
+
 /// Parse the body of a `GET /subjects/{subject}/versions` response into a list
 /// of versions.
 ///

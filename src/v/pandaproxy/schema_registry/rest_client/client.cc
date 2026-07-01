@@ -272,6 +272,53 @@ client::list_subjects(retry_chain_node& rtc, include_deleted deleted) {
     co_return std::move(parsed.value());
 }
 
+ss::future<std::expected<chunked_vector<context>, domain_error>>
+client::list_contexts(
+  retry_chain_node& rtc, std::optional<ss::sstring> context_prefix) {
+    auto gate = maybe_gate();
+    if (!gate.has_value()) {
+        co_return std::unexpected(std::move(gate.error()));
+    }
+    // TODO: offset/limit pagination is unimplemented (Redpanda SR ignores it
+    // and returns every materialized context in one unpaginated call).
+    auto request = http::request_builder{}
+                     .method(boost::beast::http::verb::get)
+                     .path("/contexts")
+                     .header("accept", accept_json);
+    if (context_prefix.has_value()) {
+        // A source-filtering hint for servers that honor it; the result is also
+        // filtered client-side below, so it is correct against a server that
+        // ignores it (Redpanda's own server does).
+        request.query_param_kv("contextPrefix", *context_prefix);
+    }
+    maybe_add_basic_auth(request);
+
+    auto response = co_await perform_request(rtc, std::move(request));
+    if (!response.has_value()) {
+        co_return std::unexpected(std::move(response.error()));
+    }
+    auto parsed = co_await parse_contexts(std::move(response.value()));
+    if (!parsed.has_value()) {
+        co_return std::unexpected(domain_error{std::move(parsed.error())});
+    }
+    if (context_prefix.has_value()) {
+        // Filter by the returned dot-prefixed name form (e.g. ".prod" matches
+        // ".prod" and ".prod-eu"), matching the server's contextPrefix
+        // semantics, so the result is correct even if the server did not
+        // filter.
+        chunked_vector<context> filtered;
+        for (auto& ctx : parsed.value()) {
+            if (
+              std::string_view{ctx()}.starts_with(
+                std::string_view{*context_prefix})) {
+                filtered.push_back(std::move(ctx));
+            }
+        }
+        co_return std::move(filtered);
+    }
+    co_return std::move(parsed.value());
+}
+
 ss::future<std::expected<chunked_vector<schema_version>, domain_error>>
 client::list_subject_versions(
   const context_subject& subject,

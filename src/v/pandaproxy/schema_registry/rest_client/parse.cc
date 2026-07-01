@@ -93,6 +93,56 @@ parse_subjects(iobuf body, qualified_subjects_enabled qualified) {
     }
 }
 
+ss::future<std::expected<chunked_vector<context>, parse_error>>
+parse_contexts(iobuf body) {
+    using token = serde::json::token;
+    // Firewall exceptions from the parser: malformed input is reported via the
+    // returned std::expected, not thrown.
+    try {
+        serde::json::parser p(std::move(body));
+
+        if (!co_await p.next() || p.token() != token::start_array) {
+            co_return std::unexpected(
+              parse_error{.reason = "expected a JSON array of contexts"});
+        }
+
+        chunked_vector<context> contexts;
+        while (co_await p.next()) {
+            switch (p.token()) {
+            case token::end_array:
+                // The body is exactly a JSON array of strings: reject any
+                // trailing content rather than ignoring it.
+                co_await p.next();
+                if (p.token() != token::eof) {
+                    co_return std::unexpected(
+                      parse_error{
+                        .reason = "trailing content after contexts array"});
+                }
+                co_return std::move(contexts);
+            case token::value_string:
+                // Each element is a bare, dot-prefixed context name (".",
+                // ".dev") and is wrapped verbatim. Unlike a subject, a context
+                // has no ":.ctx:" qualified form to decode here.
+                contexts.push_back(
+                  context{p.value_string().linearize_to_string()});
+                break;
+            default:
+                co_return std::unexpected(
+                  parse_error{
+                    .reason = "expected a string element in contexts array"});
+            }
+        }
+
+        // next() returned false before the closing ']' was seen.
+        co_return std::unexpected(
+          parse_error{.reason = "truncated or malformed JSON"});
+    } catch (const std::exception& e) {
+        co_return std::unexpected(
+          parse_error{
+            .reason = ssx::sformat("failed to parse contexts: {}", e.what())});
+    }
+}
+
 ss::future<std::expected<chunked_vector<schema_version>, parse_error>>
 parse_subject_versions(iobuf body) {
     using token = serde::json::token;

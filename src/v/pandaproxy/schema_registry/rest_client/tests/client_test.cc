@@ -282,6 +282,189 @@ TEST(rest_client, list_subjects_after_shutdown_is_aborted) {
     EXPECT_TRUE(std::holds_alternative<rc::aborted_error>(res.error()));
 }
 
+TEST(rest_client, list_contexts_request_shape_and_success) {
+    auto check_and_respond = [](
+                               bh::request_header<>&& r,
+                               std::optional<iobuf>,
+                               ss::lowres_clock::duration) {
+        EXPECT_EQ(r.method(), bh::verb::get);
+        EXPECT_EQ(r.target(), "/contexts");
+        EXPECT_EQ(r.at(bh::field::accept), "application/json");
+        // base64("user:pass") == "dXNlcjpwYXNz"
+        EXPECT_EQ(r.at(bh::field::authorization), "Basic dXNlcjpwYXNz");
+        return ss::make_ready_future<http::downloaded_response>(
+          http::downloaded_response{
+            .status = bh::status::ok, .body = iobuf::from(R"([".", ".dev"])")});
+    };
+    rc::client client{
+      make_http_client([&](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(check_and_respond);
+      }),
+      endpoint,
+      rc::basic_auth_credentials{.username = "user", .password = "pass"}};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.list_contexts(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_THAT(*res, ElementsAre(pps::default_context, pps::context{".dev"}));
+}
+
+TEST(rest_client, list_contexts_no_credentials_omits_auth_header) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce([](
+                        bh::request_header<>&& r,
+                        std::optional<iobuf>,
+                        ss::lowres_clock::duration) {
+                EXPECT_EQ(r.count(bh::field::authorization), 0);
+                return ss::make_ready_future<http::downloaded_response>(
+                  http::downloaded_response{
+                    .status = bh::status::ok, .body = iobuf::from(R"(["."])")});
+            });
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.list_contexts(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_THAT(*res, ElementsAre(pps::default_context));
+}
+
+TEST(rest_client, list_contexts_retries_then_succeeds) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(bh::status::service_unavailable, "busy"))
+            .WillOnce(respond(bh::status::ok, R"(["."])"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 30s, 10ms);
+    auto res = client.list_contexts(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_THAT(*res, SizeIs(1));
+}
+
+TEST(rest_client, list_contexts_parse_error_surfaced) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(bh::status::ok, R"({"not": "an array"})"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.list_contexts(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::parse_error>(res.error()));
+}
+
+TEST(rest_client, list_contexts_after_shutdown_is_aborted) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _)).Times(0);
+      }),
+      endpoint};
+
+    client.shutdown().get();
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.list_contexts(rtc).get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::aborted_error>(res.error()));
+}
+
+TEST(rest_client, list_contexts_prefix_sends_param_and_filters_client_side) {
+    // The client sends ?contextPrefix= AND filters client-side, so a server
+    // that ignores the param (like Redpanda, which returns everything here)
+    // still yields correctly-filtered results.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce([](
+                        bh::request_header<>&& r,
+                        std::optional<iobuf>,
+                        ss::lowres_clock::duration) {
+                EXPECT_EQ(r.target(), "/contexts?contextPrefix=.prod");
+                return ss::make_ready_future<http::downloaded_response>(
+                  http::downloaded_response{
+                    .status = bh::status::ok,
+                    .body = iobuf::from(
+                      R"([".", ".prod", ".prod-eu", ".staging"])")});
+            });
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.list_contexts(rtc, ss::sstring{".prod"}).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_THAT(
+      *res, ElementsAre(pps::context{".prod"}, pps::context{".prod-eu"}));
+}
+
+TEST(rest_client, list_contexts_prefix_matching_nothing_is_empty) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(bh::status::ok, R"([".", ".dev"])"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.list_contexts(rtc, ss::sstring{".zzz"}).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_THAT(*res, IsEmpty());
+}
+
+TEST(rest_client, list_contexts_prefix_dot_matches_all) {
+    // "." is a prefix of every returned context, so nothing is filtered out.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce([](
+                        bh::request_header<>&& r,
+                        std::optional<iobuf>,
+                        ss::lowres_clock::duration) {
+                EXPECT_EQ(r.target(), "/contexts?contextPrefix=.");
+                return ss::make_ready_future<http::downloaded_response>(
+                  http::downloaded_response{
+                    .status = bh::status::ok,
+                    .body = iobuf::from(R"([".", ".dev"])")});
+            });
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.list_contexts(rtc, ss::sstring{"."}).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_THAT(*res, ElementsAre(pps::default_context, pps::context{".dev"}));
+}
+
 TEST(rest_client, list_subject_versions_success_and_encodes_subject) {
     rc::client client{
       make_http_client([](mock_client& m) {
