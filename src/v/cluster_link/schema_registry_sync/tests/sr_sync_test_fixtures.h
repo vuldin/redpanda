@@ -310,6 +310,9 @@ public:
         return _inner->import_schema(std::move(schema));
     }
     bool is_enabled() const override { return _inner->is_enabled(); }
+    ss::future<> ensure_internal_topic() override {
+        return _inner->ensure_internal_topic();
+    }
     ss::future<ppsr::schema_getter*> getter() const override {
         return _inner->getter();
     }

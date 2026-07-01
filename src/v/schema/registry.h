@@ -42,6 +42,14 @@ public:
 
     virtual bool is_enabled() const = 0;
 
+    /// Ensures the Schema Registry's internal `_schemas` topic exists,
+    /// creating it if needed. Idempotent, and unlike a full start-up it does
+    /// not load the schema store. Shadow-link SR-API sync calls this so the
+    /// destination `_schemas` topic — and its partition-0 leader, the shard
+    /// the sync task runs on — comes into existence without first requiring
+    /// external Schema Registry traffic.
+    virtual ss::future<> ensure_internal_topic() = 0;
+
     virtual ss::future<pandaproxy::schema_registry::schema_getter*>
     getter() const = 0;
 

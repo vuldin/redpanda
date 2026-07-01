@@ -661,6 +661,11 @@ ss::future<> service::do_start() {
       });
 }
 
+ss::future<> service::ensure_internal_topic() {
+    auto guard = _gate.hold();
+    co_await create_internal_topic();
+}
+
 ss::future<> service::create_internal_topic() {
     auto topic_cfg = _topic_metadata_cache->find_topic_cfg(
       {model::kafka_namespace, model::schema_registry_internal_tp.topic});
