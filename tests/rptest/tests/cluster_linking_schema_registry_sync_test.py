@@ -388,7 +388,10 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
 
         # Mapped-but-unimplemented counters must be zero (flagged above).
         totals = sr.totals_since_task_start
-        # The cumulative summary is open-ended, so it carries no finish time.
+        # The cumulative summary carries the task start time (stamped once on the
+        # task's first run) and, being open-ended, has no finish time.
+        assert totals.HasField("start_time"), totals
+        assert totals.start_time.seconds > 0, totals
         assert not totals.HasField("finish_time"), totals
         for name in self.UNPOPULATED_COUNTERS:
             assert getattr(totals, name) == 0, (
@@ -718,6 +721,9 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
             backoff_sec=1,
             err_msg="first task instance did not fully sync",
         )
+        before_start = (
+            self._admin_sr_status().totals_since_task_start.start_time.ToNanoseconds()
+        )
 
         # Move _schemas/0 leadership to another destination broker. The sync
         # task follows leadership, so a fresh instance takes over there.
@@ -738,22 +744,21 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         )
 
         # The new instance resets its cumulative counters (documented on
-        # totals_since_task_start), re-derives the destination inventory from
-        # the replicated _schemas log, and completes a full sync that imports
-        # nothing -- everything is already present. The first instance had
-        # imported every version, so a cumulative subject_versions_changed of 0
-        # marks the reset new instance; last_full_sync == 0 confirms the sync
-        # was a no-op. This relies on the destination scan syncing the local
-        # store first: without it, the freshly-elected leader could see a
-        # stale view of its own store, spuriously re-import already-present
-        # versions, and permanently inflate subject_versions_changed for this
-        # instance (it only ever accumulates, so a transient race here would
-        # never recover).
+        # totals_since_task_start): a fresh, later start_time and
+        # subject_versions_changed back at 0. It re-derives the destination
+        # inventory from the replicated _schemas log and completes a full sync
+        # that imports nothing (last_full_sync == 0) -- everything is already
+        # present. This relies on the destination scan syncing the local store
+        # first: without it, the freshly-elected leader could see a stale view
+        # of its own store, spuriously re-import already-present versions, and
+        # permanently inflate subject_versions_changed for this instance (it
+        # only ever accumulates, so a transient race here would never recover).
         def re_derived() -> bool:
             sr = self._admin_sr_status()
             totals = sr.totals_since_task_start
             return (
                 sr.HasField("last_full_sync")
+                and totals.start_time.ToNanoseconds() > before_start
                 and totals.subject_versions_changed == 0
                 and totals.errors == 0
                 and sr.last_full_sync.subject_versions_changed == 0

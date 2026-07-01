@@ -425,6 +425,13 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
 
 ss::future<task::state_transition>
 mirroring_task::run_impl(ss::abort_source& as) {
+    // Stamp the cumulative summary's start time once per task instance (the
+    // proto documents totals_since_task_start.start_time as the task start).
+    // A fresh instance after a leadership change re-stamps it on its first run.
+    if (!_status.totals_since_task_start.start_time.has_value()) {
+        _status.totals_since_task_start.start_time = ::model::timestamp::now();
+    }
+
     // Consume the config-changed flag before any co_await so a concurrent
     // update_config during this run is not lost (it re-arms for the next run).
     const bool config_changed = std::exchange(_config_changed, false);
