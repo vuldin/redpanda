@@ -23,6 +23,7 @@
 #include "iceberg/values.h"
 #include "model/fundamental.h"
 #include "model/record.h"
+#include "strings/utf8.h"
 
 namespace datalake {
 
@@ -69,7 +70,16 @@ std::optional<size_t> get_redpanda_idx(const iceberg::struct_type& val_type) {
 
 using schema_mode = model::iceberg_mode::schema_mode;
 
-bool is_schema_mode(schema_mode mode) { return mode != schema_mode::binary; }
+bool is_schema_mode(schema_mode mode) {
+    switch (mode) {
+    case schema_mode::binary:
+    case schema_mode::string:
+        return false;
+    case schema_mode::schema_id_prefix:
+    case schema_mode::schema_latest:
+        return true;
+    }
+}
 
 } // namespace
 
@@ -110,6 +120,9 @@ record_type record_translator::build_type(
         relax_field_requirements(key_struct);
         type_field<rp_desc, "key">(rp_struct_type(ret_type)).type = std::move(
           key_struct);
+    } else if (_key_cfg.mode == schema_mode::string) {
+        type_field<rp_desc, "key">(rp_struct_type(ret_type)).type
+          = iceberg::string_type{};
     }
 
     std::optional<schema_identifier> val_id;
@@ -136,12 +149,16 @@ record_type record_translator::build_type(
             ret_type.fields.emplace_back(std::move(field));
         }
     } else {
+        iceberg::field_type val_field_type
+          = _val_cfg.mode == schema_mode::string
+              ? iceberg::field_type{iceberg::string_type{}}
+              : iceberg::field_type{iceberg::binary_type{}};
         ret_type.fields.emplace_back(
           iceberg::nested_field::create(
             rp_base_next_field_id,
             "value",
             iceberg::field_required::no,
-            iceberg::binary_type{}));
+            std::move(val_field_type)));
     }
 
     return record_type{
@@ -185,8 +202,18 @@ record_translator::translate_data(
 
     // Decode key.
     std::optional<iceberg::value> key_val;
-    if (key_type.has_value()) {
-        if (parsable_key.has_value()) {
+    if (parsable_key.has_value()) {
+        switch (_key_cfg.mode) {
+        case schema_mode::binary:
+            key_val = iceberg::binary_value{std::move(*parsable_key)};
+            break;
+        case schema_mode::string:
+            key_val = iceberg::string_value{
+              utf8_sanitize(std::move(*parsable_key))};
+            break;
+        case schema_mode::schema_id_prefix:
+            [[fallthrough]];
+        case schema_mode::schema_latest: {
             auto& resolved = *key_type.value();
             auto translated_key = co_await std::visit(
               value_translating_visitor{
@@ -201,12 +228,7 @@ record_translator::translate_data(
             }
             key_val = std::move(translated_key.value());
         }
-        // null parsable_key (null key) → key_val stays nullopt
-    } else {
-        key_val = parsable_key
-                    ? std::make_optional<iceberg::value>(
-                        iceberg::binary_value{std::move(*parsable_key)})
-                    : std::nullopt;
+        }
     }
 
     auto ret_data = iceberg::struct_value{};
@@ -248,10 +270,19 @@ record_translator::translate_data(
             ret_data.fields.emplace_back(std::move(field));
         }
     } else {
-        ret_data.fields.emplace_back(
-          parsable_val ? std::make_optional<iceberg::value>(
-                           iceberg::binary_value(std::move(*parsable_val)))
-                       : std::nullopt);
+        if (parsable_val.has_value()) {
+            if (_val_cfg.mode == schema_mode::string) {
+                ret_data.fields.emplace_back(
+                  std::make_optional<iceberg::value>(iceberg::string_value{
+                    utf8_sanitize(std::move(*parsable_val))}));
+            } else {
+                ret_data.fields.emplace_back(
+                  std::make_optional<iceberg::value>(
+                    iceberg::binary_value{std::move(*parsable_val)}));
+            }
+        } else {
+            ret_data.fields.emplace_back(std::nullopt);
+        }
     }
 
     co_return ret_data;

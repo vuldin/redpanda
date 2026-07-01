@@ -677,6 +677,7 @@ public:
         binary,           ///< Store as raw bytes, no schema decoding.
         schema_id_prefix, ///< Decode using schema ID embedded in the record.
         schema_latest, ///< Decode using latest schema for a registry subject.
+        string, ///< Store as UTF-8 string, replacing invalid bytes with U+FFFD.
     };
 
     /// Whether header values are stored as binary or decoded as UTF-8 strings.

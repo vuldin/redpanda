@@ -492,3 +492,119 @@ TEST(IcebergModeNormalize, AllSectionsAllDefaults) {
     ASSERT_TRUE(m.has_value());
     EXPECT_EQ(to_string(*m), "key_value");
 }
+
+// --- mode=string ---
+
+TEST(IcebergModeParse, KeyModeString) {
+    auto m = parse("key:mode=string");
+    ASSERT_TRUE(m.has_value());
+    ASSERT_FALSE(m->is_disabled());
+    EXPECT_EQ(m->key().mode, sm::string);
+    EXPECT_EQ(m->value().mode, sm::binary);
+}
+
+TEST(IcebergModeParse, ValueModeString) {
+    auto m = parse("value:mode=string");
+    ASSERT_TRUE(m.has_value());
+    ASSERT_FALSE(m->is_disabled());
+    EXPECT_EQ(m->key().mode, sm::binary);
+    EXPECT_EQ(m->value().mode, sm::string);
+}
+
+TEST(IcebergModeParse, KeyAndValueModeString) {
+    auto m = parse("key:mode=string;value:mode=string");
+    ASSERT_TRUE(m.has_value());
+    EXPECT_EQ(m->key().mode, sm::string);
+    EXPECT_EQ(m->value().mode, sm::string);
+}
+
+TEST(IcebergModeParse, StringModeWithHeaders) {
+    auto m = parse(
+      "key:mode=string;value:mode=string;headers:value_type=string");
+    ASSERT_TRUE(m.has_value());
+    EXPECT_EQ(m->key().mode, sm::string);
+    EXPECT_EQ(m->value().mode, sm::string);
+    EXPECT_EQ(m->headers().value_type, hsm::string);
+}
+
+TEST(IcebergModeParseError, SubjectWithStringMode) {
+    EXPECT_FALSE(parse("value:mode=string,subject=foo").has_value());
+    EXPECT_FALSE(parse("key:mode=string,subject=foo").has_value());
+}
+
+TEST(IcebergModeParseError, ProtobufNameWithStringMode) {
+    EXPECT_FALSE(parse("value:mode=string,protobuf_name=foo.Bar").has_value());
+}
+
+TEST(IcebergModeFormat, KeyModeString) {
+    enabled e{};
+    e.key.mode = sm::string;
+    model::iceberg_mode m{std::move(e)};
+    EXPECT_EQ(to_string(m), "key:mode=string");
+}
+
+TEST(IcebergModeFormat, ValueModeString) {
+    enabled e{};
+    e.value.mode = sm::string;
+    model::iceberg_mode m{std::move(e)};
+    EXPECT_EQ(to_string(m), "value:mode=string");
+}
+
+TEST(IcebergModeFormat, KeyAndValueModeString) {
+    enabled e{};
+    e.key.mode = sm::string;
+    e.value.mode = sm::string;
+    model::iceberg_mode m{std::move(e)};
+    EXPECT_EQ(to_string(m), "key:mode=string;value:mode=string");
+}
+
+TEST(IcebergModeStringRoundtrip, KeyModeString) {
+    enabled e{};
+    e.key.mode = sm::string;
+    check_stable(model::iceberg_mode{std::move(e)});
+}
+
+TEST(IcebergModeStringRoundtrip, ValueModeString) {
+    enabled e{};
+    e.value.mode = sm::string;
+    check_stable(model::iceberg_mode{std::move(e)});
+}
+
+TEST(IcebergModeStringRoundtrip, KeyAndValueModeStringWithHeaders) {
+    enabled e{};
+    e.key.mode = sm::string;
+    e.value.mode = sm::string;
+    e.headers.value_type = hsm::string;
+    check_stable(model::iceberg_mode{std::move(e)});
+}
+
+TEST(IcebergModeWireRoundtrip, KeyModeString) {
+    enabled e{};
+    e.key.mode = sm::string;
+    model::iceberg_mode m{std::move(e)};
+    EXPECT_EQ(wire_roundtrip(m), m);
+}
+
+TEST(IcebergModeWireRoundtrip, ValueModeString) {
+    enabled e{};
+    e.value.mode = sm::string;
+    model::iceberg_mode m{std::move(e)};
+    EXPECT_EQ(wire_roundtrip(m), m);
+}
+
+TEST(IcebergModeWireRoundtrip, KeyAndValueModeStringWithHeaders) {
+    enabled e{};
+    e.key.mode = sm::string;
+    e.value.mode = sm::string;
+    e.headers.value_type = hsm::string;
+    model::iceberg_mode m{std::move(e)};
+    EXPECT_EQ(wire_roundtrip(m), m);
+}
+
+TEST(IcebergModeParseErrorMsg, SubjectWithStringMode) {
+    auto e = parse_err("value:mode=string,subject=foo");
+    EXPECT_EQ(
+      e,
+      "subject and protobuf_name require mode=schema_latest in section "
+      "'value'");
+}
