@@ -96,6 +96,16 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
             ],
         )
 
+    def _large_schema(self, i: int, default_bytes: int) -> dict:
+        # Inflate the raw stored definition with a big field default. Defaults
+        # are kept verbatim in the stored body the reconciler budgets by
+        # (unlike doc, which canonicalization may drop), so the memory budget
+        # sees a genuinely large body.
+        return self._record(
+            f"Big{i}",
+            [{"name": "v", "type": "string", "default": "x" * default_bytes}],
+        )
+
     # --- registration helpers ----------------------------------------------
 
     def _register(
@@ -642,3 +652,33 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
             backoff_sec=1,
             err_msg="link did not recover after repointing at a reachable source",
         )
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_memory_backpressure(self):
+        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+
+        # Shrink the reconcile memory budget to its 1 MiB floor and raise
+        # parallelism so many bodies are fetched at once; their combined size
+        # exceeds the budget, forcing the byte-budget semaphore to serialize.
+        # Each body stays under the 200 KiB per-allocation cap the ducktape log
+        # checker enforces, so no single import trips an oversized-allocation
+        # failure while the aggregate still exercises backpressure.
+        self.target_cluster_service.set_cluster_config(
+            {
+                "schema_registry_sync_memory_bytes": 1024 * 1024,
+                "schema_registry_sync_parallelism": 14,
+            }
+        )
+
+        # ~100 KiB per body x 16 subjects: 14 fetched concurrently is ~1.4 MiB,
+        # above the 1 MiB budget.
+        body = 100 * 1024
+        pairs: list[Pair] = []
+        for i in range(16):
+            subject = f"big-{i}-value"
+            self._register(src, subject, self._large_schema(i, body))
+            pairs.append((subject, 1))
+
+        self._create_sr_link()
+        self._wait_synced(src, dest, pairs)
