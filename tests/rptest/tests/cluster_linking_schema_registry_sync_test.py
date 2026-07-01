@@ -25,6 +25,7 @@ from ducktape.utils.util import wait_until
 
 from rptest.clients.admin.proto.redpanda.core.admin.v2 import shadow_link_pb2
 from rptest.clients.rpk import RpkTool
+from rptest.services.admin import Admin
 from rptest.services.cluster import TestContext, cluster
 from rptest.services.multi_cluster_services import SecondaryClusterArgs
 from rptest.services.redpanda import SchemaRegistryConfig
@@ -682,3 +683,107 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
 
         self._create_sr_link()
         self._wait_synced(src, dest, pairs)
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_survives_leadership_change(self):
+        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+        admin = Admin(self.target_cluster_service)
+
+        # A small reference DAG so the first task instance does real import work.
+        pairs: list[Pair] = []
+        for i in range(5):
+            pairs.append(self._add_leaf(src, i))
+        for i in range(3):
+            pairs.append(self._add_mid(src, i, (2 * i) % 5, (2 * i + 1) % 5))
+        expected_versions = len(pairs)
+        expected_subjects = len({s for s, _ in pairs})
+
+        self._create_sr_link()
+        self._wait_synced(src, dest, pairs)
+
+        # Snapshot the first task instance once it has fully synced.
+        def first_synced() -> bool:
+            sr = self._admin_sr_status()
+            return (
+                sr.HasField("last_full_sync")
+                and sr.inventory.destination_subject_versions == expected_versions
+                and sr.totals_since_task_start.subject_versions_changed
+                >= expected_versions
+            )
+
+        wait_until(
+            first_synced,
+            timeout_sec=90,
+            backoff_sec=1,
+            err_msg="first task instance did not fully sync",
+        )
+
+        # Move _schemas/0 leadership to another destination broker. The sync
+        # task follows leadership, so a fresh instance takes over there.
+        info = admin.get_partitions(namespace="kafka", topic="_schemas", partition=0)
+        leader = info["leader_id"]
+        replicas = [r["node_id"] for r in info["replicas"]]
+        assert len(replicas) > 1, f"_schemas/0 has no failover target: {info}"
+        target = next(n for n in replicas if n != leader)
+        admin.partition_transfer_leadership(
+            namespace="kafka", topic="_schemas", partition=0, target_id=target
+        )
+        admin.await_stable_leader(
+            topic="_schemas",
+            partition=0,
+            namespace="kafka",
+            timeout_s=60,
+            check=lambda node_id: node_id == target,
+        )
+
+        # The new instance resets its cumulative counters (documented on
+        # totals_since_task_start), re-derives the destination inventory from
+        # the replicated _schemas log, and completes a full sync that imports
+        # nothing -- everything is already present. The first instance had
+        # imported every version, so a cumulative subject_versions_changed of 0
+        # marks the reset new instance; last_full_sync == 0 confirms the sync
+        # was a no-op. This relies on the destination scan syncing the local
+        # store first: without it, the freshly-elected leader could see a
+        # stale view of its own store, spuriously re-import already-present
+        # versions, and permanently inflate subject_versions_changed for this
+        # instance (it only ever accumulates, so a transient race here would
+        # never recover).
+        def re_derived() -> bool:
+            sr = self._admin_sr_status()
+            totals = sr.totals_since_task_start
+            return (
+                sr.HasField("last_full_sync")
+                and totals.subject_versions_changed == 0
+                and totals.errors == 0
+                and sr.last_full_sync.subject_versions_changed == 0
+                and sr.last_full_sync.errors == 0
+                and sr.inventory.selected_source_subjects == expected_subjects
+                and sr.inventory.destination_subject_versions == expected_versions
+            )
+
+        wait_until(
+            re_derived,
+            timeout_sec=90,
+            backoff_sec=1,
+            err_msg="new leader did not re-derive counters after the bounce",
+        )
+
+        # The new leader keeps syncing: a subject added now is imported by it,
+        # advancing the new instance's cumulative change counter.
+        base_changed = (
+            self._admin_sr_status().totals_since_task_start.subject_versions_changed
+        )
+        self._register(
+            src,
+            "post-bounce-value",
+            self._record("PostBounce", [{"name": "v", "type": "string"}]),
+        )
+        self._wait_synced(src, dest, [("post-bounce-value", 1)])
+        wait_until(
+            lambda: self._admin_sr_status().totals_since_task_start.subject_versions_changed
+            > base_changed,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="new leader did not count the post-bounce import",
+        )

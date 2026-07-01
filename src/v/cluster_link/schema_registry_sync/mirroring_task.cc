@@ -56,6 +56,9 @@ ss::future<inventory> scan_destination_inventory(
   ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope,
   ss::abort_source& as) {
     as.check();
+    // list_subject_versions reads the store as-is; sync first so the scan
+    // isn't stale (e.g. on a freshly-elected _schemas/0 leader).
+    co_await destination.sync();
     auto versions = co_await destination.list_subject_versions(
       std::move(in_scope), ppsr::include_deleted::yes);
     inventory inv;
