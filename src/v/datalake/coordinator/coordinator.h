@@ -15,6 +15,7 @@
 #include "config/property.h"
 #include "container/chunked_hash_map.h"
 #include "container/chunked_vector.h"
+#include "datalake/coordinator/coordinator_probe.h"
 #include "datalake/coordinator/file_committer.h"
 #include "datalake/coordinator/partition_state_override.h"
 #include "datalake/coordinator/snapshot_remover.h"
@@ -68,7 +69,8 @@ public:
       , commit_interval_(std::move(commit_interval))
       , default_partition_spec_(std::move(default_partition_spec))
       , disable_snapshot_expiry_(std::move(disable_snapshot_expiry))
-      , max_pending_files_(std::move(max_pending_files)) {}
+      , max_pending_files_(std::move(max_pending_files))
+      , probe_(stm_->raft()->ntp()) {}
 
     void start();
     ss::future<> stop_and_wait();
@@ -208,6 +210,8 @@ private:
     // Timestamp at which the total number of files was computed to be above
     // `max_pending_files_`, if ever.
     std::optional<ss::lowres_clock::time_point> backpressured_as_of_;
+
+    coordinator_probe probe_;
 };
 inline fmt::iterator format_to(coordinator::errc e, fmt::iterator out) {
     switch (e) {
