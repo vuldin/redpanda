@@ -251,6 +251,46 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
             err_msg="schemas did not sync to destination Schema Registry",
         )
 
+    def _sr_versions(
+        self, client: SchemaRegistryRedpandaClient, subject: str, deleted: bool
+    ) -> set[int]:
+        resp = client.get_subjects_subject_versions(subject, deleted=deleted)
+        return set(resp.json()) if resp.status_code == 200 else set()
+
+    def _version_state(
+        self, client: SchemaRegistryRedpandaClient, subject: str
+    ) -> tuple[frozenset[int], frozenset[int]]:
+        # (active, soft-deleted) versions of a subject. A soft-deleted version
+        # is listed only with deleted=true; a fully soft-deleted subject has an
+        # empty active set.
+        active = self._sr_versions(client, subject, deleted=False)
+        every = self._sr_versions(client, subject, deleted=True)
+        return frozenset(active), frozenset(every - active)
+
+    def _wait_delete_synced(
+        self,
+        src: SchemaRegistryRedpandaClient,
+        dest: SchemaRegistryRedpandaClient,
+        subjects: list[str],
+        timeout_sec: int = 120,
+    ):
+        # The destination's per-subject (active, deleted) version partition must
+        # converge to the source's.
+        def synced() -> bool:
+            for subject in subjects:
+                if self._version_state(dest, subject) != self._version_state(
+                    src, subject
+                ):
+                    return False
+            return True
+
+        wait_until(
+            synced,
+            timeout_sec=timeout_sec,
+            backoff_sec=1,
+            err_msg="soft-delete state did not converge to the source",
+        )
+
     # --- status-counter checks ---------------------------------------------
 
     # Counters the create-only reconcile does not yet populate: the admin API /
@@ -452,3 +492,49 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         #    through the shadow-link admin API and the rpk `shadow status`
         #    rendering of it.
         self._verify_counters(all_pairs)
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_soft_delete(self):
+        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+
+        # Version-level soft-delete: each subject keeps an active version so its
+        # versions stay enumerable. (A fully soft-deleted subject 404s its
+        # version listing over the SR API, so it cannot be replicated -- that is
+        # a separate limitation, not covered here.)
+        #  seeded-value: v1 active, v2 soft-deleted before the first sync.
+        #  after-value:  v1 + v2 active, then v2 soft-deleted after a completed
+        #    sync -- the delete must propagate onto the live destination version.
+        seeded, after = "seeded-value", "after-value"
+
+        def _v1(name: str) -> dict:
+            return self._record(name, [{"name": "v", "type": "string"}])
+
+        def _v2(name: str) -> dict:
+            # Backward-compatible evolution (added field with a default).
+            return self._record(
+                name,
+                [
+                    {"name": "v", "type": "string"},
+                    {"name": "e", "type": "long", "default": 0},
+                ],
+            )
+
+        self._register(src, seeded, _v1("Seeded"))
+        self._register(src, seeded, _v2("Seeded"))
+        assert src.delete_subject_version(seeded, "2").status_code == 200
+
+        self._register(src, after, _v1("After"))
+        self._register(src, after, _v2("After"))
+
+        self._create_sr_link()
+
+        # seeded-value's mixed active/deleted state and after-value's two active
+        # versions both converge on the destination.
+        subjects = [seeded, after]
+        self._wait_delete_synced(src, dest, subjects)
+
+        # delete-after-sync: soft-delete after-value v2 (v1 stays active) once it
+        # has already synced; the next full sync must propagate the delete.
+        assert src.delete_subject_version(after, "2").status_code == 200
+        self._wait_delete_synced(src, dest, subjects)
