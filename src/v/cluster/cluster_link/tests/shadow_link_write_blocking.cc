@@ -139,6 +139,68 @@ TEST_F_CORO(
     EXPECT_FALSE(sync_write_blocked());
 }
 
+// A paused API-mode link relinquishes ownership of its contexts: a context it
+// would otherwise block becomes writable again, while a context it never owned
+// is writable either way. Re-upserting the same link name flips only `paused`,
+// so this exercises the pause branch of link_disables_client_writes in
+// isolation.
+TEST_F_CORO(shadow_link_write_blocking_test, api_shadow_paused_lifts_block) {
+    auto make_link = [](bool paused) {
+        auto md = make_base_metadata();
+        clm::schema_registry_sync_config::shadow_schema_registry_api api;
+        api.source_url = "http://schema-registry.example.com:8081";
+        api.filter.contexts = {".prod"};
+        api.destination
+          = clm::schema_registry_sync_config::identity_context_mapping{};
+        api.is_enabled = clm::enabled_t{!paused};
+        md.configuration.schema_registry_sync_cfg.sync_mode = std::move(api);
+        return md;
+    };
+
+    // Not paused: the owned context is blocked, an unowned one is not.
+    co_await install_link(make_link(/*paused=*/false));
+    EXPECT_TRUE(client_write_blocked(".prod"));
+    EXPECT_FALSE(client_write_blocked(".staging"));
+
+    // Paused: the previously owned context is writable again; the unowned one
+    // is unaffected.
+    co_await install_link(make_link(/*paused=*/true));
+    EXPECT_FALSE(client_write_blocked(".prod"));
+    EXPECT_FALSE(client_write_blocked(".staging"));
+    // Sync writes are never blocked under API mode, paused or not.
+    EXPECT_FALSE(sync_write_blocked());
+}
+
+// Pausing one link must not unblock a context another (non-paused) link still
+// owns: paused only removes that one link's contribution to the any_of across
+// links, so a context owned by any live link stays blocked.
+TEST_F_CORO(
+  shadow_link_write_blocking_test, paused_link_does_not_unblock_other_owner) {
+    auto make_api_link =
+      [](clm::name_t name, ss::sstring owned_context, bool paused) {
+          auto md = make_base_metadata(std::move(name));
+          clm::schema_registry_sync_config::shadow_schema_registry_api api;
+          api.source_url = "http://schema-registry.example.com:8081";
+          api.filter.contexts = {std::move(owned_context)};
+          api.destination
+            = clm::schema_registry_sync_config::identity_context_mapping{};
+          api.is_enabled = clm::enabled_t{!paused};
+          md.configuration.schema_registry_sync_cfg.sync_mode = std::move(api);
+          return md;
+      };
+
+    // link-a (paused) and link-b (active) both own ".prod".
+    co_await install_link(
+      make_api_link(clm::name_t{"link-a"}, ".prod", /*paused=*/true));
+    co_await install_link(
+      make_api_link(clm::name_t{"link-b"}, ".prod", /*paused=*/false));
+
+    // ".prod" stays blocked: link-b still owns it even though link-a is paused.
+    EXPECT_TRUE(client_write_blocked(".prod"));
+    // A context neither link owns is writable.
+    EXPECT_FALSE(client_write_blocked(".staging"));
+}
+
 // Exact mapping: a destination context is owned when a selected source context
 // maps to it. Blocking follows the destination name, not the source name.
 TEST_F_CORO(
