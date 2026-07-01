@@ -282,6 +282,52 @@ TEST(rest_client, list_subjects_after_shutdown_is_aborted) {
     EXPECT_TRUE(std::holds_alternative<rc::aborted_error>(res.error()));
 }
 
+TEST(rest_client, request_aborted_by_transport_is_aborted) {
+    // A transport failure that is an abort/shutdown (here abort_requested) is
+    // classified aborted by the retry policy and short-circuits the retry loop
+    // as an aborted_error rather than being retried to exhaustion.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce([](
+                        bh::request_header<>&&,
+                        std::optional<iobuf>,
+                        ss::lowres_clock::duration) {
+                return ss::make_exception_future<http::downloaded_response>(
+                  ss::abort_requested_exception{});
+            });
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.list_subjects(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::aborted_error>(res.error()));
+}
+
+TEST(rest_client, request_with_pre_aborted_source_is_aborted) {
+    // If the retry chain's abort source is already tripped, the first
+    // rtc.retry() raises a shutdown exception before any request is issued; the
+    // call resolves as aborted, and the transport is never invoked.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _)).Times(0);
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    as.request_abort();
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.list_subjects(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::aborted_error>(res.error()));
+}
+
 TEST(rest_client, list_contexts_request_shape_and_success) {
     auto check_and_respond = [](
                                bh::request_header<>&& r,
@@ -371,6 +417,26 @@ TEST(rest_client, list_contexts_parse_error_surfaced) {
 
     ASSERT_FALSE(res.has_value());
     EXPECT_TRUE(std::holds_alternative<rc::parse_error>(res.error()));
+}
+
+TEST(rest_client, list_contexts_http_error_surfaced) {
+    // A permanent HTTP error from perform_request passes through unchanged:
+    // contexts has no operation-specific not-found translation.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(
+              respond(bh::status::bad_request, R"({"error_code": 40001})"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.list_contexts(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::http_call_error>(res.error()));
 }
 
 TEST(rest_client, list_contexts_after_shutdown_is_aborted) {
@@ -1417,6 +1483,42 @@ TEST(rest_client, list_subject_versions_subject_not_found) {
     EXPECT_EQ(std::get<rc::subject_not_found>(res.error()).subject, subject);
 }
 
+TEST(rest_client, list_subject_versions_parse_error_surfaced) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(bh::status::ok, R"({"not": "an array"})"));
+      }),
+      endpoint};
+
+    auto subject = pps::context_subject::unqualified("orders");
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.list_subject_versions(subject, rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::parse_error>(res.error()));
+}
+
+TEST(rest_client, list_subject_versions_after_shutdown_is_aborted) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _)).Times(0);
+      }),
+      endpoint};
+
+    client.shutdown().get();
+
+    auto subject = pps::context_subject::unqualified("orders");
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.list_subject_versions(subject, rtc).get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::aborted_error>(res.error()));
+}
+
 TEST(rest_client, get_schema_by_version_success) {
     constexpr std::string_view body
       = R"({"subject":"User","version":3,"id":100001,"schemaType":"AVRO",)"
@@ -1557,6 +1659,46 @@ TEST(rest_client, get_schema_by_version_invalid_version_not_translated) {
     EXPECT_EQ(
       std::get<rc::http_status_error>(call).status,
       bh::status::unprocessable_entity);
+}
+
+TEST(rest_client, get_schema_by_version_parse_error_surfaced) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(bh::status::ok, R"([1, 2, 3])"));
+      }),
+      endpoint};
+
+    auto subject = pps::context_subject::unqualified("User");
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client
+                 .get_schema_by_version(subject, pps::schema_version{1}, rtc)
+                 .get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::parse_error>(res.error()));
+}
+
+TEST(rest_client, get_schema_by_version_after_shutdown_is_aborted) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _)).Times(0);
+      }),
+      endpoint};
+
+    client.shutdown().get();
+
+    auto subject = pps::context_subject::unqualified("User");
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client
+                 .get_schema_by_version(subject, pps::schema_version{1}, rtc)
+                 .get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::aborted_error>(res.error()));
 }
 
 TEST(rest_client, get_schema_id_subject_versions_request_shape_and_success) {

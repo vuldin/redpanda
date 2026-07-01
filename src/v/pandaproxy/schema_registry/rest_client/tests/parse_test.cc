@@ -426,6 +426,14 @@ TEST_CORO(parse_mode_test, malformed_or_truncated_is_error) {
     }
 }
 
+TEST_CORO(parse_mode_test, unknown_field_missing_value_is_error) {
+    // An unmodeled field whose value is absent (a truncated object) faults the
+    // skip-unknown path; the exception firewall reports it as a parse_error
+    // rather than letting the parser exception escape.
+    auto res = co_await parse_mode(iobuf::from(R"({"other"})"));
+    ASSERT_FALSE_CORO(res.has_value());
+}
+
 TEST(registry_mode_test, to_string_view_and_format) {
     // The display/log form of every mode, including the open-enum `unknown`
     // sentinel. The known arms are also hit via registry_mode_from_wire, but
@@ -600,6 +608,13 @@ TEST_CORO(parse_config_test, malformed_or_truncated_is_error) {
         auto res = co_await parse_config(iobuf::from(body));
         ASSERT_FALSE_CORO(res.has_value());
     }
+}
+
+TEST_CORO(parse_config_test, unknown_field_missing_value_is_error) {
+    // As parse_mode: an unmodeled field with no value trips the skip path; the
+    // firewall turns the parser exception into a parse_error.
+    auto res = co_await parse_config(iobuf::from(R"({"other"})"));
+    ASSERT_FALSE_CORO(res.has_value());
 }
 
 TEST(registry_compatibility_level_test, to_string_view_and_format) {
@@ -1142,8 +1157,16 @@ TEST_CORO(parse_subject_version_test, rejects_unrepresentable) {
           R"({"metadata":{"properties":5}})",    // properties not an object
           R"({"metadata":{"properties":{"k":["x"]}}})", // value not a scalar
           R"({"metadata":{"properties":{"k":null}}})",  // value null
-          "[1,2,3]",                                    // not an object
-          R"({"subject":"r")",                          // truncated
+          R"({"subject":42})",                          // subject wrong type
+          R"({"schema":42,"subject":"r"})",             // schema wrong type
+          R"({"schemaType":42,"subject":"r"})",         // schemaType wrong type
+          R"({"references":[42]})",             // reference not an object
+          R"({"references":[{"name":42}]})",    // reference name wrong type
+          R"({"references":[{"subject":42}]})", // reference subject wrong type
+          R"({"references":[{"version":0}]})", // reference version out of range
+          R"({"references":[{)", // truncated reference: parser throws, caught
+          "[1,2,3]",             // not an object
+          R"({"subject":"r")",   // truncated
           R"({"subject":"r"}garbage)", // trailing content after }
           "not json"}) {
         SCOPED_TRACE(body);
@@ -1222,6 +1245,59 @@ TEST_CORO(parse_error_body_test, trailing_content_is_nullopt) {
       iobuf::from("{\"error_code\": 40401}  \n"));
     ASSERT_TRUE_CORO(ok.has_value());
     ASSERT_EQ_CORO(ok->error_code, 40401);
+}
+
+TEST_CORO(parse_subject_version_test, reference_unknown_keys_skipped) {
+    // A reference may carry keys the client does not model; they are skipped
+    // (never rejected, never recorded in unknown_fields) and the modeled
+    // name/subject/version are still recovered.
+    auto res = co_await parse_subject_version(
+      iobuf::from(
+        R"({"subject":"r","version":1,"references":)"
+        R"([{"extra":{"nested":true},"name":"n","subject":"s","version":2}]})"),
+      qualified_subjects_enabled::yes);
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_TRUE_CORO(res->unknown_fields.empty());
+    const auto& refs = res->schema.schema.def().refs();
+    ASSERT_EQ_CORO(refs.size(), size_t{1});
+    ASSERT_EQ_CORO(refs[0].name, "n");
+    ASSERT_EQ_CORO(refs[0].version, schema_version{2});
+}
+
+TEST_CORO(parse_error_body_test, non_key_token_is_nullopt) {
+    // After '{', a token that is not an object key means a malformed body:
+    // tolerantly nullopt, not an error.
+    auto res = co_await parse_error_body(iobuf::from(R"({true})"));
+    ASSERT_FALSE_CORO(res.has_value());
+}
+
+TEST_CORO(parse_error_body_test, error_code_out_of_int32_range_is_nullopt) {
+    // error_code must fit int32; a value outside the range is not a usable
+    // code, so it is dropped and the body (carrying no other code) yields
+    // nullopt.
+    auto res = co_await parse_error_body(
+      iobuf::from(R"({"error_code": 9999999999})"));
+    ASSERT_FALSE_CORO(res.has_value());
+}
+
+TEST_CORO(parse_error_body_test, non_string_message_ignored) {
+    // A present-but-wrong-typed message is skipped like any unmodeled field;
+    // the error_code is still recovered and message stays empty.
+    auto res = co_await parse_error_body(
+      iobuf::from(R"({"error_code": 40401, "message": 42})"));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res->error_code, 40401);
+    ASSERT_EQ_CORO(res->message, "");
+}
+
+TEST_CORO(parse_error_body_test, missing_value_is_nullopt) {
+    // A key with no value makes the parser throw while skipping; the tolerant
+    // firewall turns that into nullopt rather than propagating.
+    for (std::string_view body : {R"({"error_code"})", R"({"unknown"})"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_error_body(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
 }
 
 } // namespace pandaproxy::schema_registry::rest_client
