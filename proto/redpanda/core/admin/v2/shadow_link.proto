@@ -464,6 +464,12 @@ message SchemaRegistrySyncOptions {
         // destination, such as rulesets or metadata tags. If unset, FAIL is
         // used.
         UnsupportedSchemaFeaturePolicy unsupported_schema_feature_policy = 12;
+
+        // Allows the user to pause the Schema Registry sync task. If paused,
+        // the task enters the 'paused' state and stops replicating schemas from
+        // the source, and the per-context client write protection on the
+        // contexts this link owns is lifted.
+        bool paused = 13;
     }
     // Schema Registry shadowing mode.
     oneof schema_registry_shadowing_mode {
