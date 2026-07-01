@@ -20,6 +20,7 @@ import json
 from typing import Any
 
 import google.protobuf.duration_pb2
+import google.protobuf.field_mask_pb2
 from ducktape.utils.util import wait_until
 
 from rptest.clients.admin.proto.redpanda.core.admin.v2 import shadow_link_pb2
@@ -583,3 +584,61 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         dest_subjects = set(dest.get_subjects().json())
         assert "ok-value" in dest_subjects, dest_subjects
         assert "mid-0-value" not in dest_subjects, dest_subjects
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_recovers_after_source_unavailable(self):
+        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+
+        self._register(
+            src,
+            "orders-value",
+            self._record("Orders", [{"name": "v", "type": "string"}]),
+        )
+
+        # Point the link at an endpoint the reader rejects (out-of-range port),
+        # so it parks immediately -- no connect retries -- without completing a
+        # sync, recording the failure in last_error_message.
+        self._create_sr_link(source_url="http://127.0.0.1:99999")
+
+        # The park records the failure in last_error_message and, having
+        # completed no sync, leaves last_full_sync unset.
+        def parked() -> bool:
+            sr = self._admin_sr_status()
+            return sr.last_error_message != "" and not sr.HasField("last_full_sync")
+
+        wait_until(
+            parked,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="link did not park on an unreachable source",
+        )
+
+        # Repoint the link at the real source. The config change forces a fresh
+        # full sync, which now reaches the source and replicates.
+        good_url = self.source_cluster_service.schema_reg(limit=1)
+        link = self.get_link(LINK_NAME)
+        link.configurations.schema_registry_sync_options.shadow_schema_registry_api.source_url = good_url
+        self.update_link(
+            shadow_link=link,
+            update_mask=google.protobuf.field_mask_pb2.FieldMask(
+                paths=["configurations.schema_registry_sync_options"]
+            ),
+        )
+
+        self._wait_synced(src, dest, [("orders-value", 1)])
+
+        def recovered() -> bool:
+            sr = self._admin_sr_status()
+            return (
+                sr.HasField("last_full_sync")
+                and sr.inventory.selected_source_subjects == 1
+                and sr.totals_since_task_start.subject_versions_changed >= 1
+            )
+
+        wait_until(
+            recovered,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="link did not recover after repointing at a reachable source",
+        )
