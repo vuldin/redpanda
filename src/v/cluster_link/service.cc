@@ -1197,6 +1197,9 @@ void service::register_notifications() {
     auto pl_notif_id = _plf->local().register_for_updates(
       [this](model::id_t id, ::model::revision_id revision) {
           _manager->on_link_change(id, revision);
+          // A newly created or changed link may use SR-API mode; bootstrap the
+          // destination `_schemas` topic on demand, off the notification path.
+          _queue.submit([this] { return maybe_bootstrap_destination_sr(); });
       });
     _notification_cleanups.emplace_back([this, pl_notif_id] {
         _plf->local().unregister_for_updates(pl_notif_id);
@@ -1329,6 +1332,50 @@ ss::future<> service::maybe_start_manager() {
         std::rethrow_exception(ex);
     }
     std::move(manager_start).get();
+
+    // Bootstrap the destination Schema Registry now for any pre-existing
+    // SR-API-mode link; links created later are handled by the link-change
+    // notification in register_notifications.
+    co_await maybe_bootstrap_destination_sr();
+}
+
+ss::future<> service::maybe_bootstrap_destination_sr() {
+    // Topic creation is cluster-wide; one shard suffices even though the
+    // manager start and the link-change notification fire on every shard.
+    if (ss::this_shard_id() != 0 || _schema_registry_dest == nullptr) {
+        co_return;
+    }
+    // Create the destination `_schemas` topic only when a shadow link actually
+    // uses SR-API mode. The sync task runs on the `_schemas/0` leader and the
+    // Schema Registry otherwise creates `_schemas` lazily on the first client
+    // request, so without this an SR-API link on an untouched destination would
+    // never start syncing. Only the topic is created; the full start-up (store
+    // load) is left to the `_schemas/0` leader, where the sync task triggers
+    // it on its first destination operation. Gating on an api-mode link keeps
+    // a cluster that enabled shadow linking without one clean. Idempotent; a
+    // no-op when the destination Schema Registry is disabled.
+    for (const auto& id : _plf->local().get_all_link_ids()) {
+        auto md = _plf->local().find_link_by_id(id);
+        if (
+          md != nullptr
+          && md->configuration.schema_registry_sync_cfg.api_mode() != nullptr) {
+            // Best-effort: a failure must not fail link handling.
+            auto created = co_await ss::coroutine::as_future(
+              _schema_registry_dest->ensure_internal_topic());
+            if (created.failed()) {
+                auto ex = created.get_exception();
+                auto lvl = ssx::is_shutdown_exception(ex) ? ss::log_level::debug
+                                                          : ss::log_level::warn;
+                vlogl(
+                  cllog,
+                  lvl,
+                  "Failed to bootstrap destination Schema Registry for shadow "
+                  "linking: {}",
+                  ex);
+            }
+            co_return;
+        }
+    }
 }
 
 ss::future<> service::maybe_stop_manager() {

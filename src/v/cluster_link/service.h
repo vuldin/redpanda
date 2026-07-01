@@ -199,6 +199,14 @@ private:
     ss::future<> maybe_start_manager();
     ss::future<> maybe_stop_manager();
 
+    /// If any shadow link uses Schema-Registry API mode, ensures the
+    /// destination Schema Registry's internal `_schemas` topic exists so the
+    /// sync task (which runs on the topic's partition-0 leader) can start
+    /// without external Schema Registry traffic. A no-op when no such link
+    /// exists, so a cluster with shadow linking enabled but no API-mode link
+    /// keeps a clean data directory. Idempotent, cluster-wide, best-effort.
+    ss::future<> maybe_bootstrap_destination_sr();
+
     template<typename Func, typename Ret = std::invoke_result_t<Func, manager*>>
     requires std::invocable<Func, manager*>
     auto with_manager(Func&& func) -> Ret {
