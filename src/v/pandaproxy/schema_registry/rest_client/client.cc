@@ -319,6 +319,31 @@ client::list_contexts(
     co_return std::move(parsed.value());
 }
 
+ss::future<std::expected<mode_info, domain_error>>
+client::get_mode(retry_chain_node& rtc) {
+    auto gate = maybe_gate();
+    if (!gate.has_value()) {
+        co_return std::unexpected(std::move(gate.error()));
+    }
+    // defaultToGlobal is omitted: on the subject-less GET /mode it has no
+    // observable effect (the global mode is returned either way).
+    auto request = http::request_builder{}
+                     .method(boost::beast::http::verb::get)
+                     .path("/mode")
+                     .header("accept", accept_json);
+    maybe_add_basic_auth(request);
+
+    auto response = co_await perform_request(rtc, std::move(request));
+    if (!response.has_value()) {
+        co_return std::unexpected(std::move(response.error()));
+    }
+    auto parsed = co_await parse_mode(std::move(response.value()));
+    if (!parsed.has_value()) {
+        co_return std::unexpected(domain_error{std::move(parsed.error())});
+    }
+    co_return std::move(parsed.value());
+}
+
 ss::future<std::expected<chunked_vector<schema_version>, domain_error>>
 client::list_subject_versions(
   const context_subject& subject,

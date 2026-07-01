@@ -284,6 +284,164 @@ TEST_CORO(parse_contexts_test, malformed_or_truncated_is_error) {
     }
 }
 
+TEST_CORO(parse_mode_test, readwrite) {
+    auto res = co_await parse_mode(iobuf::from(R"({"mode": "READWRITE"})"));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res->mode, registry_mode::read_write);
+    ASSERT_EQ_CORO(res->raw, "READWRITE");
+}
+
+TEST_CORO(parse_mode_test, all_known_values_map_to_enumerators) {
+    // Every value the Schema Registry REST API defines maps to its enumerator,
+    // including READONLY_OVERRIDE (deprecated) and FORWARD — values Redpanda's
+    // own server never emits but a Confluent-compatible one can. raw always
+    // carries the verbatim wire string.
+    const std::pair<std::string_view, registry_mode> cases[] = {
+      {"READWRITE", registry_mode::read_write},
+      {"READONLY", registry_mode::read_only},
+      {"READONLY_OVERRIDE", registry_mode::read_only_override},
+      {"IMPORT", registry_mode::import},
+      {"FORWARD", registry_mode::forward},
+    };
+    for (const auto& [wire, expected] : cases) {
+        SCOPED_TRACE(wire);
+        auto res = co_await parse_mode(
+          iobuf::from(ssx::sformat(R"({{"mode": "{}"}})", wire)));
+        ASSERT_TRUE_CORO(res.has_value());
+        ASSERT_EQ_CORO(res->mode, expected);
+        ASSERT_EQ_CORO(res->raw, ss::sstring{wire});
+    }
+}
+
+TEST_CORO(parse_mode_test, unknown_value_is_open_enum) {
+    // An unrecognized mode is tolerated, not rejected: it maps to `unknown`
+    // with the verbatim wire string preserved so nothing is lost.
+    auto res = co_await parse_mode(iobuf::from(R"({"mode": "GALAXY_BRAIN"})"));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res->mode, registry_mode::unknown);
+    ASSERT_EQ_CORO(res->raw, "GALAXY_BRAIN");
+}
+
+TEST_CORO(parse_mode_test, empty_value_is_unknown_not_error) {
+    // Shape is strict, value is open: a present-but-empty string is not a shape
+    // violation; the value simply maps to `unknown` (raw="").
+    auto res = co_await parse_mode(iobuf::from(R"({"mode": ""})"));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res->mode, registry_mode::unknown);
+    ASSERT_EQ_CORO(res->raw, "");
+}
+
+TEST_CORO(parse_mode_test, ignores_unknown_fields) {
+    // Only `mode` is modeled; any other top-level field is skipped, whether it
+    // precedes or follows `mode` and whatever its (possibly nested) value.
+    for (std::string_view body :
+         {R"({"mode": "READONLY", "extra": 123})",
+          R"({"extra": {"a": [1, 2]}, "mode": "READONLY"})"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_mode(iobuf::from(body));
+        ASSERT_TRUE_CORO(res.has_value());
+        ASSERT_EQ_CORO(res->mode, registry_mode::read_only);
+        ASSERT_EQ_CORO(res->raw, "READONLY");
+    }
+}
+
+TEST_CORO(parse_mode_test, missing_mode_is_error) {
+    // `mode` is the one field a successful response must carry.
+    for (std::string_view body : {R"({})", R"({"other": 1})"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_mode(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_mode_test, non_object_is_error) {
+    for (std::string_view body :
+         {R"(["READWRITE"])", R"("READWRITE")", "42", "null", "true"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_mode(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_mode_test, non_string_mode_is_error) {
+    for (std::string_view body :
+         {R"({"mode": 5})",
+          R"({"mode": null})",
+          R"({"mode": ["READWRITE"]})",
+          R"({"mode": {}})",
+          R"({"mode": true})"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_mode(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_mode_test, trailing_content_after_object_is_error) {
+    // The mode body is exactly one object; content after the closing '}' is
+    // rejected, not ignored.
+    for (std::string_view body :
+         {R"({"mode": "READWRITE"} "more")",
+          R"({"mode": "READWRITE"}{})",
+          R"({"mode": "READWRITE"}garbage)",
+          R"({"mode": "READWRITE"},)"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_mode(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST_CORO(parse_mode_test, trailing_whitespace_is_ok) {
+    auto res = co_await parse_mode(
+      iobuf::from("{\"mode\": \"READWRITE\"}  \n\t "));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res->mode, registry_mode::read_write);
+}
+
+TEST_CORO(parse_mode_test, fragmented_input) {
+    // One byte per fragment forces the object structure and the mode value to
+    // span parser fragment boundaries.
+    auto res = co_await parse_mode(
+      fragmented_iobuf(R"({"mode": "READONLY_OVERRIDE"})", 1));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_EQ_CORO(res->mode, registry_mode::read_only_override);
+    ASSERT_EQ_CORO(res->raw, "READONLY_OVERRIDE");
+}
+
+TEST_CORO(parse_mode_test, malformed_or_truncated_is_error) {
+    // Missing close brace, missing value, unterminated string, an unclosed
+    // object after a complete pair, a dangling key at EOF, and non-JSON — every
+    // route ends in an error, never a partial result.
+    for (std::string_view body :
+         {"",
+          "{",
+          R"({"mode")",
+          R"({"mode":)",
+          R"({"mode": "READWRITE)",
+          R"({"mode": "READWRITE")",
+          R"({"x": 1, "mode")",
+          "not json"}) {
+        SCOPED_TRACE(body);
+        auto res = co_await parse_mode(iobuf::from(body));
+        ASSERT_FALSE_CORO(res.has_value());
+    }
+}
+
+TEST(registry_mode_test, to_string_view_and_format) {
+    // The display/log form of every mode, including the open-enum `unknown`
+    // sentinel. The known arms are also hit via registry_mode_from_wire, but
+    // this pins the full contract and the format_to path.
+    EXPECT_EQ(to_string_view(registry_mode::read_write), "READWRITE");
+    EXPECT_EQ(to_string_view(registry_mode::read_only), "READONLY");
+    EXPECT_EQ(
+      to_string_view(registry_mode::read_only_override), "READONLY_OVERRIDE");
+    EXPECT_EQ(to_string_view(registry_mode::import), "IMPORT");
+    EXPECT_EQ(to_string_view(registry_mode::forward), "FORWARD");
+    EXPECT_EQ(to_string_view(registry_mode::unknown), "{unknown}");
+    // The fmt formatter (via format_to) mirrors to_string_view.
+    EXPECT_EQ(fmt::format("{}", registry_mode::forward), "FORWARD");
+    EXPECT_EQ(fmt::format("{}", registry_mode::unknown), "{unknown}");
+}
+
 TEST_CORO(parse_subject_versions_test, basic) {
     auto res = co_await parse_subject_versions(iobuf::from("[1, 2, 3]"));
     ASSERT_TRUE_CORO(res.has_value());

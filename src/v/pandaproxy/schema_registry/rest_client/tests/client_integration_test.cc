@@ -84,6 +84,19 @@ void soft_delete(http::client& client, std::string_view subject_path) {
     BOOST_REQUIRE_EQUAL(res.headers.result(), bh::status::ok);
 }
 
+// Set the registry-wide (global) mode via PUT /mode on the seed client.
+// mode_mutability defaults to true, so this is accepted.
+void put_global_mode(http::client& client, std::string_view mode_value) {
+    auto res = http_request(
+      client,
+      "/mode",
+      iobuf::from(fmt::format(R"({{"mode": "{}"}})", mode_value)),
+      bh::verb::put,
+      serialization_format::schema_registry_v1_json,
+      serialization_format::schema_registry_v1_json);
+    BOOST_REQUIRE_EQUAL(res.headers.result(), bh::status::ok);
+}
+
 } // namespace
 
 // Drives the rest_client against the in-tree Schema Registry server: seeds
@@ -156,6 +169,16 @@ FIXTURE_TEST(sr_rest_client_integration, pandaproxy_test_fixture) {
         };
         BOOST_REQUIRE(contains(pps::context{".myctx"}));
         BOOST_REQUIRE(!contains(pps::default_context));
+    }
+
+    info("get_mode returns the default READWRITE global mode");
+    {
+        // No global mode has been set, so the registry reports its built-in
+        // default. The real server emits {"mode":"READWRITE"}.
+        auto res = sut.get_mode(rtc).get();
+        BOOST_REQUIRE(res.has_value());
+        BOOST_REQUIRE(res->mode == rc::registry_mode::read_write);
+        BOOST_REQUIRE_EQUAL(res->raw, "READWRITE");
     }
 
     info("list_subject_versions returns [1, 2]");
@@ -300,6 +323,24 @@ FIXTURE_TEST(sr_rest_client_integration, pandaproxy_test_fixture) {
             BOOST_REQUIRE(all.has_value());
             BOOST_REQUIRE(contains(all.value(), solo));
         }
+    }
+
+    // Kept last: switching the global mode to READONLY would reject the schema
+    // registrations and soft-deletes the earlier sections rely on.
+    info("get_mode reflects a mode change made via PUT /mode");
+    {
+        put_global_mode(seed, "READONLY");
+        auto ro = sut.get_mode(rtc).get();
+        BOOST_REQUIRE(ro.has_value());
+        BOOST_REQUIRE(ro->mode == rc::registry_mode::read_only);
+        BOOST_REQUIRE_EQUAL(ro->raw, "READONLY");
+
+        // Reading tracks a change in the other direction too (and restores the
+        // registry so it isn't left read-only).
+        put_global_mode(seed, "READWRITE");
+        auto rw = sut.get_mode(rtc).get();
+        BOOST_REQUIRE(rw.has_value());
+        BOOST_REQUIRE(rw->mode == rc::registry_mode::read_write);
     }
 
     sut.shutdown().get();

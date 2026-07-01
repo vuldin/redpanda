@@ -16,6 +16,7 @@
 #include "http/client.h"
 #include "pandaproxy/schema_registry/rest_client/credentials.h"
 #include "pandaproxy/schema_registry/rest_client/error.h"
+#include "pandaproxy/schema_registry/rest_client/mode.h"
 #include "pandaproxy/schema_registry/rest_client/parse.h"
 #include "pandaproxy/schema_registry/rest_client/retry_policy.h"
 #include "pandaproxy/schema_registry/types.h"
@@ -89,6 +90,21 @@ public:
     list_contexts(
       retry_chain_node& rtc,
       std::optional<ss::sstring> context_prefix = std::nullopt);
+
+    /// GET /mode — read the registry-wide (global / default-context) operating
+    /// mode. This endpoint always resolves to a value: a registry that never
+    /// had a global mode set reports READWRITE. There is no operation-specific
+    /// not-found condition (only a transient 500 / error_code 50001 storage
+    /// failure, handled by the retry policy).
+    ///
+    /// The mode is an open enum (see mode.h): the values the Schema Registry
+    /// REST API defines are mapped to registry_mode, and any value a newer
+    /// server reports is surfaced as registry_mode::unknown with the verbatim
+    /// wire string preserved in mode_info::raw, rather than rejected. The
+    /// `defaultToGlobal` query parameter is omitted: on the subject-less global
+    /// endpoint it has no observable effect.
+    ss::future<std::expected<mode_info, domain_error>>
+    get_mode(retry_chain_node& rtc);
 
     /// GET /subjects/{subject}/versions — list the version numbers registered
     /// under \p subject. With \p deleted set to yes, soft-deleted versions are

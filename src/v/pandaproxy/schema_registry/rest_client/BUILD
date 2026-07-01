@@ -8,6 +8,7 @@ redpanda_cc_library(
         "parse.cc",
     ],
     hdrs = [
+        "mode.h",
         "parse.h",
     ],
     implementation_deps = [
@@ -19,6 +20,7 @@ redpanda_cc_library(
         "//src/v/bytes:iobuf",
         "//src/v/container:chunked_vector",
         "//src/v/pandaproxy/schema_registry:types",
+        "//src/v/strings:string_switch",
         "@seastar",
     ],
 )

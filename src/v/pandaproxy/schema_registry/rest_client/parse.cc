@@ -143,6 +143,73 @@ parse_contexts(iobuf body) {
     }
 }
 
+ss::future<std::expected<mode_info, parse_error>> parse_mode(iobuf body) {
+    using token = serde::json::token;
+    // Firewall exceptions from the parser: malformed input is reported via the
+    // returned std::expected, not thrown.
+    try {
+        serde::json::parser p(std::move(body));
+
+        if (!co_await p.next() || p.token() != token::start_object) {
+            co_return std::unexpected(
+              parse_error{.reason = "expected a JSON object"});
+        }
+
+        std::optional<mode_info> result;
+        while (co_await p.next()) {
+            if (p.token() == token::end_object) {
+                // The body is exactly one JSON object: reject any trailing
+                // content rather than ignoring it.
+                co_await p.next();
+                if (p.token() != token::eof) {
+                    co_return std::unexpected(
+                      parse_error{
+                        .reason = "trailing content after mode object"});
+                }
+                if (!result.has_value()) {
+                    // `mode` is the one field a successful response must carry.
+                    co_return std::unexpected(
+                      parse_error{.reason = "missing mode field"});
+                }
+                co_return std::move(*result);
+            }
+            if (p.token() != token::key) {
+                co_return std::unexpected(
+                  parse_error{.reason = "expected an object key"});
+            }
+            auto key = p.value_string().linearize_to_string();
+            if (!co_await p.next()) {
+                co_return std::unexpected(
+                  parse_error{.reason = "truncated JSON after key"});
+            }
+            if (key == "mode") {
+                if (p.token() != token::value_string) {
+                    co_return std::unexpected(
+                      parse_error{.reason = "mode must be a string"});
+                }
+                // Shape is strict but the value is open: map the recognized
+                // wire strings and keep the verbatim value, so an unrecognized
+                // (open-enum) mode is preserved rather than rejected.
+                auto raw = p.value_string().linearize_to_string();
+                result = mode_info{
+                  .mode = registry_mode_from_wire(raw), .raw = std::move(raw)};
+            } else {
+                // Ignore any other field: the server omits null/empty fields
+                // and a client must not assume any field beyond `mode`.
+                co_await p.skip_value();
+            }
+        }
+
+        // next() returned false before the closing '}'.
+        co_return std::unexpected(
+          parse_error{.reason = "truncated or malformed JSON"});
+    } catch (const std::exception& e) {
+        co_return std::unexpected(
+          parse_error{
+            .reason = ssx::sformat("failed to parse mode: {}", e.what())});
+    }
+}
+
 ss::future<std::expected<chunked_vector<schema_version>, parse_error>>
 parse_subject_versions(iobuf body) {
     using token = serde::json::token;

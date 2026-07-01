@@ -465,6 +465,173 @@ TEST(rest_client, list_contexts_prefix_dot_matches_all) {
     EXPECT_THAT(*res, ElementsAre(pps::default_context, pps::context{".dev"}));
 }
 
+TEST(rest_client, get_mode_request_shape_and_success) {
+    auto check_and_respond = [](
+                               bh::request_header<>&& r,
+                               std::optional<iobuf>,
+                               ss::lowres_clock::duration) {
+        EXPECT_EQ(r.method(), bh::verb::get);
+        // No defaultToGlobal query param on the subject-less endpoint.
+        EXPECT_EQ(r.target(), "/mode");
+        EXPECT_EQ(r.at(bh::field::accept), "application/json");
+        // base64("user:pass") == "dXNlcjpwYXNz"
+        EXPECT_EQ(r.at(bh::field::authorization), "Basic dXNlcjpwYXNz");
+        return ss::make_ready_future<http::downloaded_response>(
+          http::downloaded_response{
+            .status = bh::status::ok,
+            .body = iobuf::from(R"({"mode": "READWRITE"})")});
+    };
+    rc::client client{
+      make_http_client([&](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(check_and_respond);
+      }),
+      endpoint,
+      rc::basic_auth_credentials{.username = "user", .password = "pass"}};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_mode(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->mode, rc::registry_mode::read_write);
+    EXPECT_EQ(res->raw, "READWRITE");
+}
+
+TEST(rest_client, get_mode_open_enum_tolerates_unknown_values) {
+    // A value Redpanda's own enum lacks (FORWARD) and a hypothetical future
+    // value both parse: known -> enumerator, unknown -> `unknown` + raw. This
+    // is the open-enum contract the client must honor against other registries.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(bh::status::ok, R"({"mode": "FORWARD"})"))
+            .WillOnce(respond(bh::status::ok, R"({"mode": "GALAXY_BRAIN"})"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+
+    auto fwd = client.get_mode(rtc).get();
+    ASSERT_TRUE(fwd.has_value());
+    EXPECT_EQ(fwd->mode, rc::registry_mode::forward);
+    EXPECT_EQ(fwd->raw, "FORWARD");
+
+    auto unknown = client.get_mode(rtc).get();
+    ASSERT_TRUE(unknown.has_value());
+    EXPECT_EQ(unknown->mode, rc::registry_mode::unknown);
+    EXPECT_EQ(unknown->raw, "GALAXY_BRAIN");
+
+    client.shutdown().get();
+}
+
+TEST(rest_client, get_mode_no_credentials_omits_auth_header) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce([](
+                        bh::request_header<>&& r,
+                        std::optional<iobuf>,
+                        ss::lowres_clock::duration) {
+                EXPECT_EQ(r.count(bh::field::authorization), 0);
+                return ss::make_ready_future<http::downloaded_response>(
+                  http::downloaded_response{
+                    .status = bh::status::ok,
+                    .body = iobuf::from(R"({"mode": "READONLY"})")});
+            });
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_mode(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->mode, rc::registry_mode::read_only);
+}
+
+TEST(rest_client, get_mode_storage_error_is_retried) {
+    // The report's one operation-specific failure, 500 / error_code 50001
+    // (backend storage), is transient: the client retries it and succeeds once
+    // the store recovers.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(
+              bh::status::internal_server_error,
+              R"({"error_code": 50001, "message": "Failed to get mode"})"))
+            .WillOnce(respond(bh::status::ok, R"({"mode": "READWRITE"})"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 30s, 10ms);
+    auto res = client.get_mode(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->mode, rc::registry_mode::read_write);
+}
+
+TEST(rest_client, get_mode_parse_error_surfaced) {
+    // A well-formed but wrong-shaped 200 body (an array, not the mode object)
+    // surfaces as a parse_error.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce(respond(bh::status::ok, R"(["not", "an", "object"])"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_mode(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::parse_error>(res.error()));
+}
+
+TEST(rest_client, get_mode_after_shutdown_is_aborted) {
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _)).Times(0);
+      }),
+      endpoint};
+
+    client.shutdown().get();
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client.get_mode(rtc).get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::aborted_error>(res.error()));
+}
+
+TEST(rest_client, get_mode_retries_exhausted_surfaces_error) {
+    // A persistently failing transient status exhausts the retry budget;
+    // get_mode propagates the terminal error from perform_request rather than
+    // attempting to parse a body.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillRepeatedly(respond(bh::status::service_unavailable, "busy"));
+      }),
+      endpoint};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 100ms, 10ms);
+    auto res = client.get_mode(rtc).get();
+    client.shutdown().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_TRUE(std::holds_alternative<rc::retries_exhausted>(res.error()));
+}
+
 TEST(rest_client, list_subject_versions_success_and_encodes_subject) {
     rc::client client{
       make_http_client([](mock_client& m) {

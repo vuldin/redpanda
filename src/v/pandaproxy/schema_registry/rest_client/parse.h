@@ -13,6 +13,7 @@
 #include "base/seastarx.h"
 #include "bytes/iobuf.h"
 #include "container/chunked_vector.h"
+#include "pandaproxy/schema_registry/rest_client/mode.h"
 #include "pandaproxy/schema_registry/types.h"
 
 #include <seastar/core/future.hh>
@@ -64,6 +65,20 @@ parse_subjects(iobuf body, qualified_subjects_enabled qualified);
 /// malformed input is reported via the returned std::expected.
 ss::future<std::expected<chunked_vector<context>, parse_error>>
 parse_contexts(iobuf body);
+
+/// Parse the body of a `GET /mode` response into a mode_info.
+///
+/// The body is a JSON object with a single modeled field, `mode`, a string
+/// (e.g. `{"mode": "READWRITE"}`). Parsing splits shape from value: the shape
+/// is strict — a non-object body, a missing `mode`, a non-string `mode`, or any
+/// trailing content after the object yields a parse_error — whereas the `mode`
+/// value is an open enum, so an unrecognized (or empty) string is not rejected
+/// but mapped to registry_mode::unknown with the original preserved in
+/// mode_info::raw (see mode.h). Any other top-level field is ignored: the
+/// server omits null/empty fields, and a client must not assume any field
+/// beyond `mode`. The function does not throw: malformed input is reported via
+/// the returned std::expected.
+ss::future<std::expected<mode_info, parse_error>> parse_mode(iobuf body);
 
 /// Parse the body of a `GET /subjects/{subject}/versions` response into a list
 /// of versions.
