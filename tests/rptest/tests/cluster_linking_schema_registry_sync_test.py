@@ -176,12 +176,16 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
     # --- link creation -----------------------------------------------------
 
     def _create_sr_link(
-        self, source_url: str | None = None, full_sync_interval_sec: int = 2
+        self,
+        source_url: str | None = None,
+        full_sync_interval_sec: int = 2,
+        source_filter_subjects: list[str] | None = None,
     ) -> str:
         # Create a shadow link that syncs only the Schema Registry, in API mode,
         # pointing at the source cluster's SR endpoint (or an explicit URL, e.g.
         # a bad one to exercise the unavailable path). Short intervals so
-        # subsequent full syncs land quickly. Returns the source URL used.
+        # subsequent full syncs land quickly. An optional exact-subject filter
+        # scopes replication. Returns the source URL used.
         if source_url is None:
             source_url = self.source_cluster_service.schema_reg(limit=1)
         req = self.create_default_link_request(
@@ -190,14 +194,17 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
             mirror_all_groups=False,
             mirror_all_acls=False,
         )
+        api = shadow_link_pb2.SchemaRegistrySyncOptions.ShadowSchemaRegistryApi(
+            source_url=source_url,
+            tail_interval=google.protobuf.duration_pb2.Duration(seconds=2),
+            full_sync_interval=google.protobuf.duration_pb2.Duration(
+                seconds=full_sync_interval_sec
+            ),
+        )
+        if source_filter_subjects is not None:
+            api.source_filter.subjects.extend(source_filter_subjects)
         req.shadow_link.configurations.schema_registry_sync_options.shadow_schema_registry_api.CopyFrom(
-            shadow_link_pb2.SchemaRegistrySyncOptions.ShadowSchemaRegistryApi(
-                source_url=source_url,
-                tail_interval=google.protobuf.duration_pb2.Duration(seconds=2),
-                full_sync_interval=google.protobuf.duration_pb2.Duration(
-                    seconds=full_sync_interval_sec
-                ),
-            )
+            api
         )
         self.create_link_with_request(req=req)
         return source_url
@@ -534,3 +541,45 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         assert src.delete_subject_version(after, "2").status_code == 200
         assert src.delete_subject(whole).status_code == 200
         self._wait_delete_synced(src, dest, subjects)
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_out_of_scope_reference(self):
+        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+
+        # leaf-0 is a referent; mid-0 references it; ok-value is independent.
+        self._add_leaf(src, 0)
+        self._add_mid(src, 0, 0, 0)
+        self._register(
+            src, "ok-value", self._record("Ok", [{"name": "v", "type": "string"}])
+        )
+
+        # Select the referrer and the independent subject but NOT the referent,
+        # so mid-0's reference is out of scope. Importing mid-0 must fail and be
+        # counted, while ok-value still syncs and the full sync completes (the
+        # link neither parks nor faults).
+        self._create_sr_link(source_filter_subjects=["mid-0-value", "ok-value"])
+
+        self._wait_synced(src, dest, [("ok-value", 1)])
+
+        # last_full_sync.errors >= 1 proves the error was counted within a
+        # completed full sync (best-effort), not that the task parked/faulted.
+        def errored() -> bool:
+            sr = self._admin_sr_status()
+            return (
+                sr.HasField("last_full_sync")
+                and sr.last_full_sync.errors >= 1
+                and sr.totals_since_task_start.errors >= 1
+            )
+
+        wait_until(
+            errored,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="out-of-scope reference did not surface as a counted error",
+        )
+
+        # The referrer never imported; the in-scope independent subject did.
+        dest_subjects = set(dest.get_subjects().json())
+        assert "ok-value" in dest_subjects, dest_subjects
+        assert "mid-0-value" not in dest_subjects, dest_subjects
