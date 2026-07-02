@@ -726,6 +726,25 @@ TEST_CORO(parse_schema_id_subject_versions_test, non_object_element_is_error) {
     }
 }
 
+TEST_CORO(
+  parse_schema_id_subject_versions_test, non_key_token_in_object_is_error) {
+    // An object member that opens with a non-key token (a bare value) is
+    // rejected by an explicit shape check rather than by letting value_string()
+    // throw and relying on the exception firewall.
+    auto res = co_await parse_schema_id_subject_versions(
+      iobuf::from(R"([{true}])"), qualified_subjects_enabled::yes);
+    ASSERT_FALSE_CORO(res.has_value());
+}
+
+TEST_CORO(
+  parse_schema_id_subject_versions_test, unknown_key_missing_value_is_error) {
+    // An unmodeled key with no value faults the skip path; the exception
+    // firewall reports it as a parse_error rather than letting it escape.
+    auto res = co_await parse_schema_id_subject_versions(
+      iobuf::from(R"([{"x"}])"), qualified_subjects_enabled::yes);
+    ASSERT_FALSE_CORO(res.has_value());
+}
+
 TEST_CORO(parse_schema_id_subject_versions_test, wrong_typed_field_is_error) {
     for (std::string_view body :
          {R"([{"subject": 5, "version": 1}])",
@@ -1164,7 +1183,10 @@ TEST_CORO(parse_subject_version_test, rejects_unrepresentable) {
           R"({"references":[{"name":42}]})",    // reference name wrong type
           R"({"references":[{"subject":42}]})", // reference subject wrong type
           R"({"references":[{"version":0}]})", // reference version out of range
-          R"({"references":[{)", // truncated reference: parser throws, caught
+          R"({"references":[{true}]})",        // reference: non-key token
+          R"({"references":[{)", // reference: missing key (truncated)
+          R"({"metadata":{)",    // truncated metadata (parser throws, firewall
+                                 // catch)
           "[1,2,3]",             // not an object
           R"({"subject":"r")",   // truncated
           R"({"subject":"r"}garbage)", // trailing content after }

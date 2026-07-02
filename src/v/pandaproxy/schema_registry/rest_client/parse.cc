@@ -385,6 +385,13 @@ parse_schema_id_subject_versions(
             std::optional<context_subject> sub;
             std::optional<schema_version> version;
             while (co_await p.next() && p.token() != token::end_object) {
+                // Shape is strict: reject a non-key token explicitly rather
+                // than letting value_string() throw and rely on the catch
+                // below.
+                if (p.token() != token::key) {
+                    co_return std::unexpected(
+                      parse_error{.reason = "expected an object key"});
+                }
                 auto key = p.value_string().linearize_to_string();
                 if (!co_await p.next()) {
                     co_return std::unexpected(
@@ -429,7 +436,7 @@ parse_schema_id_subject_versions(
         co_return std::unexpected(
           parse_error{
             .reason = ssx::sformat(
-              "failed to parse subject-versions: {}", e.what())});
+              "failed to parse schema-id subject-versions: {}", e.what())});
     }
 }
 
@@ -455,6 +462,12 @@ parse_references(serde::json::parser& p, qualified_subjects_enabled qualified) {
         std::optional<context_subject_reference> sub;
         std::optional<schema_version> version;
         while (co_await p.next() && p.token() != token::end_object) {
+            // Shape is strict: reject a non-key token explicitly rather than
+            // letting value_string() throw and rely on the catch in the caller.
+            if (p.token() != token::key) {
+                co_return std::unexpected(
+                  parse_error{.reason = "expected an object key"});
+            }
             auto key = p.value_string().linearize_to_string();
             if (!co_await p.next()) {
                 co_return std::unexpected(
