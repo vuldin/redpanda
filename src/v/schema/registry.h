@@ -15,7 +15,7 @@
 #include "pandaproxy/schema_registry/schema_getter.h"
 #include "pandaproxy/schema_registry/types.h"
 
-#include <functional>
+#include <seastar/util/noncopyable_function.hh>
 
 namespace schema {
 /**
@@ -72,13 +72,13 @@ public:
         std::optional<pandaproxy::schema_registry::schema_version>) const = 0;
 
     /// Lists every (subject, version) whose subject matches `filter`, each
-    /// carrying its version's soft-delete state. The predicate must be pure and
-    /// copyable (it runs on each registry shard).
+    /// carrying its version's soft-delete state. The predicate must be pure; it
+    /// is invoked on each registry shard.
     virtual ss::future<
       chunked_vector<pandaproxy::schema_registry::subject_version_deleted>>
     list_subject_versions(
-      std::function<bool(const pandaproxy::schema_registry::context_subject&)>
-        filter,
+      ss::noncopyable_function<
+        bool(const pandaproxy::schema_registry::context_subject&)> filter,
       pandaproxy::schema_registry::include_deleted) const = 0;
 
     virtual ss::future<pandaproxy::schema_registry::context_schema_id>

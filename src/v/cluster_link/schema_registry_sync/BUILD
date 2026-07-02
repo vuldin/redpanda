@@ -23,10 +23,12 @@ redpanda_cc_library(
     srcs = [
         "mirroring_task.cc",
         "reconciler.cc",
+        "scope.cc",
     ],
     hdrs = [
         "mirroring_task.h",
         "reconciler.h",
+        "scope.h",
     ],
     implementation_deps = [
         "//src/v/base",

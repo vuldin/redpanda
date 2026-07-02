@@ -442,9 +442,12 @@ ss::future<chunked_vector<context_subject>> sharded_store::get_subjects(
 
 ss::future<chunked_vector<subject_version_deleted>>
 sharded_store::list_subject_versions(
-  std::function<bool(const context_subject&)> filter, include_deleted inc_del) {
+  ss::noncopyable_function<bool(const context_subject&)> filter,
+  include_deleted inc_del) {
     using result_t = chunked_vector<subject_version_deleted>;
-    auto map = [filter = std::move(filter), inc_del](store& s) {
+    // Captured by reference because it is move-only; the coroutine frame keeps
+    // `filter` alive for the scan.
+    auto map = [&filter, inc_del](store& s) {
         result_t out;
         for (const auto& sub : s.get_subjects(inc_del)) {
             if (!filter(sub)) {

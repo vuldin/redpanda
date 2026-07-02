@@ -23,9 +23,9 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/util/noncopyable_function.hh>
 
 #include <cstdint>
-#include <functional>
 
 namespace cluster_link::schema_registry_sync {
 
@@ -41,9 +41,10 @@ struct reconcile_stats {
     uint64_t errors{0};
 };
 
-/// The set of changes a reconcile applies. Create-only: every upsert is a
-/// (context, subject, version) node present on the source but absent from the
-/// destination's active set.
+/// The set of changes a reconcile applies: each upsert is a (context, subject,
+/// version) node imported from the source with its source deleted state. The
+/// caller selects which nodes to upsert (create, reactivate, or propagate a
+/// soft-delete); the reconciler imports them in reference order.
 struct work_set {
     chunked_vector<ppsr::subject_version> upserts;
 };
@@ -89,7 +90,7 @@ public:
     reconciler(
       source_reader* source,
       schema::registry* destination,
-      std::function<bool(const ppsr::context_subject&)> in_scope,
+      ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope,
       limits lim);
 
     /// Imports `work_set.upserts` referent-first.
@@ -176,7 +177,7 @@ private:
 
     source_reader* _source;
     schema::registry* _destination;
-    std::function<bool(const ppsr::context_subject&)> _in_scope;
+    ss::noncopyable_function<bool(const ppsr::context_subject&)> _in_scope;
     limits _limits;
 
     chunked_hash_set<ppsr::subject_version> _replicated;

@@ -16,8 +16,7 @@
 #include "pandaproxy/schema_registry/types.h"
 
 #include <seastar/core/sharded.hh>
-
-#include <functional>
+#include <seastar/util/noncopyable_function.hh>
 
 namespace pandaproxy::schema_registry {
 
@@ -115,7 +114,7 @@ public:
     /// version's soft-delete state, so an include_deleted scan reports both the
     /// live and deleted nodes in one pass.
     ss::future<chunked_vector<subject_version_deleted>> list_subject_versions(
-      std::function<bool(const context_subject&)> filter,
+      ss::noncopyable_function<bool(const context_subject&)> filter,
       include_deleted inc_del);
 
     ///\brief Return whether there are any subjects.

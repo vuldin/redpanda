@@ -103,7 +103,7 @@ ss::future<ppsr::schema_getter*> schema::fake_registry::getter() const {
 }
 ss::future<chunked_vector<ppsr::subject_version_deleted>>
 schema::fake_registry::list_subject_versions(
-  std::function<bool(const ppsr::context_subject&)> filter,
+  ss::noncopyable_function<bool(const ppsr::context_subject&)> filter,
   ppsr::include_deleted inc_del) const {
     maybe_throw_injected_failure();
     chunked_vector<ppsr::subject_version_deleted> out;

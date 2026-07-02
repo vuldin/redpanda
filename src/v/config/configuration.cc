@@ -3962,6 +3962,22 @@ configuration::configuration()
       "context.",
       {.needs_restart = needs_restart::yes, .visibility = visibility::user},
       true)
+  , schema_registry_sync_memory_bytes(
+      *this,
+      "schema_registry_sync_memory_bytes",
+      "Maximum bytes of schema bodies held in memory at once while a schema "
+      "registry cluster link reconciles from the source.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      16_MiB,
+      {.min = 1_MiB})
+  , schema_registry_sync_parallelism(
+      *this,
+      "schema_registry_sync_parallelism",
+      "Maximum number of schemas imported concurrently while a schema registry "
+      "cluster link reconciles from the source.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      4,
+      {.min = 1, .max = 1024})
   , pp_sr_smp_max_non_local_requests(
       *this,
       "pp_sr_smp_max_non_local_requests",

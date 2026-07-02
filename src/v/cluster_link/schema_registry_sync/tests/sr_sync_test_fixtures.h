@@ -24,8 +24,8 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/util/noncopyable_function.hh>
 
-#include <functional>
 #include <memory>
 #include <vector>
 
@@ -107,6 +107,7 @@ key(const ppsr::context_subject& sub, int32_t version) {
 struct fake_source_state {
     chunked_vector<ppsr::context> contexts{ppsr::default_context};
     chunked_vector<ppsr::stored_schema> schemas;
+    std::optional<srs::source_error> list_contexts_error;
     std::optional<srs::source_error> list_subjects_error;
     // Forces list_subject_versions to fail for specific subjects, letting a
     // test inject a per-subject enumeration failure (e.g. operation_failed)
@@ -171,6 +172,9 @@ public:
 
     ss::future<srs::source_result<chunked_vector<ppsr::context>>>
     list_contexts(ss::abort_source&) override {
+        if (_state->list_contexts_error.has_value()) {
+            co_return std::unexpected(*_state->list_contexts_error);
+        }
         co_return _state->contexts.copy();
     }
 
@@ -273,7 +277,7 @@ struct reconcile_harness {
     srs::reconciler::limits lim{.memory_bytes = 1u << 20, .parallelism = 1};
 
     srs::reconciler make(
-      std::function<bool(const ppsr::context_subject&)> in_scope =
+      ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope =
         [](const ppsr::context_subject&) { return true; }) {
         return srs::reconciler{&reader, &destination, std::move(in_scope), lim};
     }
@@ -325,7 +329,7 @@ public:
     }
     ss::future<chunked_vector<ppsr::subject_version_deleted>>
     list_subject_versions(
-      std::function<bool(const ppsr::context_subject&)> filter,
+      ss::noncopyable_function<bool(const ppsr::context_subject&)> filter,
       ppsr::include_deleted inc) const override {
         return _inner->list_subject_versions(std::move(filter), inc);
     }

@@ -242,6 +242,57 @@ TEST(reconciler, seed_replicated_upsert_is_still_imported) {
     EXPECT_GE(h.source.reads(a, 1), 1);
 }
 
+// A soft-deleted source version imports preserving its deleted state: the
+// reconciler fetches the body (which carries the flag) and import_schema stores
+// it soft-deleted. Underpins the task syncing soft-deleted source versions
+// preserving their deleted state.
+TEST(reconciler, imports_soft_deleted_as_deleted) {
+    reconcile_harness h;
+    auto a = ppsr::context_subject::unqualified("a");
+    h.source.add(a, 1, ppsr::is_deleted::yes);
+
+    srs::work_set work;
+    work.upserts.push_back(key(a, 1));
+
+    auto stats = h.run(std::move(work)).get();
+    ASSERT_TRUE(stats.has_value());
+    EXPECT_EQ(stats->versions_changed, 1);
+    EXPECT_EQ(stats->errors, 0);
+
+    const auto& all = h.destination.get_all();
+    auto ia = index_of(all, "a");
+    ASSERT_GE(ia, 0);
+    EXPECT_EQ(all[ia].deleted, ppsr::is_deleted::yes);
+}
+
+// Soft-delete propagation onto an active destination version: re-importing the
+// source body (which now carries deleted=yes) transitions an existing active
+// version to soft-deleted. The node is in the seed (a destination version is in
+// `all`), so this also guards that a seeded upsert is still imported. Underpins
+// the task propagating a source soft-delete onto a live destination version.
+TEST(reconciler, propagates_soft_delete_over_active_destination) {
+    reconcile_harness h;
+    auto a = ppsr::context_subject::unqualified("a");
+    // Destination already holds a:v1 active; the source has soft-deleted it.
+    h.destination.import_schema(make_schema(a, 1, R"({"v":1})")).get();
+    h.source.add(a, 1, ppsr::is_deleted::yes);
+
+    chunked_hash_set<ppsr::subject_version> seed;
+    seed.insert(key(a, 1));
+    srs::work_set work;
+    work.upserts.push_back(key(a, 1));
+
+    auto stats = h.run(std::move(work), std::move(seed)).get();
+    ASSERT_TRUE(stats.has_value());
+    EXPECT_EQ(stats->versions_changed, 1);
+    EXPECT_EQ(stats->errors, 0);
+
+    const auto& all = h.destination.get_all();
+    auto ia = index_of(all, "a");
+    ASSERT_GE(ia, 0);
+    EXPECT_EQ(all[ia].deleted, ppsr::is_deleted::yes);
+}
+
 TEST(reconciler, cyclic_source_does_not_hang) {
     reconcile_harness h;
     auto a = ppsr::context_subject::unqualified("a");
