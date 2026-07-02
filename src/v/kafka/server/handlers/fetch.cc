@@ -217,27 +217,6 @@ static ss::future<read_result> do_read_from_ntp(
   std::optional<model::timeout_clock::time_point> deadline,
   const bool obligatory_batch_read,
   fetch_memory_units_manager& units_mgr) {
-    // If it's the obligatory batch read then we need to allow for the
-    // configured max bytes to exceeded if the next batch in the partition
-    // is larger. This is needed to conform with KIP-74.
-    ntp_config.cfg.strict_max_bytes = !obligatory_batch_read;
-
-    // control available memory
-    auto memory_units = units_mgr.zero_units();
-    if (!ntp_config.cfg.skip_read) {
-        memory_units = units_mgr.allocate_memory_units(
-          ntp_config.ktp(),
-          ntp_config.cfg.max_bytes,
-          ntp_config.cfg.max_batch_size,
-          ntp_config.cfg.avg_batch_size,
-          obligatory_batch_read);
-        if (!memory_units.has_units()) {
-            ntp_config.cfg.skip_read = true;
-        } else if (ntp_config.cfg.max_bytes > memory_units.num_units()) {
-            ntp_config.cfg.max_bytes = memory_units.num_units();
-        }
-    }
-
     /*
      * lookup the ntp's partition
      */
@@ -314,6 +293,27 @@ static ss::future<read_result> do_read_from_ntp(
               preferred_replica);
         }
     }
+    // If it's the obligatory batch read then we need to allow for the
+    // configured max bytes to exceeded if the next batch in the partition
+    // is larger. This is needed to conform with KIP-74.
+    ntp_config.cfg.strict_max_bytes = !obligatory_batch_read;
+
+    // control available memory
+    auto memory_units = units_mgr.zero_units();
+    if (!ntp_config.cfg.skip_read) {
+        memory_units = units_mgr.allocate_memory_units(
+          ntp_config.ktp(),
+          ntp_config.cfg.max_bytes,
+          ntp_config.cfg.max_batch_size,
+          ntp_config.cfg.avg_batch_size,
+          obligatory_batch_read);
+        if (!memory_units.has_units()) {
+            ntp_config.cfg.skip_read = true;
+        } else if (ntp_config.cfg.max_bytes > memory_units.num_units()) {
+            ntp_config.cfg.max_bytes = memory_units.num_units();
+        }
+    }
+
     auto result = co_await read_from_partition(
       std::move(*kafka_partition), maybe_lso.value(), ntp_config.cfg, deadline);
 
