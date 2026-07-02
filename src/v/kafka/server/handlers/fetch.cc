@@ -321,7 +321,8 @@ static ss::future<read_result> do_read_from_ntp(
     // happen because there is no strict limit on read size when reading the
     // obligatory batch.
     memory_units.adjust_units(result.data_size_bytes());
-    result.memory_units = std::move(memory_units);
+    result.memory_units = std::make_shared<fetch_memory_units>(
+      std::move(memory_units));
     co_return result;
 }
 
@@ -414,7 +415,7 @@ static void fill_fetch_responses(
             resp.preferred_read_replica = *res.preferred_replica;
         }
 
-        std::optional<fetch_memory_units> resp_units{};
+        std::shared_ptr<fetch_memory_units> resp_units;
         auto current_response_size = resp_it->response_size();
         auto bytes_left = octx.bytes_left - current_response_size;
 
@@ -1750,10 +1751,10 @@ ss::future<response_ptr> op_context::send_error_response(error_code ec) && {
 }
 
 ss::deleter op_context::response_memory_units_deleter() {
-    chunked_vector<fetch_memory_units> mu;
+    chunked_vector<std::shared_ptr<fetch_memory_units>> mu;
     for (auto& r : iteration_order) {
         if (r.has_memory_units()) {
-            mu.push_back(r.release_memory_units().value());
+            mu.push_back(r.release_memory_units());
         }
     }
     return ss::make_object_deleter(std::move(mu));
@@ -1775,7 +1776,7 @@ op_context::response_placeholder::response_placeholder(
 
 void op_context::response_placeholder::set(
   fetch_response::partition_response&& response,
-  std::optional<fetch_memory_units>&& response_memory_units) {
+  std::shared_ptr<fetch_memory_units>&& response_memory_units) {
     vassert(
       response.partition_index == _it->partition_response->partition_index,
       "Response and current partition ids have to be the same. Current "

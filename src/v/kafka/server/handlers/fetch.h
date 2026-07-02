@@ -52,7 +52,7 @@ struct op_context {
 
         void set(
           fetch_response::partition_response&&,
-          std::optional<fetch_memory_units>&&);
+          std::shared_ptr<fetch_memory_units>&&);
 
         const model::topic& topic() { return _it->partition->topic; }
         model::partition_id partition_id() {
@@ -90,13 +90,13 @@ struct op_context {
         }
 
         // Adds/replaces the memory units that are held for this ntp.
-        void
-        replace_or_add_memory_units(std::optional<fetch_memory_units>&& units) {
+        void replace_or_add_memory_units(
+          std::shared_ptr<fetch_memory_units>&& units) {
             _response_memory_units = std::move(units);
         }
 
         // Releases/returns the memory units that are held for this ntp.
-        std::optional<fetch_memory_units> release_memory_units() {
+        std::shared_ptr<fetch_memory_units> release_memory_units() {
             return std::move(_response_memory_units);
         }
 
@@ -104,8 +104,9 @@ struct op_context {
         fetch_response::iterator _it;
         op_context* _ctx;
         const model::ktp_with_hash _ktp;
-        // Tracks memory used by response data in `_it`.
-        std::optional<fetch_memory_units> _response_memory_units;
+        // Tracks memory used by response data in `_it`. Shared so a coalesced
+        // read result can hand the same units to every response sharing it.
+        std::shared_ptr<fetch_memory_units> _response_memory_units;
     };
 
     using iteration_order_t
@@ -367,7 +368,7 @@ struct read_result {
     error_code error;
     model::partition_id partition;
     std::vector<cluster::tx::tx_range> aborted_transactions;
-    std::optional<fetch_memory_units> memory_units;
+    std::shared_ptr<fetch_memory_units> memory_units;
 };
 // struct aggregating fetch requests and corresponding response iterators for
 // the same shard
