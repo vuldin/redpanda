@@ -66,6 +66,7 @@ inline fmt::iterator format_to(errc e, fmt::iterator out) {
     case errc::failed:
         return fmt::format_to(out, "errc::failed");
     }
+    return fmt::format_to(out, "errc::unknown({})", static_cast<int16_t>(e));
 }
 
 struct ensure_table_exists_reply
