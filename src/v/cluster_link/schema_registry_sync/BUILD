@@ -57,11 +57,13 @@ redpanda_cc_library(
     name = "mirroring_task",
     srcs = [
         "mirroring_task.cc",
+        "probe.cc",
         "reconciler.cc",
         "scope.cc",
     ],
     hdrs = [
         "mirroring_task.h",
+        "probe.h",
         "reconciler.h",
         "scope.h",
     ],
@@ -84,6 +86,7 @@ redpanda_cc_library(
         ":source_reader",
         "//src/v/cluster_link:impl",
         "//src/v/cluster_link/model",
+        "//src/v/metrics",
         "//src/v/model",
         "//src/v/schema:registry",
         "//src/v/ssx:semaphore",

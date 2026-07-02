@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "cluster_link/schema_registry_sync/probe.h"
 #include "cluster_link/schema_registry_sync/reconciler.h"
 #include "cluster_link/schema_registry_sync/source_reader.h"
 #include "cluster_link/task.h"
@@ -72,6 +73,8 @@ public:
     ~mirroring_task() override = default;
 
     void update_config(const model::metadata& link_metadata) override;
+
+    ss::future<cl_result<void>> start() override;
 
     ss::future<cl_result<void>> stop() noexcept override;
 
@@ -224,6 +227,8 @@ private:
     [[nodiscard]] state_transition make_active();
     [[nodiscard]] state_transition make_faulted(const ss::sstring& reason);
 
+    model::schema_registry_sync_status get_live_sync_status() const;
+
     model::schema_registry_sync_config _config;
     // Source->destination context remapping for the current run, rebuilt from
     // _config at the start of each full sync. Applied only at the destination
@@ -237,6 +242,7 @@ private:
     // Live counters for the in-flight reconcile; reflected by get_status_report
     // for mid-sync progress, then folded into _status at end of run.
     reconcile_stats _reconcile_stats;
+    probe _probe;
     std::optional<ss::lowres_clock::time_point> _last_full_sync;
     // Set by update_config, consumed by run_impl to force a full scan. A flag
     // (rather than mutating _status/_last_full_sync in update_config) avoids
