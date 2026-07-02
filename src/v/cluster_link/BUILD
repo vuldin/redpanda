@@ -51,6 +51,7 @@ redpanda_cc_library(
         "//src/v/kafka/client:cluster",
         "//src/v/kafka/client:configuration",
         "//src/v/kafka/protocol",
+        "//src/v/net:tls",
         "//src/v/ssx:sformat",
         "@seastar",
     ],
