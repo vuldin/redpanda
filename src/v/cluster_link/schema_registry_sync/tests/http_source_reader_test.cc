@@ -270,6 +270,47 @@ TEST(http_source_reader, reachable_error_maps_to_operation_failed) {
     EXPECT_EQ(res.error().kind, srs::source_error_kind::operation_failed);
 }
 
+// Auth failures (401 Unauthorized / 403 Forbidden) are a link-wide, terminal
+// condition: the credentials are wrong or lack permission, so every request
+// would fail identically. The reader maps them to source_unavailable so the
+// sync backs off rather than churning through and re-failing every subject.
+// These statuses are not in the rest_client's retriable set, so a single
+// response settles the result.
+TEST(http_source_reader, auth_failure_maps_to_source_unavailable) {
+    for (auto status : {bh::status::unauthorized, bh::status::forbidden}) {
+        auto reader = reader_over([status](mock_client& m) {
+            EXPECT_CALL(m, request_and_collect_response(_, _, _))
+              .WillOnce(respond(status, R"({"error_code": 40101})"));
+        });
+        ss::abort_source as;
+        auto res = reader.list_subjects(pps::default_context, as).get();
+        reader.stop().get();
+
+        ASSERT_FALSE(res.has_value()) << "status=" << static_cast<int>(status);
+        EXPECT_EQ(res.error().kind, srs::source_error_kind::source_unavailable)
+          << "status=" << static_cast<int>(status);
+    }
+}
+
+// HTTP 404 / error_code 40401 maps to subject_not_found, not operation_failed.
+TEST(http_source_reader, not_found_maps_to_subject_not_found) {
+    auto reader = reader_over([](mock_client& m) {
+        EXPECT_CALL(m, request_and_collect_response(_, _, _))
+          .WillOnce(respond(bh::status::not_found, R"({"error_code": 40401})"));
+    });
+    ss::abort_source as;
+    auto res = reader
+                 .list_subject_versions(
+                   pps::context_subject::unqualified("Gone"),
+                   pps::include_deleted::no,
+                   as)
+                 .get();
+    reader.stop().get();
+
+    ASSERT_FALSE(res.has_value());
+    EXPECT_EQ(res.error().kind, srs::source_error_kind::subject_not_found);
+}
+
 // A null config (not in API mode) or an unparseable URL yields an unavailable
 // reader, so the link parks rather than faulting.
 TEST(http_source_reader, factory_parks_on_missing_or_unparseable_config) {

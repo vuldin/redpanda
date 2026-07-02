@@ -498,14 +498,11 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         src = SchemaRegistryRedpandaClient(self.source_cluster_service)
         dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
 
-        # Version-level soft-delete: each subject keeps an active version so its
-        # versions stay enumerable. (A fully soft-deleted subject 404s its
-        # version listing over the SR API, so it cannot be replicated -- that is
-        # a separate limitation, not covered here.)
-        #  seeded-value: v1 active, v2 soft-deleted before the first sync.
-        #  after-value:  v1 + v2 active, then v2 soft-deleted after a completed
-        #    sync -- the delete must propagate onto the live destination version.
-        seeded, after = "seeded-value", "after-value"
+        # seeded-value: mixed active/deleted before the first sync.
+        # after-value: version-level delete after a sync.
+        # whole-value: subject-level delete after a sync (source's
+        #   active-only listing then 404s).
+        seeded, after, whole = "seeded-value", "after-value", "whole-value"
 
         def _v1(name: str) -> dict:
             return self._record(name, [{"name": "v", "type": "string"}])
@@ -527,14 +524,13 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         self._register(src, after, _v1("After"))
         self._register(src, after, _v2("After"))
 
+        self._register(src, whole, _v1("Whole"))
+
         self._create_sr_link()
 
-        # seeded-value's mixed active/deleted state and after-value's two active
-        # versions both converge on the destination.
-        subjects = [seeded, after]
+        subjects = [seeded, after, whole]
         self._wait_delete_synced(src, dest, subjects)
 
-        # delete-after-sync: soft-delete after-value v2 (v1 stays active) once it
-        # has already synced; the next full sync must propagate the delete.
         assert src.delete_subject_version(after, "2").status_code == 200
+        assert src.delete_subject(whole).status_code == 200
         self._wait_delete_synced(src, dest, subjects)

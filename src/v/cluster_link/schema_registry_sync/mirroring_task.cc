@@ -220,6 +220,11 @@ mirroring_task::list_versions_once(
         }
         co_return std::nullopt;
     }
+    // Not-found means no versions of this kind, not a fault -- how a fully
+    // soft-deleted subject's active-only listing reads.
+    if (res.error().kind == source_error_kind::subject_not_found) {
+        co_return chunked_vector<ppsr::schema_version>{};
+    }
     // Reachable but failed (rare delete race): count and skip. Counters are
     // touched only between co_awaits, so sharing them across the concurrent
     // fibers is safe on one reactor.
@@ -237,18 +242,17 @@ ss::future<> mirroring_task::list_one_subject(
     if (unavailable.has_value()) {
         co_return;
     }
-    // Two listings recover the per-version deleted state the bare source
-    // listing omits: `active` are the non-deleted versions; the remainder of
-    // `all` are soft-deleted. Short-circuit on the first failure so a failing
-    // subject counts at most one error.
-    auto active = co_await list_versions_once(
-      subject, ppsr::include_deleted::no, as, unavailable);
-    if (!active.has_value()) {
-        co_return;
-    }
+    // List all versions first: unlike the active-only listing, it succeeds
+    // for a fully soft-deleted subject. The two listings partition versions
+    // into active vs. soft-deleted.
     auto all = co_await list_versions_once(
       subject, ppsr::include_deleted::yes, as, unavailable);
     if (!all.has_value()) {
+        co_return;
+    }
+    auto active = co_await list_versions_once(
+      subject, ppsr::include_deleted::no, as, unavailable);
+    if (!active.has_value()) {
         co_return;
     }
     chunked_hash_set<ppsr::schema_version> active_set;

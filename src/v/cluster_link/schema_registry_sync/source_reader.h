@@ -35,6 +35,8 @@ enum class source_error_kind : uint8_t {
     /// The source Schema Registry is unreachable; the whole sync should back
     /// off.
     source_unavailable,
+    /// The subject does not exist in the source (HTTP 404).
+    subject_not_found,
 };
 
 struct source_error {

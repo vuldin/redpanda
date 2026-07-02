@@ -43,21 +43,38 @@ namespace {
 constexpr auto request_timeout = 30s;
 constexpr auto request_backoff = 100ms;
 
-// Map a rest_client failure onto a source_error. A still-reachable source (an
-// HTTP status response, a not-found, a parse failure) is a per-item
-// operation_failed; an unreachable source (a transport exception, an exhausted
-// retry budget, or shutdown) is source_unavailable, which parks the link.
+// Map a rest_client failure onto a source_error. A source that is unreachable
+// or rejecting every request is source_unavailable and parks the link; a 404 is
+// subject_not_found; any other terminal status is a per-item operation_failed.
 source_error to_source_error(rc::domain_error err) {
-    auto kind = source_error_kind::operation_failed;
-    if (
-      const auto* call = std::get_if<rc::http_call_error>(&err);
-      call != nullptr && std::holds_alternative<ss::sstring>(*call)) {
-        kind = source_error_kind::source_unavailable;
-    } else if (std::holds_alternative<rc::retries_exhausted>(err)) {
-        kind = source_error_kind::source_unavailable;
-    } else if (std::holds_alternative<rc::aborted_error>(err)) {
-        kind = source_error_kind::source_unavailable;
-    }
+    using enum boost::beast::http::status;
+    auto kind = ss::visit(
+      err,
+      [](const rc::http_call_error& call) {
+          return ss::visit(
+            call,
+            [](const rc::http_status_error& s) {
+                // Auth failures are link-wide and deterministic, so back off
+                // rather than re-fail every subject in turn.
+                return s.status == unauthorized || s.status == forbidden
+                         ? source_error_kind::source_unavailable
+                         : source_error_kind::operation_failed;
+            },
+            // A permanent exception with no HTTP response: source unreachable.
+            [](const ss::sstring&) {
+                return source_error_kind::source_unavailable;
+            });
+      },
+      [](const rc::retries_exhausted&) {
+          return source_error_kind::source_unavailable;
+      },
+      [](const rc::aborted_error&) {
+          return source_error_kind::source_unavailable;
+      },
+      [](const rc::subject_not_found&) {
+          return source_error_kind::subject_not_found;
+      },
+      [](const auto&) { return source_error_kind::operation_failed; });
     return source_error{.kind = kind, .message = fmt::format("{}", err)};
 }
 
