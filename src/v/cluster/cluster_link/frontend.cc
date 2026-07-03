@@ -347,9 +347,7 @@ bool filter_selects_source_context(
     if (filter.contexts.empty() && filter.subjects.empty()) {
         return true;
     }
-    if (
-      std::ranges::find(filter.contexts, source_context())
-      != filter.contexts.end()) {
+    if (std::ranges::contains(filter.contexts, source_context())) {
         return true;
     }
     return std::ranges::any_of(
@@ -408,6 +406,11 @@ bool link_disables_client_writes(
     // API-mode shadowing only blocks the contexts it mirrors, identified by
     // source_filter/destination.
     if (auto* api = md.configuration.schema_registry_sync_cfg.api_mode()) {
+        // A paused link relinquishes ownership of its contexts: replication
+        // has stopped, so client writes to them are allowed again.
+        if (!bool(api->is_enabled)) {
+            return false;
+        }
         return api_mode_shadows_context(*api, context);
     }
     return false;

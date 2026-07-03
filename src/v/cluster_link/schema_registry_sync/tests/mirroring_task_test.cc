@@ -499,6 +499,25 @@ TEST_F(
     EXPECT_EQ(all[0].deleted, ppsr::is_deleted::yes);
 }
 
+TEST_F(mirroring_task_test, pauses_when_config_paused) {
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+    ASSERT_TRUE(wait_for_task_state(model::task_state::active).get());
+
+    // Pausing the config disables the task. It still leads _schemas/0, so the
+    // reconciler pauses it (rather than stopping it, which is
+    // placement-driven).
+    auto paused = get_default_metadata();
+    paused.configuration.schema_registry_sync_cfg.api_mode()->is_enabled
+      = model::enabled_t::no;
+    fixture()->update_link(model::id_t{0}, std::move(paused)).get();
+    ASSERT_TRUE(wait_for_task_state(model::task_state::paused).get());
+
+    // Un-pausing re-enables the task; the reconciler brings it back to active.
+    fixture()->update_link(model::id_t{0}, get_default_metadata()).get();
+    ASSERT_TRUE(wait_for_task_state(model::task_state::active).get());
+}
+
 TEST_F(mirroring_task_test, follows_partition_leadership) {
     auto subject = ppsr::context_subject::unqualified("orders-value");
     _source_state.add(subject, 1);

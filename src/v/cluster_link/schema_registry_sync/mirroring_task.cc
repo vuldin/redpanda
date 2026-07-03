@@ -94,7 +94,8 @@ void mirroring_task::update_config(const model::metadata& link_metadata) {
 }
 
 model::enabled_t mirroring_task::is_enabled() const {
-    return model::enabled_t(_config.api_mode() != nullptr);
+    const auto* api = _config.api_mode();
+    return model::enabled_t(api != nullptr && bool(api->is_enabled));
 }
 
 bool mirroring_task::leads_schema_registry_partition() const {

@@ -617,7 +617,7 @@ struct schema_registry_sync_config
     struct shadow_schema_registry_api
       : serde::envelope<
           shadow_schema_registry_api,
-          serde::version<0>,
+          serde::version<1>,
           serde::compat_version<0>> {
         ss::sstring source_url;
         std::optional<auth_config_t> auth_config;
@@ -642,6 +642,12 @@ struct schema_registry_sync_config
         std::optional<destination_mapping_t> destination;
         unsupported_feature_policy feature_policy{
           unsupported_feature_policy::fail};
+
+        /// Whether the Schema Registry sync task is enabled. When disabled
+        /// (the user paused the task) it enters the 'paused' state, stops
+        /// replicating schemas, and the per-context client write protection on
+        /// the contexts this link owns is lifted.
+        enabled_t is_enabled{enabled_t::yes};
 
         ss::lowres_clock::duration get_tail_interval() const {
             return tail_interval.value_or(default_tail_interval);
@@ -674,7 +680,8 @@ struct schema_registry_sync_config
               max_source_requests_per_second,
               filter,
               destination,
-              feature_policy);
+              feature_policy,
+              is_enabled);
         }
 
         shadow_schema_registry_api copy() const;

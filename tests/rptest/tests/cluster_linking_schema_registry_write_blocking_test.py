@@ -7,6 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
+from rptest.clients.admin.proto.redpanda.core.admin.v2 import shadow_link_pb2
 from rptest.services.cluster import cluster
 from rptest.tests.cluster_linking_topic_syncing_test import (
     ClusterLinkingSchemaRegistryBase,
@@ -77,6 +78,96 @@ class ClusterLinkingSchemaRegistryWriteBlocking(ClusterLinkingSchemaRegistryBase
             timeout_sec=30,
             backoff_sec=1,
             err_msg=f"client write to context '{context}' never became blocked (412)",
+        )
+
+    def wait_for_context_write_allowed(
+        self,
+        sr_client: SchemaRegistryRedpandaClient,
+        context: str,
+        schema: str,
+    ):
+        """Poll client writes to `context` until one succeeds (HTTP 200).
+
+        The mirror image of wait_for_context_write_blocked: after a failover or
+        a manual pause, write protection is lifted asynchronously as the serving
+        node applies the new link metadata. A fresh subject per attempt avoids
+        the already-registered short-circuit."""
+        attempt = 0
+
+        def allowed() -> bool:
+            nonlocal attempt
+            attempt += 1
+            return (
+                self.post_schema_to_context(
+                    sr_client, context, f"unblock-{attempt}-value", schema
+                ).status_code
+                == 200
+            )
+
+        wait_until(
+            allowed,
+            timeout_sec=30,
+            backoff_sec=1,
+            err_msg=f"client write to context '{context}' never became allowed (200)",
+        )
+
+    def create_prod_api_link(self) -> shadow_link_pb2.ShadowLink:
+        """Create a link that shadows only the ".prod" context over the Schema
+        Registry API with identity context mapping, and return the updated
+        link. The owned ".prod" context becomes write-protected on the target."""
+        created_link = self.create_link("test-link")
+        api = created_link.configurations.schema_registry_sync_options.shadow_schema_registry_api
+        api.source_url = "http://schema-registry.example.com:8081"
+        api.source_filter.contexts.append(".prod")
+        api.destination.identity.SetInParent()
+        update_mask = google.protobuf.field_mask_pb2.FieldMask(
+            paths=["configurations.schema_registry_sync_options"]
+        )
+        updated_link = self.update_link(created_link, update_mask)
+        assert list(
+            updated_link.configurations.schema_registry_sync_options.shadow_schema_registry_api.source_filter.contexts
+        ) == [".prod"], "source_filter not applied after update"
+        return updated_link
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_manual_pause_toggles_blocking(self):
+        """
+        `paused` is user-settable via update_shadow_link, independent of
+        failover: setting it lifts the write protection on owned contexts, and
+        clearing it restores it.
+        """
+        target_sr_client = self.target_sr_client()
+        assert len(self.get_subjects(target_sr_client)) == 0, (
+            "Expected no subjects on the target before shadowing"
+        )
+
+        link = self.create_prod_api_link()
+        self.wait_for_context_write_blocked(
+            target_sr_client, ".prod", self.simple_proto_def
+        )
+
+        update_mask = google.protobuf.field_mask_pb2.FieldMask(
+            paths=["configurations.schema_registry_sync_options"]
+        )
+
+        # Pausing lifts the block on ".prod".
+        link.configurations.schema_registry_sync_options.shadow_schema_registry_api.paused = True
+        paused_link = self.update_link(link, update_mask)
+        assert paused_link.configurations.schema_registry_sync_options.shadow_schema_registry_api.paused, (
+            "paused not set after update"
+        )
+        self.wait_for_context_write_allowed(
+            target_sr_client, ".prod", self.simple_a_proto_def
+        )
+
+        # Un-pausing restores the block on ".prod".
+        paused_link.configurations.schema_registry_sync_options.shadow_schema_registry_api.paused = False
+        resumed_link = self.update_link(paused_link, update_mask)
+        assert not resumed_link.configurations.schema_registry_sync_options.shadow_schema_registry_api.paused, (
+            "paused not cleared after update"
+        )
+        self.wait_for_context_write_blocked(
+            target_sr_client, ".prod", self.simple_b_proto_def
         )
 
     @cluster(num_nodes=6)

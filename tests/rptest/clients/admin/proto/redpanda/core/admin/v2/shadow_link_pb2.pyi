@@ -891,6 +891,7 @@ class SchemaRegistrySyncOptions(google.protobuf.message.Message):
         SOURCE_FILTER_FIELD_NUMBER: builtins.int
         DESTINATION_FIELD_NUMBER: builtins.int
         UNSUPPORTED_SCHEMA_FEATURE_POLICY_FIELD_NUMBER: builtins.int
+        PAUSED_FIELD_NUMBER: builtins.int
         source_url: builtins.str
         'The source Schema Registry URL to use.'
         max_source_requests_per_second: builtins.int
@@ -899,6 +900,8 @@ class SchemaRegistrySyncOptions(google.protobuf.message.Message):
         'The effective maximum request rate, in requests per second.'
         unsupported_schema_feature_policy: Global___UnsupportedSchemaFeaturePolicy.ValueType
         'Policy for handling source schema features unsupported by the\n        destination, such as rulesets or metadata tags. If unset, FAIL is\n        used.\n        '
+        paused: builtins.bool
+        "Allows the user to pause the Schema Registry sync task. If paused,\n        the task enters the 'paused' state and stops replicating schemas from\n        the source, and the per-context client write protection on the\n        contexts this link owns is lifted.\n        "
 
         @property
         def auth_options(self) -> Global___SchemaRegistryAuthOptions:
@@ -946,13 +949,13 @@ class SchemaRegistrySyncOptions(google.protobuf.message.Message):
             collisions. If unset, source context names are preserved.
             """
 
-        def __init__(self, *, source_url: builtins.str=..., auth_options: Global___SchemaRegistryAuthOptions | None=..., tls_settings: proto.redpanda.core.common.v1.tls_pb2.TLSSettings | None=..., tail_interval: google.protobuf.duration_pb2.Duration | None=..., effective_tail_interval: google.protobuf.duration_pb2.Duration | None=..., full_sync_interval: google.protobuf.duration_pb2.Duration | None=..., effective_full_sync_interval: google.protobuf.duration_pb2.Duration | None=..., max_source_requests_per_second: builtins.int=..., effective_max_source_requests_per_second: builtins.int=..., source_filter: Global___SchemaRegistrySourceFilter | None=..., destination: Global___SchemaRegistryContextDestination | None=..., unsupported_schema_feature_policy: Global___UnsupportedSchemaFeaturePolicy.ValueType=...) -> None:
+        def __init__(self, *, source_url: builtins.str=..., auth_options: Global___SchemaRegistryAuthOptions | None=..., tls_settings: proto.redpanda.core.common.v1.tls_pb2.TLSSettings | None=..., tail_interval: google.protobuf.duration_pb2.Duration | None=..., effective_tail_interval: google.protobuf.duration_pb2.Duration | None=..., full_sync_interval: google.protobuf.duration_pb2.Duration | None=..., effective_full_sync_interval: google.protobuf.duration_pb2.Duration | None=..., max_source_requests_per_second: builtins.int=..., effective_max_source_requests_per_second: builtins.int=..., source_filter: Global___SchemaRegistrySourceFilter | None=..., destination: Global___SchemaRegistryContextDestination | None=..., unsupported_schema_feature_policy: Global___UnsupportedSchemaFeaturePolicy.ValueType=..., paused: builtins.bool=...) -> None:
             ...
 
         def HasField(self, field_name: typing.Literal['_tls_settings', b'_tls_settings', 'auth_options', b'auth_options', 'destination', b'destination', 'effective_full_sync_interval', b'effective_full_sync_interval', 'effective_tail_interval', b'effective_tail_interval', 'full_sync_interval', b'full_sync_interval', 'source_filter', b'source_filter', 'tail_interval', b'tail_interval', 'tls_settings', b'tls_settings']) -> builtins.bool:
             ...
 
-        def ClearField(self, field_name: typing.Literal['_tls_settings', b'_tls_settings', 'auth_options', b'auth_options', 'destination', b'destination', 'effective_full_sync_interval', b'effective_full_sync_interval', 'effective_max_source_requests_per_second', b'effective_max_source_requests_per_second', 'effective_tail_interval', b'effective_tail_interval', 'full_sync_interval', b'full_sync_interval', 'max_source_requests_per_second', b'max_source_requests_per_second', 'source_filter', b'source_filter', 'source_url', b'source_url', 'tail_interval', b'tail_interval', 'tls_settings', b'tls_settings', 'unsupported_schema_feature_policy', b'unsupported_schema_feature_policy']) -> None:
+        def ClearField(self, field_name: typing.Literal['_tls_settings', b'_tls_settings', 'auth_options', b'auth_options', 'destination', b'destination', 'effective_full_sync_interval', b'effective_full_sync_interval', 'effective_max_source_requests_per_second', b'effective_max_source_requests_per_second', 'effective_tail_interval', b'effective_tail_interval', 'full_sync_interval', b'full_sync_interval', 'max_source_requests_per_second', b'max_source_requests_per_second', 'paused', b'paused', 'source_filter', b'source_filter', 'source_url', b'source_url', 'tail_interval', b'tail_interval', 'tls_settings', b'tls_settings', 'unsupported_schema_feature_policy', b'unsupported_schema_feature_policy']) -> None:
             ...
 
         def WhichOneof(self, oneof_group: typing.Literal['_tls_settings', b'_tls_settings']) -> typing.Literal['tls_settings'] | None:
