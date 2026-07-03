@@ -28,6 +28,8 @@
 
 namespace kafka {
 
+class fetch_read_coalescer;
+
 std::optional<ss::scheduling_group>
 fetch_scheduling_group_provider(const connection_context&);
 
@@ -270,6 +272,7 @@ struct ntp_fetch_config {
     fetch_config cfg;
 
     const model::ktp& ktp() const { return _ktp; }
+    const model::ktp_with_hash& ktp_with_hash() const { return _ktp; }
 
     fmt::iterator format_to(fmt::iterator it) const {
         return fmt::format_to(it, R"({{"{}": {}}})", ktp(), cfg);
@@ -453,7 +456,8 @@ ss::future<read_result> read_from_ntp(
   fetch_config,
   std::optional<model::timeout_clock::time_point>,
   bool obligatory_batch_read,
-  fetch_memory_units_manager& units_mgr);
+  fetch_memory_units_manager& units_mgr,
+  fetch_read_coalescer& coalescer);
 
 /**
  * Create a fetch plan with the simple fetch planner.
