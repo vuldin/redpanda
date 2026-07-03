@@ -1618,7 +1618,7 @@ class Admin:
         url = "debug/reset_leaders"
         return self._request("post", url, node=node)
 
-    def get_leaders_info(self, node: MaybeNode = None) -> dict[str, Any]:
+    def get_leaders_info(self, node: MaybeNode = None) -> list[dict[str, Any]]:
         """
         Get info for leaders on node
         """
