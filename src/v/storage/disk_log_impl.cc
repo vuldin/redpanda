@@ -1773,6 +1773,10 @@ ss::future<> disk_log_impl::gc(gc_config cfg) {
 
 ss::future<std::optional<model::offset>> disk_log_impl::do_gc(gc_config cfg) {
     vassert(!_closed, "gc on closed log - {}", *this);
+    vassert(
+      !config().cloud_topic_enabled(),
+      "[{}] gc on cloud topic partition",
+      config().ntp());
 
     cfg = apply_overrides(cfg);
 
