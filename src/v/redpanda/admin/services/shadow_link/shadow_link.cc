@@ -74,8 +74,7 @@ shadow_link_service_impl::create_shadow_link(
     }
 
     if (validate_only) {
-        handle_error(
-          co_await _service->local().test_connection(md.name, md.connection));
+        handle_error(co_await _service->local().test_connection(std::move(md)));
         co_return proto::admin::create_shadow_link_response{};
     }
 

@@ -101,6 +101,10 @@ ss::future<> cluster_link_manager_test_fixture::wire_up_and_start(
           _fmtp = fmtp.get();
           return fmtp;
       }),
+      ss::sharded_parameter([this]() {
+          return sr_preflight_checker::make_default(
+            _fake_schema_registry, std::make_unique<fake_source_sr_prober>());
+      }),
       1s,
       _default_topic_replication.bind(),
       ss::default_scheduling_group());

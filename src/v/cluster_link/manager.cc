@@ -92,6 +92,7 @@ manager::manager(
   std::unique_ptr<partition_metadata_provider> partition_metadata_provider,
   std::unique_ptr<kafka_rpc_client_service> kafka_rpc_client_service,
   std::unique_ptr<members_table_provider> members_table_provider,
+  std::unique_ptr<sr_preflight_checker> sr_preflight,
   ss::lowres_clock::duration task_reconciler_interval,
   config::binding<int16_t> default_topic_replication,
   ss::scheduling_group scheduling_group)
@@ -108,6 +109,7 @@ manager::manager(
   , _partition_metadata_provider(std::move(partition_metadata_provider))
   , _kafka_rpc_client_service(std::move(kafka_rpc_client_service))
   , _members_table_provider(std::move(members_table_provider))
+  , _sr_preflight(std::move(sr_preflight))
   , _queue(
       scheduling_group,
       [](const std::exception_ptr& ex) {
@@ -351,14 +353,13 @@ ss::future<err_info> manager::link_preflight_checks(const model::metadata& md) {
             e.what())};
     }
     co_await stop_and_ignore();
-    co_return return_error;
+    if (return_error.code() != errc::success) {
+        co_return return_error;
+    }
+    co_return co_await _sr_preflight->check(md, _as);
 }
 
-ss::future<cl_result<void>>
-manager::test_connection(model::name_t name, model::connection_config config) {
-    model::metadata md;
-    md.name = std::move(name);
-    md.connection = std::move(config);
+ss::future<cl_result<void>> manager::test_connection(model::metadata md) {
     auto err = co_await link_preflight_checks(md);
     if (err.code() != errc::success) {
         co_return err;

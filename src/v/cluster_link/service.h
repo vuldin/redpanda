@@ -135,16 +135,18 @@ public:
     delete_cluster_link(model::name_t name, bool force_delete_link);
 
     /**
-     * @brief Tests connectivity and permissions to a source cluster without
+     * @brief Tests connectivity and permissions for a prospective link without
      * persisting any state. Used to implement the validate_only path of
      * CreateShadowLink.
      *
-     * @param name Link name used in log and error messages
-     * @param config Connection configuration to test
+     * Takes the full metadata (not just the connection config) so that
+     * replication-specific preflight checks, such as the Schema Registry API
+     * sync checks, can inspect the link configuration.
+     *
+     * @param md Prospective link metadata to validate
      * @return nothing on success or a preflight error
      */
-    ss::future<cl_result<void>>
-    test_connection(model::name_t name, model::connection_config config);
+    ss::future<cl_result<void>> test_connection(model::metadata md);
 
     /**
      * @brief Removes a shadow topic from a shadow link, removing all state but
