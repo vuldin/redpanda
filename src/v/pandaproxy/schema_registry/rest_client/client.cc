@@ -336,19 +336,27 @@ ss::future<std::expected<iobuf, domain_error>> client::perform_request(
 }
 
 ss::future<std::expected<chunked_vector<context_subject>, domain_error>>
-client::list_subjects(retry_chain_node& rtc, include_deleted deleted) {
+client::list_subjects(
+  retry_chain_node& rtc, include_deleted deleted, std::optional<context> ctx) {
     auto gate = maybe_gate();
     if (!gate.has_value()) {
         co_return std::unexpected(std::move(gate.error()));
     }
-    // TODO: offset/limit pagination, deletedOnly, and subjectPrefix filtering
-    // are unimplemented. Redpanda SR doesn't support deletedOnly/offset/limit;
-    // subjectPrefix is a deferred source-filtering optimization.
+    // TODO: offset/limit pagination and deletedOnly are unimplemented (Redpanda
+    // SR doesn't support them).
     auto request = http::request_builder{}
                      .method(boost::beast::http::verb::get)
                      .path("/subjects")
                      .header("accept", accept_json);
     add_deleted_param(request, deleted);
+    if (ctx.has_value()) {
+        // A source-filtering hint for servers that honor it: ":<ctx>:" is the
+        // context-qualified subject prefix that scopes to a single context
+        // (e.g. ":.dev:", or ":.:" for the default context). The result is also
+        // filtered client-side below, so it is correct against a server that
+        // ignores the hint (Redpanda's own server honors it).
+        request.query_param_kv("subjectPrefix", fmt::format(":{}:", (*ctx)()));
+    }
     maybe_add_basic_auth(request);
 
     auto response = co_await perform_request(rtc, std::move(request));
@@ -359,6 +367,17 @@ client::list_subjects(retry_chain_node& rtc, include_deleted deleted) {
       std::move(response.value()), _qualified);
     if (!parsed.has_value()) {
         co_return std::unexpected(domain_error{std::move(parsed.error())});
+    }
+    if (ctx.has_value()) {
+        // Keep only the requested context so the listing is correctly scoped
+        // even if the server ignored the subjectPrefix hint.
+        chunked_vector<context_subject> filtered;
+        for (auto& cs : parsed.value()) {
+            if (cs.ctx == *ctx) {
+                filtered.push_back(std::move(cs));
+            }
+        }
+        co_return std::move(filtered);
     }
     co_return std::move(parsed.value());
 }
