@@ -792,3 +792,47 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
             backoff_sec=1,
             err_msg="new leader did not count the post-bounce import",
         )
+
+        # Now bounce leadership back to the original broker (A -> B -> A). Its
+        # task instance ran before, was stopped on losing leadership, and is now
+        # reused -- not a fresh object. stop() clears the in-memory sync state,
+        # so the returning leader must look just as fresh as B did: a later
+        # start_time, zeroed cumulative counters, and an immediate full sync (a
+        # stale _last_full_sync would otherwise defer it up to the full-sync
+        # interval). Without the reset it would report its pre-B totals instead.
+        expected_subjects += 1  # post-bounce-value
+        expected_versions += 1
+        before_return_start = (
+            self._admin_sr_status().totals_since_task_start.start_time.ToNanoseconds()
+        )
+        admin.partition_transfer_leadership(
+            namespace="kafka", topic="_schemas", partition=0, target_id=leader
+        )
+        admin.await_stable_leader(
+            topic="_schemas",
+            partition=0,
+            namespace="kafka",
+            timeout_s=60,
+            check=lambda node_id: node_id == leader,
+        )
+
+        def returning_leader_fresh() -> bool:
+            sr = self._admin_sr_status()
+            totals = sr.totals_since_task_start
+            return (
+                sr.HasField("last_full_sync")
+                and totals.start_time.ToNanoseconds() > before_return_start
+                and totals.subject_versions_changed == 0
+                and totals.errors == 0
+                and sr.last_full_sync.subject_versions_changed == 0
+                and sr.last_full_sync.errors == 0
+                and sr.inventory.selected_source_subjects == expected_subjects
+                and sr.inventory.destination_subject_versions == expected_versions
+            )
+
+        wait_until(
+            returning_leader_fresh,
+            timeout_sec=90,
+            backoff_sec=1,
+            err_msg="reused instance did not reset state on regaining leadership",
+        )

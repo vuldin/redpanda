@@ -87,6 +87,14 @@ private:
     /// new source URL, auth, or TLS setting takes effect on the next run.
     ss::future<> reset_reader();
 
+    /// Clears the in-memory sync state (status counters, destination inventory,
+    /// last-full-sync timestamp) on losing leadership, so the next leader -- a
+    /// new instance or this same one regaining leadership -- re-derives
+    /// everything from the durable destination store instead of a prior
+    /// tenure's view. `_config`/`_config_changed` are preserved: config is
+    /// authoritative and a change queued while stopped must still take effect.
+    void reset_sync_state();
+
     /// Whether a periodic full scan is due (first run, or the full-sync
     /// interval has elapsed). A config change additionally forces one via
     /// `_config_changed`, consumed in `run_impl`.

@@ -97,8 +97,22 @@ void mirroring_task::update_config(const model::metadata& link_metadata) {
     _config_changed = true;
 }
 
+void mirroring_task::reset_sync_state() {
+    _status = model::schema_registry_sync_status{};
+    _destination_inventory = inventory{};
+    _reconcile_stats = reconcile_stats{};
+    _last_full_sync.reset();
+}
+
 ss::future<cl_result<void>> mirroring_task::stop() noexcept {
     auto res = co_await task::stop();
+    // task::stop() closed the runner's gate, so no run_impl is in flight and it
+    // is safe to reset the state directly (unlike update_config, which races a
+    // running fiber and defers via _config_changed). Reset so a later leader
+    // starts fresh: this instance may regain _schemas/0 leadership (A->B->A)
+    // and would otherwise report a prior tenure's stale counters/inventory and
+    // skip its first full sync on a still-recent _last_full_sync.
+    reset_sync_state();
     // The run loop has stopped, so no fiber is using the reader; release its
     // HTTP transport. as_future guards the noexcept contract.
     if (_reader) {
@@ -425,9 +439,10 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
 
 ss::future<task::state_transition>
 mirroring_task::run_impl(ss::abort_source& as) {
-    // Stamp the cumulative summary's start time once per task instance (the
-    // proto documents totals_since_task_start.start_time as the task start).
-    // A fresh instance after a leadership change re-stamps it on its first run.
+    // Stamp the cumulative summary's start time once per leadership acquisition
+    // (the proto documents totals_since_task_start.start_time as the task
+    // start). stop() clears the status on losing leadership, so the next leader
+    // -- a new instance or this same one regaining it -- re-stamps it here.
     if (!_status.totals_since_task_start.start_time.has_value()) {
         _status.totals_since_task_start.start_time = ::model::timestamp::now();
     }
