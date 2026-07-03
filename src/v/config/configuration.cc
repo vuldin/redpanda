@@ -5073,6 +5073,22 @@ configuration::configuration()
       "behind and writes are being throttled.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       5min)
+  , cloud_topics_metastore_rpc_timeout_ms(
+      *this,
+      "cloud_topics_metastore_rpc_timeout_ms",
+      "Timeout for a single L1 metastore RPC to the metastore partition "
+      "leader. Bounds one attempt; the overall operation may retry until "
+      "cloud_topics_metastore_retry_timeout_ms elapses.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      30s)
+  , cloud_topics_metastore_retry_timeout_ms(
+      *this,
+      "cloud_topics_metastore_retry_timeout_ms",
+      "Overall deadline for retrying an L1 metastore operation on transport "
+      "errors. To allow more than one attempt, keep this larger than "
+      "cloud_topics_metastore_rpc_timeout_ms.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      90s)
   , cloud_topics_metastore_block_cache_size(
       *this,
       "cloud_topics_metastore_block_cache_size",
