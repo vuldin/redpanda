@@ -245,7 +245,6 @@ class CloudStorageTimingStressTest(RedpandaTest, PartitionMovementMixin):
     target_runtime = 60  # seconds
     check_interval = 10  # seconds
     check_timeout = 10  # seconds
-    allow_runtime_overshoot_by = 2
 
     topic_spec = TopicSpec(
         name="test-topic",
@@ -291,6 +290,11 @@ class CloudStorageTimingStressTest(RedpandaTest, PartitionMovementMixin):
         self.rpk = RpkTool(self.redpanda)
         self.admin = Admin(self.redpanda)
         self.checks = []
+
+        # 2x overshoot is allowed for dedicated nodes, 10x for non-dedicated
+        # nodes as the test is sensitive to the performance of the underlying
+        # hardware.
+        self.allow_runtime_overshoot_by = 2 if self.redpanda.dedicated_nodes else 10
 
     def _create_producer(self, cleanup_policy: str = None) -> KgoVerifierProducer:
         bps = self.produce_byte_rate_per_ntp * self.topics[0].partition_count
