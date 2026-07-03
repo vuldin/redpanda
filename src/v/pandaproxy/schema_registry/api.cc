@@ -165,7 +165,7 @@ public:
             return writes_disabled_t{
               frontend.schema_registry_local_topic_writes_disabled()};
         }
-        __builtin_unreachable();
+        vunreachable("Unhandled write_source: {}", static_cast<int>(source));
     }
 
 private:

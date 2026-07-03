@@ -347,9 +347,7 @@ bool filter_selects_source_context(
     if (filter.contexts.empty() && filter.subjects.empty()) {
         return true;
     }
-    if (
-      std::ranges::find(filter.contexts, source_context())
-      != filter.contexts.end()) {
+    if (std::ranges::contains(filter.contexts, source_context())) {
         return true;
     }
     return std::ranges::any_of(
