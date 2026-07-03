@@ -73,6 +73,10 @@ public:
         bool(const pandaproxy::schema_registry::context_subject&)> filter,
       pandaproxy::schema_registry::include_deleted inc_del) const override;
 
+    ss::future<bool> has_subjects(
+      pandaproxy::schema_registry::context ctx,
+      pandaproxy::schema_registry::include_deleted inc_del) const override;
+
     ss::future<pandaproxy::schema_registry::context_schema_id> create_schema(
       pandaproxy::schema_registry::subject_schema unparsed) override;
 

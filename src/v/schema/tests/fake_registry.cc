@@ -119,6 +119,14 @@ schema::fake_registry::list_subject_versions(
     co_return out;
 }
 
+ss::future<bool> schema::fake_registry::has_subjects(
+  ppsr::context ctx, ppsr::include_deleted inc_del) const {
+    maybe_throw_injected_failure();
+    co_return std::ranges::any_of(_store.schemas, [&](const auto& s) {
+        return s.schema.sub().ctx == ctx && (inc_del || !s.deleted);
+    });
+}
+
 ss::future<ppsr::context_schema_id>
 schema::fake_registry::create_schema(ppsr::subject_schema unparsed) {
     maybe_throw_injected_failure();
