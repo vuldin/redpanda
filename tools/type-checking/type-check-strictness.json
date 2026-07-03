@@ -147,6 +147,7 @@
         "rptest/tests/fetch_after_deletion_test.py",
         "rptest/tests/fetch_fairness_test.py",
         "rptest/tests/fetch_long_poll_test.py",
+        "rptest/tests/fetch_read_coalescing_test.py",
         "rptest/tests/follower_fetching_test.py",
         "rptest/tests/host_metrics_test.py",
         "rptest/tests/idempotency_test.py",
