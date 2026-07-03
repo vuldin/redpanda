@@ -899,6 +899,14 @@ configuration::configuration()
       "Use a separate scheduler group for fetch processing.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       true)
+  , kafka_fetch_read_coalescing_enabled(
+      *this,
+      "kafka_fetch_read_coalescing_enabled",
+      "Coalesce concurrent fetches of the same partition offset into one read "
+      "and serialization shared across the requesting consumers, reducing "
+      "duplicate reads and fetch-response memory under high fanout.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      false)
   , use_produce_scheduler_group(
       *this,
       "use_produce_scheduler_group",
