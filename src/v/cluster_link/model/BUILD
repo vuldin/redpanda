@@ -1,6 +1,21 @@
 load("//bazel:build.bzl", "redpanda_cc_library")
 
 redpanda_cc_library(
+    name = "sr_context_mapping",
+    srcs = [
+        "sr_context_mapping.cc",
+    ],
+    hdrs = [
+        "sr_context_mapping.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":model",
+        "//src/v/pandaproxy/schema_registry:types",
+    ],
+)
+
+redpanda_cc_library(
     name = "model",
     srcs = [
         "filter_utils.cc",

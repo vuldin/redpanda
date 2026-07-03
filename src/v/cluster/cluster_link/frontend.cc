@@ -18,6 +18,7 @@
 #include "cluster/partition_leaders_table.h"
 #include "cluster/types.h"
 #include "cluster_link/model/filter_utils.h"
+#include "cluster_link/model/sr_context_mapping.h"
 #include "cluster_link/model/types.h"
 #include "config/configuration.h"
 #include "model/namespace.h"
@@ -339,32 +340,14 @@ bool link_shadows_schema_registry(const ::cluster_link::model::metadata& md) {
            || md.configuration.schema_registry_sync_cfg.api_mode() != nullptr;
 }
 
-bool filter_selects_source_context(
-  const ::cluster_link::model::schema_registry_sync_config::source_filter&
-    filter,
-  const ppsr::context& source_context) {
-    // An empty filter selects every source context.
-    if (filter.contexts.empty() && filter.subjects.empty()) {
-        return true;
-    }
-    if (std::ranges::contains(filter.contexts, source_context())) {
-        return true;
-    }
-    return std::ranges::any_of(
-      filter.subjects, [&source_context](const auto& subject) {
-          const auto parsed = ppsr::context_subject::from_string(
-            subject, ppsr::qualified_subjects_enabled::yes);
-          return parsed.ctx == source_context;
-      });
-}
-
 bool api_mode_shadows_context(
   const ::cluster_link::model::schema_registry_sync_config::
     shadow_schema_registry_api& api,
   const ppsr::context& dest_context) {
     // Identity mapping: the destination context name equals the source name.
     if (!api.destination) {
-        return filter_selects_source_context(api.filter, dest_context);
+        return ::cluster_link::model::filter_selects_source_context(
+          api.filter, dest_context);
     }
 
     return ss::visit(
@@ -374,7 +357,8 @@ bool api_mode_shadows_context(
           identity_context_mapping&) {
           // Identity mapping: the destination context name equals the source
           // name.
-          return filter_selects_source_context(api.filter, dest_context);
+          return ::cluster_link::model::filter_selects_source_context(
+            api.filter, dest_context);
       },
       [&api, &dest_context](
         const ::cluster_link::model::schema_registry_sync_config::
@@ -387,7 +371,7 @@ bool api_mode_shadows_context(
           for (const auto& [src_ctx, dst_ctx] : destination.mappings) {
               if (
                 dest_context == dst_ctx
-                && filter_selects_source_context(
+                && ::cluster_link::model::filter_selects_source_context(
                   api.filter, ppsr::context{src_ctx})) {
                   return true;
               }
