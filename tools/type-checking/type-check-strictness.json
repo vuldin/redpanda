@@ -200,6 +200,7 @@
         "rptest/tests/security_report_test.py",
         "rptest/tests/services_self_test.py",
         "rptest/tests/shadow_indexing_firewall_test.py",
+        "rptest/tests/shadow_link_sr_preflight_test.py",
         "rptest/tests/storage_failure_injection_test.py",
         "rptest/tests/strict_data_init_test.py",
         "rptest/tests/tiered_storage_enable_test.py",
