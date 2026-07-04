@@ -508,6 +508,7 @@ class DatalakeE2ETests(RedpandaTest):
                     {
                         "bootstrap.servers": self.redpanda.brokers(),
                         "schema.registry.url": self.redpanda.schema_reg().split(",")[0],
+                        "enable.idempotence": True,
                     },
                     default_value_schema=raw_schema,
                 )
@@ -721,6 +722,7 @@ class DatalakeE2ETests(RedpandaTest):
                 {
                     "bootstrap.servers": self.redpanda.brokers(),
                     "schema.registry.url": self.redpanda.schema_reg().split(",")[0],
+                    "enable.idempotence": True,
                 },
                 default_value_schema=avro.loads(schema_str),
             )
@@ -827,7 +829,12 @@ class DatalakeE2ETests(RedpandaTest):
             dl.create_iceberg_enabled_topic(
                 topic, iceberg_mode="headers:value_type=string"
             )
-            producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+            producer = Producer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "enable.idempotence": True,
+                }
+            )
             # One header with valid UTF-8, one with a leading invalid byte so
             # we verify sanitization fires end-to-end.
             producer.produce(
@@ -922,6 +929,7 @@ class DatalakeE2ETests(RedpandaTest):
                 {
                     "bootstrap.servers": self.redpanda.brokers(),
                     "schema.registry.url": sr_url,
+                    "enable.idempotence": True,
                 },
                 default_key_schema=avro.loads(key_schema_str),
                 default_value_schema=avro.loads(val_schema_str),
@@ -995,7 +1003,12 @@ class DatalakeE2ETests(RedpandaTest):
                 topic,
                 iceberg_mode="key:mode=string;value:mode=string",
             )
-            producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+            producer = Producer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "enable.idempotence": True,
+                }
+            )
             # Record with valid UTF-8 key and value.
             producer.produce(topic, key=b"hello-key", value=b"hello-val")
             # Record with invalid UTF-8 in key and value (bare continuation
@@ -1087,7 +1100,12 @@ class DatalakeE2ETests(RedpandaTest):
                 )
 
                 self.logger.info(f"Producing records for topic {test_case_topic_name}")
-                producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+                producer = Producer(
+                    {
+                        "bootstrap.servers": self.redpanda.brokers(),
+                        "enable.idempotence": True,
+                    }
+                )
                 for i in range(count):
                     t = time.time()
                     producer.produce(
@@ -1184,7 +1202,12 @@ class DatalakeE2ETests(RedpandaTest):
             )
 
             self.logger.info(f"Producing records for topic {self.topic_name}")
-            producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+            producer = Producer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "enable.idempotence": True,
+                }
+            )
             for _ in range(count):
                 t = time.time()
                 record = record_generator(t)
@@ -1267,7 +1290,12 @@ class DatalakeE2ETests(RedpandaTest):
                 )
 
                 self.logger.info(f"Producing records for topic {test_case_topic_name}")
-                producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+                producer = Producer(
+                    {
+                        "bootstrap.servers": self.redpanda.brokers(),
+                        "enable.idempotence": True,
+                    }
+                )
                 for i in range(count):
                     t = time.time()
                     producer.produce(
@@ -1392,7 +1420,12 @@ message_type {
         count = 100
 
         def produce_protos():
-            producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+            producer = Producer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "enable.idempotence": True,
+                }
+            )
             for i in range(count):
                 record = json.dumps(
                     {
@@ -1720,6 +1753,7 @@ message_type {
                 {
                     "bootstrap.servers": self.redpanda.brokers(),
                     "schema.registry.url": self.redpanda.schema_reg().split(",")[0],
+                    "enable.idempotence": True,
                 },
                 default_value_schema=schema,
             )
@@ -1864,7 +1898,12 @@ class DatalakeMultiBrokerE2ETest(RedpandaTest):
         Person = factory.GetPrototype(person_desc)
 
         def produce_protos():
-            producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+            producer = Producer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "enable.idempotence": True,
+                }
+            )
             for i in range(count):
                 record = json.dumps(
                     {
