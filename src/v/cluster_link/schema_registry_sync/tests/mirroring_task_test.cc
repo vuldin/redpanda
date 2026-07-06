@@ -853,6 +853,142 @@ TEST_F(mirroring_task_test, skips_global_context_mode_when_filtered_out) {
     EXPECT_EQ(status->last_full_sync->modes_changed, 0);
 }
 
+TEST_F(mirroring_task_test, replicates_context_level_mode_and_config) {
+    // A context-level override -- a whole context's default mode/config, keyed
+    // by the empty subject -- mirrors like a subject override, through the
+    // per-context targets of the mode/config pass. It is distinct from a
+    // subject in the context and from the registry-wide global (.__GLOBAL).
+    // Identity mapping, so the override stays under its own (.prod) context.
+    auto prod_ctx = ppsr::context_subject{
+      ppsr::context{".prod"}, ppsr::subject{""}};
+    _source_state.contexts.push_back(ppsr::context{".prod"});
+    _source_state.add(
+      ppsr::context_subject{
+        ppsr::context{".prod"}, ppsr::subject{"orders-value"}},
+      1);
+    _source_state.modes.emplace(prod_ctx, ppsr::mode::read_only);
+    _source_state.configs.emplace(prod_ctx, ppsr::compatibility_level::full);
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+
+    // Exactly one context-level mode + config change: the subject, the default
+    // context, and the global target carry no override, so their no-op deletes
+    // do not count.
+    EXPECT_EQ(status->last_full_sync->modes_changed, 1);
+    EXPECT_EQ(status->last_full_sync->compatibility_configs_changed, 1);
+    EXPECT_EQ(status->last_full_sync->errors, 0);
+
+    ASSERT_TRUE(_registry.modes().contains(prod_ctx));
+    EXPECT_EQ(_registry.modes().at(prod_ctx), ppsr::mode::read_only);
+    ASSERT_TRUE(_registry.configs().contains(prod_ctx));
+    EXPECT_EQ(
+      _registry.configs().at(prod_ctx), ppsr::compatibility_level::full);
+}
+
+TEST_F(mirroring_task_test, remaps_source_context_to_destination) {
+    // Collapse the source .prod context onto the destination default context.
+    // Mapping to the default target keeps the test independent of the
+    // qualified-subjects cluster config (a non-default destination would need
+    // it enabled). Filter to .prod so the mapping fully covers the scope.
+    auto prod_orders = ppsr::context_subject{
+      ppsr::context{".prod"}, ppsr::subject{"orders-value"}};
+    _source_state.contexts.push_back(ppsr::context{".prod"});
+    _source_state.add(prod_orders, 1);
+    _source_state.modes.emplace(prod_orders, ppsr::mode::read_only);
+    _source_state.configs.emplace(prod_orders, ppsr::compatibility_level::full);
+
+    auto metadata = get_default_metadata();
+    auto* api = metadata.configuration.schema_registry_sync_cfg.api_mode();
+    api->filter.contexts.push_back(".prod");
+    model::schema_registry_sync_config::exact_context_mapping mapping;
+    mapping.mappings.emplace(".prod", std::string{ppsr::default_context()});
+    api->destination = std::move(mapping);
+
+    lead_schema_registry();
+    fixture()->upsert_link(std::move(metadata)).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->last_full_sync->subject_versions_changed, 1);
+    EXPECT_EQ(status->last_full_sync->errors, 0);
+
+    // The schema lands in the destination's default context (remapped from
+    // .prod), not in .prod.
+    const auto& all = _registry.get_all();
+    ASSERT_EQ(all.size(), 1);
+    auto dest_orders = ppsr::context_subject::unqualified("orders-value");
+    EXPECT_EQ(all[0].schema.sub(), dest_orders);
+
+    // Mode and compatibility are written under the remapped (default) context.
+    ASSERT_TRUE(_registry.modes().contains(dest_orders));
+    EXPECT_EQ(_registry.modes().at(dest_orders), ppsr::mode::read_only);
+    ASSERT_TRUE(_registry.configs().contains(dest_orders));
+    EXPECT_EQ(
+      _registry.configs().at(dest_orders), ppsr::compatibility_level::full);
+
+    // The destination scan reverse-maps the default context back to .prod, so
+    // the mirrored subject is recognised as in-scope rather than hard-deleted.
+    EXPECT_EQ(status->inventory.destination_subjects, 1);
+    EXPECT_EQ(status->inventory.destination_subject_versions, 1);
+}
+
+TEST_F(mirroring_task_test, remaps_context_level_mode_and_config) {
+    // A context-level override on a source context is written under the
+    // REMAPPED destination context, not the source one -- the context-level
+    // counterpart of remaps_source_context_to_destination. Remaps .prod onto a
+    // distinct .staging context; both are non-default, which the on-by-default
+    // schema_registry_enable_qualified_subjects permits.
+    auto prod_ctx = ppsr::context_subject{
+      ppsr::context{".prod"}, ppsr::subject{""}};
+    auto prod_orders = ppsr::context_subject{
+      ppsr::context{".prod"}, ppsr::subject{"orders-value"}};
+    _source_state.contexts.push_back(ppsr::context{".prod"});
+    _source_state.add(prod_orders, 1);
+    _source_state.modes.emplace(prod_ctx, ppsr::mode::read_only);
+    _source_state.configs.emplace(prod_ctx, ppsr::compatibility_level::full);
+
+    auto metadata = get_default_metadata();
+    auto* api = metadata.configuration.schema_registry_sync_cfg.api_mode();
+    api->filter.contexts.push_back(".prod");
+    model::schema_registry_sync_config::exact_context_mapping mapping;
+    mapping.mappings.emplace(".prod", ".staging");
+    api->destination = std::move(mapping);
+
+    lead_schema_registry();
+    fixture()->upsert_link(std::move(metadata)).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->last_full_sync->modes_changed, 1);
+    EXPECT_EQ(status->last_full_sync->compatibility_configs_changed, 1);
+    EXPECT_EQ(status->last_full_sync->errors, 0);
+
+    // The override lands on the remapped .staging context, keyed by the empty
+    // subject; nothing is written under the source .prod context.
+    auto dest_ctx = ppsr::context_subject{
+      ppsr::context{".staging"}, ppsr::subject{""}};
+    ASSERT_TRUE(_registry.modes().contains(dest_ctx));
+    EXPECT_EQ(_registry.modes().at(dest_ctx), ppsr::mode::read_only);
+    ASSERT_TRUE(_registry.configs().contains(dest_ctx));
+    EXPECT_EQ(
+      _registry.configs().at(dest_ctx), ppsr::compatibility_level::full);
+    EXPECT_FALSE(_registry.modes().contains(prod_ctx));
+    EXPECT_FALSE(_registry.configs().contains(prod_ctx));
+}
+
 TEST_F(mirroring_task_test, pauses_when_config_paused) {
     lead_schema_registry();
     fixture()->upsert_link(get_default_metadata()).get();
@@ -910,9 +1046,11 @@ TEST_F(mirroring_task_test, destination_inventory_spans_contexts_and_deleted) {
     _registry.import_schema(make_schema(c, 1, R"({"v":1})")).get();
 
     ss::abort_source as;
+    srs::context_mapper identity;
     auto inv = srs::scan_destination_inventory(
                  _registry,
                  [](const ppsr::context_subject&) { return true; },
+                 identity,
                  as)
                  .get();
 

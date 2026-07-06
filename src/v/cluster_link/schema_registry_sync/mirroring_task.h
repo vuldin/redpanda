@@ -33,11 +33,18 @@ struct inventory {
 
 /// Scans the destination registry for every in-scope (subject, version) node.
 /// A single include_deleted scan reports each version's soft-delete state, so
-/// `active` is the non-deleted subset of `all` from one snapshot. `in_scope`
-/// must be pure; it runs on each registry shard.
+/// `active` is the non-deleted subset of `all` from one snapshot.
+///
+/// `in_scope` is a source-namespace predicate; the destination is scanned in
+/// the destination namespace, so the scan reverse-maps each destination context
+/// to its source context via `mapper` before applying `in_scope` and returns
+/// nodes in the source namespace, keeping the whole diff single-namespaced.
+/// Under the identity mapper this is a passthrough. `in_scope` must be pure; it
+/// runs on each registry shard.
 ss::future<inventory> scan_destination_inventory(
   schema::registry& destination,
   ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope,
+  const context_mapper& mapper,
   ss::abort_source& as);
 
 /// Shadows a source Schema Registry into the local (destination) Schema
@@ -194,6 +201,10 @@ private:
     [[nodiscard]] state_transition make_faulted(const ss::sstring& reason);
 
     model::schema_registry_sync_config _config;
+    // Source->destination context remapping for the current run, rebuilt from
+    // _config at the start of each full sync. Applied only at the destination
+    // boundary; identity when no remapping is configured.
+    context_mapper _mapper;
     schema::registry* _destination;
     source_reader_factory* _source_factory;
     std::unique_ptr<source_reader> _reader;

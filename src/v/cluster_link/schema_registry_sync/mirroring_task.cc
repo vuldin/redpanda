@@ -69,17 +69,34 @@ bool is_reference_blocked(const std::exception_ptr& ep) {
 ss::future<inventory> scan_destination_inventory(
   schema::registry& destination,
   ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope,
+  const context_mapper& mapper,
   ss::abort_source& as) {
     as.check();
+    // A destination node is in scope iff its context reverse-maps to a source
+    // context `in_scope` accepts (identity mapper: reduces to `in_scope`).
+    // Captured by reference like the underlying filter; both outlive the scan.
+    auto dest_in_scope = [&in_scope,
+                          &mapper](const ppsr::context_subject& dest_cs) {
+        auto src_ctx = mapper.reverse(dest_cs.ctx);
+        return src_ctx.has_value()
+               && in_scope(ppsr::context_subject{*src_ctx, dest_cs.sub});
+    };
     // list_subject_versions reads the store as-is; sync first so the scan
     // isn't stale (e.g. on a freshly-elected _schemas/0 leader).
     co_await destination.sync();
     auto versions = co_await destination.list_subject_versions(
-      std::move(in_scope), ppsr::include_deleted::yes);
+      std::move(dest_in_scope), ppsr::include_deleted::yes);
     inventory inv;
     inv.all.reserve(versions.size());
     for (const auto& sv : versions) {
-        auto node = ppsr::subject_version{sv.sub, sv.version};
+        // Back to the source namespace, so the diff/seed/purge phases speak
+        // one.
+        auto src_ctx = mapper.reverse(sv.sub.ctx);
+        if (!src_ctx.has_value()) {
+            continue;
+        }
+        auto node = ppsr::subject_version{
+          ppsr::context_subject{*src_ctx, sv.sub.sub}, sv.version};
         if (sv.deleted == ppsr::is_deleted::no) {
             inv.active.insert(node);
         }
@@ -116,6 +133,7 @@ void mirroring_task::reset_sync_state() {
     _status = model::schema_registry_sync_status{};
     _destination_inventory = inventory{};
     _reconcile_stats = reconcile_stats{};
+    _mapper = context_mapper{};
     _last_full_sync.reset();
 }
 
@@ -215,6 +233,7 @@ ss::future<> mirroring_task::refresh_destination_inventory(
     _destination_inventory = co_await scan_destination_inventory(
       *_destination,
       [&in_scope](const ppsr::context_subject& cs) { return in_scope(cs); },
+      _mapper,
       as);
 
     chunked_hash_set<ppsr::context_subject> subjects;
@@ -243,8 +262,21 @@ ss::future<> mirroring_task::purge_one(
   uint64_t& purged,
   chunked_vector<purge_target>& next_round) {
     as.check();
-    auto fut = co_await ss::coroutine::as_future(hard_delete_target(
-      target.node.sub, target.node.version, target.was_active));
+    // `node` is source-namespace; forward-map to the destination for the
+    // delete.
+    auto dest_ctx = _mapper.forward(target.node.sub.ctx);
+    if (!dest_ctx.has_value()) {
+        record_error(
+          fmt::format(
+            "cannot hard-delete {}/{}: source context has no destination "
+            "mapping",
+            target.node.sub,
+            target.node.version));
+        co_return;
+    }
+    const auto dest_sub = ppsr::context_subject{*dest_ctx, target.node.sub.sub};
+    auto fut = co_await ss::coroutine::as_future(
+      hard_delete_target(dest_sub, target.node.version, target.was_active));
     if (fut.failed()) {
         auto ex = fut.get_exception();
         if (ssx::is_shutdown_exception(ex)) {
@@ -309,6 +341,18 @@ ss::future<> mirroring_task::sync_mode_and_config(
     if (unavailable.has_value()) {
         co_return;
     }
+    // Read the source in its own (source) namespace; write to the destination
+    // under the remapped context. Identity leaves dest_target == target.
+    auto dest_ctx = _mapper.forward(target.ctx);
+    if (!dest_ctx.has_value()) {
+        record_error(
+          fmt::format(
+            "cannot sync mode/config for {}: source context has no destination "
+            "mapping",
+            target));
+        co_return;
+    }
+    const auto dest_target = ppsr::context_subject{*dest_ctx, target.sub};
     auto mode = co_await _reader->read_mode(target, as);
     if (!mode.has_value()) {
         if (mode.error().kind == source_error_kind::source_unavailable) {
@@ -324,15 +368,15 @@ ss::future<> mirroring_task::sync_mode_and_config(
         // override
         auto write = co_await ss::coroutine::as_future(
           mode.value().has_value()
-            ? _destination->write_mode(target, *mode.value())
-            : _destination->delete_mode(target));
+            ? _destination->write_mode(dest_target, *mode.value())
+            : _destination->delete_mode(dest_target));
         if (write.failed()) {
             auto ex = write.get_exception();
             if (ssx::is_shutdown_exception(ex)) {
                 std::rethrow_exception(ex);
             }
             record_error(
-              fmt::format("failed to sync mode for {}: {}", target, ex));
+              fmt::format("failed to sync mode for {}: {}", dest_target, ex));
         } else if (write.get()) {
             ++_status.current_sync->summary.modes_changed;
             ++_status.totals_since_task_start.modes_changed;
@@ -356,15 +400,15 @@ ss::future<> mirroring_task::sync_mode_and_config(
 
     auto write = co_await ss::coroutine::as_future(
       config.value().has_value()
-        ? _destination->write_config(target, *config.value())
-        : _destination->delete_config(target));
+        ? _destination->write_config(dest_target, *config.value())
+        : _destination->delete_config(dest_target));
     if (write.failed()) {
         auto ex = write.get_exception();
         if (ssx::is_shutdown_exception(ex)) {
             std::rethrow_exception(ex);
         }
         record_error(
-          fmt::format("failed to sync config for {}: {}", target, ex));
+          fmt::format("failed to sync config for {}: {}", dest_target, ex));
         co_return;
     }
     if (write.get()) {
@@ -574,10 +618,12 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
     }
 
     // The reconciler sinks the predicate by value; forward the borrowed one.
+    // The mapper remaps contexts at the import boundary only.
     auto rec = reconciler{
       _reader.get(),
       _destination,
       [&in_scope](const ppsr::context_subject& cs) { return in_scope(cs); },
+      _mapper,
       limits};
 
     // The reconciler increments _reconcile_stats live (reflected mid-sync by
@@ -775,6 +821,11 @@ mirroring_task::run_impl(ss::abort_source& as) {
     // wrapper.
     auto in_scope = make_in_scope(
       std::move(filter_contexts), std::move(filter_subjects));
+
+    // Rebuild once per run from the validated config; held on the task so every
+    // phase shares one mapping without re-reading _config (which a concurrent
+    // update_config could swap mid-run).
+    _mapper = context_mapper::make(_config);
 
     co_await refresh_destination_inventory(in_scope, as);
     co_return co_await full_source_sync(as, contexts, in_scope);

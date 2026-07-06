@@ -381,10 +381,12 @@ TEST(reconciler, import_errors_are_per_item_and_cascade) {
     fake_source_reader reader{&source};
     srs::reconciler::limits lim{
       .memory_bytes = no_memory_limit, .parallelism = 1};
+    srs::context_mapper mapper;
     auto r = srs::reconciler{
       &reader,
       &destination,
       [](const ppsr::context_subject&) { return true; },
+      mapper,
       lim};
 
     ss::abort_source as;
@@ -466,10 +468,12 @@ TEST(reconciler, abort_mid_sync_drains_cleanly) {
 
     srs::reconciler::limits lim{
       .memory_bytes = no_memory_limit, .parallelism = 4};
+    srs::context_mapper mapper;
     auto r = srs::reconciler{
       &reader,
       &destination,
       [](const ppsr::context_subject&) { return true; },
+      mapper,
       lim};
 
     srs::work_set work;
@@ -519,10 +523,12 @@ TEST(reconciler, reports_progress_live) {
     // the next begins.
     srs::reconciler::limits lim{
       .memory_bytes = no_memory_limit, .parallelism = 1};
+    srs::context_mapper mapper;
     auto r = srs::reconciler{
       &reader,
       &destination,
       [](const ppsr::context_subject&) { return true; },
+      mapper,
       lim};
 
     srs::work_set work;
@@ -674,6 +680,94 @@ TEST(reconciler, concurrent_stress) {
         EXPECT_LT(i_ref, i_rer)
           << fmt::format("{} must precede {}", referent.sub(), referrer.sub());
     }
+}
+
+TEST(reconciler, remaps_context_at_import) {
+    fake_source_state source;
+    source.contexts.push_back(ppsr::context{".prod"});
+    auto base = ppsr::context_subject{
+      ppsr::context{".prod"}, ppsr::subject{"base"}};
+    auto leaf = ppsr::context_subject{
+      ppsr::context{".prod"}, ppsr::subject{"leaf"}};
+    auto orders = ppsr::context_subject{
+      ppsr::context{".prod"}, ppsr::subject{"orders"}};
+    source.add(base, 1);
+    source.add(leaf, 1);
+    // orders references base with a context-qualified reference, and leaf with
+    // an unqualified one (which resolves against orders' own .prod context).
+    source.add_with_refs(
+      orders,
+      1,
+      refs_to(
+        {ref_to(base, 1),
+         ref_to(ppsr::context_subject::unqualified("leaf"), 1)}));
+
+    fake_source_reader reader{&source};
+    schema::fake_registry destination;
+
+    // Map source .prod onto destination .dest.
+    model::schema_registry_sync_config config;
+    model::schema_registry_sync_config::shadow_schema_registry_api api;
+    model::schema_registry_sync_config::exact_context_mapping mapping;
+    mapping.mappings.emplace(".prod", ".dest");
+    api.destination = std::move(mapping);
+    config.sync_mode = std::move(api);
+    auto mapper = srs::context_mapper::make(config);
+
+    srs::reconciler::limits lim{
+      .memory_bytes = no_memory_limit, .parallelism = 1};
+    auto r = srs::reconciler{
+      &reader,
+      &destination,
+      [](const ppsr::context_subject&) { return true; },
+      mapper,
+      lim};
+
+    srs::work_set work;
+    work.upserts.push_back(key(base, 1));
+    work.upserts.push_back(key(leaf, 1));
+    work.upserts.push_back(key(orders, 1));
+    ss::abort_source as;
+    srs::reconcile_stats stats;
+    auto res = r.reconcile(std::move(work), {}, stats, as).get();
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(stats.versions_changed, 3);
+
+    // Every schema lands in the destination .dest context (subject remapped)...
+    const auto& all = destination.get_all();
+    ASSERT_EQ(all.size(), 3u);
+    for (const auto& s : all) {
+        EXPECT_EQ(s.schema.sub().ctx, ppsr::context{".dest"});
+    }
+    const ppsr::stored_schema* orders_stored = nullptr;
+    for (const auto& s : all) {
+        if (s.schema.sub().sub == ppsr::subject{"orders"}) {
+            orders_stored = &s;
+        }
+    }
+    ASSERT_NE(orders_stored, nullptr);
+    const auto& refs = orders_stored->schema.def().refs();
+    ASSERT_EQ(refs.size(), 2u);
+    auto ref_named =
+      [&](std::string_view name) -> const ppsr::schema_reference* {
+        for (const auto& r : refs) {
+            if (r.name == name) {
+                return &r;
+            }
+        }
+        return nullptr;
+    };
+    // ...the qualified reference's own context is remapped to .dest...
+    const auto* base_ref = ref_named("base");
+    ASSERT_NE(base_ref, nullptr);
+    EXPECT_EQ(base_ref->sub.qualified, ppsr::is_qualified::yes);
+    EXPECT_EQ(base_ref->sub.sub.ctx, ppsr::context{".dest"});
+    // ...and the unqualified reference is left as-is (it resolves against the
+    // remapped parent on the destination, so it needs no rewrite).
+    const auto* leaf_ref = ref_named("leaf");
+    ASSERT_NE(leaf_ref, nullptr);
+    EXPECT_EQ(leaf_ref->sub.qualified, ppsr::is_qualified::no);
+    EXPECT_EQ(leaf_ref->sub.sub.ctx, ppsr::default_context);
 }
 
 } // namespace cluster_link::tests

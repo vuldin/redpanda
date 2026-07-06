@@ -327,10 +327,15 @@ struct reconcile_harness {
     // assertions.
     srs::reconciler::limits lim{.memory_bytes = 1u << 20, .parallelism = 1};
 
+    // Identity mapping by default: source and destination contexts coincide, so
+    // reconcile tests need no remapping.
+    srs::context_mapper mapper;
+
     srs::reconciler make(
       ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope =
         [](const ppsr::context_subject&) { return true; }) {
-        return srs::reconciler{&reader, &destination, std::move(in_scope), lim};
+        return srs::reconciler{
+          &reader, &destination, std::move(in_scope), mapper, lim};
     }
 
     ss::future<srs::source_result<srs::reconcile_stats>>

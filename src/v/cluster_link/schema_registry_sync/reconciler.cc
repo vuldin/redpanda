@@ -59,6 +59,40 @@ size_t body_size(const ppsr::stored_schema& s) {
     return s.schema.def().raw()().size_bytes();
 }
 
+// Rewrites a schema's contexts source->destination for import: the subject's
+// context and each context-qualified reference's context. An unqualified
+// reference is left alone -- it resolves against the referrer's remapped parent
+// on the destination. Body, type, and metadata are unchanged. nullopt if a
+// context has no destination mapping.
+std::optional<ppsr::stored_schema>
+remap_for_import(const context_mapper& mapper, ppsr::stored_schema s) {
+    if (mapper.is_identity()) {
+        return s;
+    }
+    auto [sub, def] = std::move(s.schema).destructure();
+    auto mapped_ctx = mapper.forward(sub.ctx);
+    if (!mapped_ctx.has_value()) {
+        return std::nullopt;
+    }
+    sub.ctx = *mapped_ctx;
+    auto [raw, type, refs, meta] = std::move(def).destructure();
+    for (auto& ref : refs) {
+        if (ref.sub.qualified == ppsr::is_qualified::yes) {
+            auto mapped_ref_ctx = mapper.forward(ref.sub.sub.ctx);
+            if (!mapped_ref_ctx.has_value()) {
+                return std::nullopt;
+            }
+            ref.sub.sub.ctx = *mapped_ref_ctx;
+        }
+    }
+    return ppsr::stored_schema{
+      .schema = ppsr::
+        subject_schema{std::move(sub), ppsr::schema_definition{std::move(raw), type, std::move(refs), std::move(meta)}},
+      .version = s.version,
+      .id = s.id,
+      .deleted = s.deleted};
+}
+
 void adjust_units(
   ssx::semaphore& sem, ssx::semaphore_units& units, size_t new_size) {
     auto reserved = units.count();
@@ -75,10 +109,12 @@ reconciler::reconciler(
   source_reader* source,
   schema::registry* destination,
   ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope,
+  const context_mapper& mapper,
   limits lim)
   : _source(source)
   , _destination(destination)
   , _in_scope(std::move(in_scope))
+  , _mapper(&mapper)
   , _limits(lim)
   , _mem(std::max<size_t>(1, lim.memory_bytes), "schema_registry_sync/memory") {
     // Floor the budget so the clamp `min(body_size, memory_bytes)` and the
@@ -342,8 +378,20 @@ reconciler::do_import(const ppsr::subject_version& n, ss::abort_source& as) {
 ss::future<bool> reconciler::import_body(
   const ppsr::subject_version& n, ppsr::stored_schema schema) {
     data(n).state = node_state::importing;
+    // The graph key `n` stays in the source namespace; only the schema written
+    // to the destination is remapped.
+    auto remapped = remap_for_import(*_mapper, std::move(schema));
+    if (!remapped.has_value()) {
+        vlog(
+          cllog.warn,
+          "Cannot replicate {}/{}: a context has no destination mapping",
+          n.sub,
+          n.version);
+        fail(n);
+        co_return false;
+    }
     auto fut = co_await ss::coroutine::as_future(
-      _destination->import_schema(std::move(schema)));
+      _destination->import_schema(std::move(*remapped)));
     if (fut.failed()) {
         auto eptr = fut.get_exception();
         if (ssx::is_shutdown_exception(eptr)) {
