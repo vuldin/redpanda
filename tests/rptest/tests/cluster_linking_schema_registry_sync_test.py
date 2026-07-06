@@ -192,6 +192,8 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         source_url: str | None = None,
         full_sync_interval_sec: int = 2,
         source_filter_subjects: list[str] | None = None,
+        source_filter_contexts: list[str] | None = None,
+        exact_context_map: dict[str, str] | None = None,
     ) -> str:
         # Create a shadow link that syncs only the Schema Registry, in API mode,
         # pointing at the source cluster's SR endpoint (or an explicit URL, e.g.
@@ -215,6 +217,13 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         )
         if source_filter_subjects is not None:
             api.source_filter.subjects.extend(source_filter_subjects)
+        if source_filter_contexts is not None:
+            api.source_filter.contexts.extend(source_filter_contexts)
+        if exact_context_map is not None:
+            for source, destination in exact_context_map.items():
+                api.destination.exact.mappings.add(
+                    source=source, destination=destination
+                )
         req.shadow_link.configurations.schema_registry_sync_options.shadow_schema_registry_api.CopyFrom(
             api
         )
@@ -312,10 +321,12 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
 
     # --- status-counter checks ---------------------------------------------
 
-    # Counters the create-only reconcile does not yet populate: the admin API /
-    # rpk map them through, but they stay zero until compatibility, mode, and
-    # unsupported-feature handling are implemented.
-    UNPOPULATED_COUNTERS = (
+    # Counters expected to stay zero in the override-free DAG tests: those DAGs
+    # register no mode or compatibility overrides, so mode/config replication is
+    # a no-op, and unsupported-feature handling is unimplemented. A test that
+    # sets overrides (test_schema_registry_api_sync_compatibility) asserts the
+    # compatibility counter advances.
+    EXPECTED_ZERO_COUNTERS = (
         "compatibility_configs_changed",
         "modes_changed",
         "unsupported_features_removed",
@@ -393,7 +404,7 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         assert totals.HasField("start_time"), totals
         assert totals.start_time.seconds > 0, totals
         assert not totals.HasField("finish_time"), totals
-        for name in self.UNPOPULATED_COUNTERS:
+        for name in self.EXPECTED_ZERO_COUNTERS:
             assert getattr(totals, name) == 0, (
                 f"unexpected {name}={getattr(totals, name)}"
             )
@@ -435,7 +446,7 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         assert inv["destination_subject_versions"] == expected_versions, status
         assert totals["subject_versions_changed"] == expected_versions, status
         assert totals["errors"] == 0, status
-        for name in self.UNPOPULATED_COUNTERS:
+        for name in self.EXPECTED_ZERO_COUNTERS:
             assert totals[name] == 0, status
 
     @cluster(num_nodes=6)
@@ -556,6 +567,82 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         assert src.delete_subject_version(after, "2").status_code == 200
         assert src.delete_subject(whole).status_code == 200
         self._wait_delete_synced(src, dest, subjects)
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_compatibility(self):
+        # A subject-level compatibility override round-tripping through the
+        # destination's write API -- a path the reconciler unit fakes cannot
+        # cover -- then un-setting it so the destination reverts to the
+        # inherited default. Mode replication is covered e2e by
+        # test_schema_registry_api_sync_context_remap.
+        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+
+        keep = "keep-value"
+        schema = self._record("V", [{"name": "v", "type": "string"}])
+        self._register(src, keep, schema)
+        # A subject-level compatibility override on the source, to be mirrored.
+        assert (
+            src.set_config_subject(
+                keep, data=json.dumps({"compatibility": "FULL"})
+            ).status_code
+            == 200
+        )
+
+        self._create_sr_link()
+        self._wait_synced(src, dest, [(keep, 1)])
+
+        # The compatibility override replicates to the destination and moves the
+        # compatibility_configs_changed counter.
+        def config_synced() -> bool:
+            c = dest.get_config_subject(keep)
+            return c.status_code == 200 and c.json().get("compatibilityLevel") == "FULL"
+
+        wait_until(
+            config_synced,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="compatibility config did not replicate to the destination",
+        )
+        wait_until(
+            lambda: self._admin_sr_status().totals_since_task_start.compatibility_configs_changed
+            >= 1,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="compatibility_configs_changed counter did not advance",
+        )
+
+        # Un-setting the source override propagates as a delete, reverting the
+        # destination subject to the inherited (global) default rather than
+        # leaving the stale FULL override behind.
+        before = self._admin_sr_status().totals_since_task_start.compatibility_configs_changed
+        assert src.delete_config_subject(keep).status_code == 200
+
+        def config_delete_synced() -> bool:
+            # With no subject-level override remaining, a non-fallback GET on the
+            # destination reports it missing (40401); a fallback GET now yields
+            # the global default rather than the removed FULL override.
+            missing = dest.get_config_subject(keep).status_code == 404
+            fallback = dest.get_config_subject(keep, fallback=True)
+            reverted = (
+                fallback.status_code == 200
+                and fallback.json().get("compatibilityLevel") != "FULL"
+            )
+            return missing and reverted
+
+        wait_until(
+            config_delete_synced,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="config override deletion did not replicate to the destination",
+        )
+        wait_until(
+            lambda: self._admin_sr_status().totals_since_task_start.compatibility_configs_changed
+            > before,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="compatibility_configs_changed counter did not advance for the delete",
+        )
 
     @cluster(num_nodes=6)
     def test_schema_registry_api_sync_out_of_scope_reference(self):
