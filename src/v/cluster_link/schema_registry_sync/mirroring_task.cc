@@ -22,6 +22,7 @@
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/coroutine/as_future.hh>
 #include <seastar/util/defer.hh>
 
 #include <utility>
@@ -55,6 +56,9 @@ ss::future<inventory> scan_destination_inventory(
   ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope,
   ss::abort_source& as) {
     as.check();
+    // list_subject_versions reads the store as-is; sync first so the scan
+    // isn't stale (e.g. on a freshly-elected _schemas/0 leader).
+    co_await destination.sync();
     auto versions = co_await destination.list_subject_versions(
       std::move(in_scope), ppsr::include_deleted::yes);
     inventory inv;
@@ -81,7 +85,7 @@ mirroring_task::mirroring_task(
   , _config(link_metadata.configuration.schema_registry_sync_cfg.copy())
   , _destination(destination)
   , _source_factory(source_factory)
-  , _reader(_source_factory->create()) {}
+  , _reader(_source_factory->create(_config.api_mode())) {}
 
 void mirroring_task::update_config(const model::metadata& link_metadata) {
     _config = link_metadata.configuration.schema_registry_sync_cfg.copy();
@@ -91,6 +95,51 @@ void mirroring_task::update_config(const model::metadata& link_metadata) {
     // _status/_last_full_sync would race an in-flight run_impl that resumes and
     // overwrites it.
     _config_changed = true;
+}
+
+void mirroring_task::reset_sync_state() {
+    _status = model::schema_registry_sync_status{};
+    _destination_inventory = inventory{};
+    _reconcile_stats = reconcile_stats{};
+    _last_full_sync.reset();
+}
+
+ss::future<cl_result<void>> mirroring_task::stop() noexcept {
+    auto res = co_await task::stop();
+    // task::stop() closed the runner's gate, so no run_impl is in flight and it
+    // is safe to reset the state directly (unlike update_config, which races a
+    // running fiber and defers via _config_changed). Reset so a later leader
+    // starts fresh: this instance may regain _schemas/0 leadership (A->B->A)
+    // and would otherwise report a prior tenure's stale counters/inventory and
+    // skip its first full sync on a still-recent _last_full_sync.
+    reset_sync_state();
+    // The run loop has stopped, so no fiber is using the reader; release its
+    // HTTP transport. as_future guards the noexcept contract.
+    if (_reader) {
+        auto stopped = co_await ss::coroutine::as_future(_reader->stop());
+        if (stopped.failed()) {
+            auto ex = stopped.get_exception();
+            vlog(
+              logger().warn,
+              "Error stopping Schema Registry source reader: {}",
+              ex);
+        }
+    }
+    co_return res;
+}
+
+ss::future<> mirroring_task::reset_reader() {
+    if (_reader) {
+        auto stopped = co_await ss::coroutine::as_future(_reader->stop());
+        if (stopped.failed()) {
+            auto ex = stopped.get_exception();
+            vlog(
+              logger().warn,
+              "Error stopping previous Schema Registry source reader: {}",
+              ex);
+        }
+    }
+    _reader = _source_factory->create(_config.api_mode());
 }
 
 model::enabled_t mirroring_task::is_enabled() const {
@@ -188,6 +237,11 @@ mirroring_task::list_versions_once(
         }
         co_return std::nullopt;
     }
+    // Not-found means no versions of this kind, not a fault -- how a fully
+    // soft-deleted subject's active-only listing reads.
+    if (res.error().kind == source_error_kind::subject_not_found) {
+        co_return chunked_vector<ppsr::schema_version>{};
+    }
     // Reachable but failed (rare delete race): count and skip. Counters are
     // touched only between co_awaits, so sharing them across the concurrent
     // fibers is safe on one reactor.
@@ -205,18 +259,17 @@ ss::future<> mirroring_task::list_one_subject(
     if (unavailable.has_value()) {
         co_return;
     }
-    // Two listings recover the per-version deleted state the bare source
-    // listing omits: `active` are the non-deleted versions; the remainder of
-    // `all` are soft-deleted. Short-circuit on the first failure so a failing
-    // subject counts at most one error.
-    auto active = co_await list_versions_once(
-      subject, ppsr::include_deleted::no, as, unavailable);
-    if (!active.has_value()) {
-        co_return;
-    }
+    // List all versions first: unlike the active-only listing, it succeeds
+    // for a fully soft-deleted subject. The two listings partition versions
+    // into active vs. soft-deleted.
     auto all = co_await list_versions_once(
       subject, ppsr::include_deleted::yes, as, unavailable);
     if (!all.has_value()) {
+        co_return;
+    }
+    auto active = co_await list_versions_once(
+      subject, ppsr::include_deleted::no, as, unavailable);
+    if (!active.has_value()) {
         co_return;
     }
     chunked_hash_set<ppsr::schema_version> active_set;
@@ -386,10 +439,24 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
 
 ss::future<task::state_transition>
 mirroring_task::run_impl(ss::abort_source& as) {
+    // Stamp the cumulative summary's start time once per leadership acquisition
+    // (the proto documents totals_since_task_start.start_time as the task
+    // start). stop() clears the status on losing leadership, so the next leader
+    // -- a new instance or this same one regaining it -- re-stamps it here.
+    if (!_status.totals_since_task_start.start_time.has_value()) {
+        _status.totals_since_task_start.start_time = ::model::timestamp::now();
+    }
+
     // Consume the config-changed flag before any co_await so a concurrent
     // update_config during this run is not lost (it re-arms for the next run).
-    const bool long_sync = std::exchange(_config_changed, false)
-                           || should_long_sync();
+    const bool config_changed = std::exchange(_config_changed, false);
+    const bool long_sync = config_changed || should_long_sync();
+
+    // A config change may have altered the source connection (URL, auth, TLS),
+    // so rebuild the reader before this run reads from the source.
+    if (config_changed) {
+        co_await reset_reader();
+    }
 
     _status.current_sync = model::schema_registry_current_sync{
       .sync_type = long_sync ? model::schema_registry_sync_type::full

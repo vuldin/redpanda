@@ -38,6 +38,10 @@ public:
 
     bool is_enabled() const override { return true; };
 
+    ss::future<> ensure_internal_topic() override {
+        return _service->local().ensure_internal_topic();
+    }
+
     ss::future<ppsr::schema_getter*> getter() const override {
         auto [reader, _] = co_await service();
         co_return reader;
@@ -186,6 +190,8 @@ private:
 class disabled_schema_registry : public registry {
 public:
     bool is_enabled() const override { return false; };
+
+    ss::future<> ensure_internal_topic() override { return ss::now(); }
 
     ss::future<ppsr::schema_getter*> getter() const override {
         throw std::logic_error(

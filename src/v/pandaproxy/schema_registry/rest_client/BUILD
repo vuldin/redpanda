@@ -31,6 +31,10 @@ redpanda_cc_library(
     hdrs = [
         "error.h",
     ],
+    visibility = [
+        "//src/v/cluster_link:__subpackages__",
+        "//src/v/pandaproxy:__subpackages__",
+    ],
     deps = [
         ":parse",
         "//src/v/base",
@@ -78,6 +82,10 @@ redpanda_cc_library(
     hdrs = [
         "credentials.h",
     ],
+    visibility = [
+        "//src/v/cluster_link:__subpackages__",
+        "//src/v/pandaproxy:__subpackages__",
+    ],
     deps = [
         "//src/v/base",
         "@seastar",
@@ -98,6 +106,10 @@ redpanda_cc_library(
         "//src/v/http:utils",
         "//src/v/ssx:future_util",
         "@boost//:beast",
+    ],
+    visibility = [
+        "//src/v/cluster_link:__subpackages__",
+        "//src/v/pandaproxy:__subpackages__",
     ],
     deps = [
         ":credentials",

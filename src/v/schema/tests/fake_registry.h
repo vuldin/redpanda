@@ -42,6 +42,8 @@ class fake_registry : public schema::registry {
 public:
     bool is_enabled() const override { return true; };
 
+    ss::future<> ensure_internal_topic() override { return ss::now(); }
+
     ss::future<pandaproxy::schema_registry::schema_getter*>
     getter() const override;
     ss::future<pandaproxy::schema_registry::schema_getter*>

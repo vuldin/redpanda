@@ -12,8 +12,42 @@ redpanda_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
+        "//src/v/cluster_link/model",
         "//src/v/container:chunked_vector",
         "//src/v/pandaproxy/schema_registry:types",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "http_source_reader",
+    srcs = [
+        "http_source_reader.cc",
+    ],
+    hdrs = [
+        "http_source_reader.h",
+    ],
+    implementation_deps = [
+        "//src/v/base",
+        "//src/v/cluster_link:utils",
+        "//src/v/config",
+        "//src/v/http",
+        "//src/v/net",
+        "//src/v/pandaproxy/schema_registry/rest_client:error",
+        "//src/v/utils:retry_chain_node",
+        "@ada",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":source_reader",
+        "//src/v/cluster_link/model",
+        "//src/v/container:chunked_vector",
+        "//src/v/net:tls",
+        "//src/v/pandaproxy/schema_registry:types",
+        "//src/v/pandaproxy/schema_registry/rest_client:client",
+        "//src/v/pandaproxy/schema_registry/rest_client:credentials",
+        "//src/v/ssx:semaphore",
+        "//src/v/utils:unresolved_address",
         "@seastar",
     ],
 )

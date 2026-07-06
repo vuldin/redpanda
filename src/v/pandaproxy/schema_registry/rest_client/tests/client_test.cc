@@ -133,6 +133,44 @@ TEST(rest_client, list_subjects_deleted_adds_query_param) {
     ASSERT_TRUE(res.has_value());
 }
 
+TEST(rest_client, list_subjects_context_sends_param_and_filters_client_side) {
+    // The client sends ?subjectPrefix=":<ctx>:" AND filters client-side, so a
+    // server that ignores the param (like Redpanda, which returns everything
+    // here) still yields subjects scoped to exactly the requested context.
+    rc::client client{
+      make_http_client([](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce([](
+                        bh::request_header<>&& r,
+                        std::optional<iobuf>,
+                        ss::lowres_clock::duration) {
+                // ':' is percent-encoded; ":.dev:" -> "%3A.dev%3A".
+                EXPECT_EQ(r.target(), "/subjects?subjectPrefix=%3A.dev%3A");
+                return ss::make_ready_future<http::downloaded_response>(
+                  http::downloaded_response{
+                    .status = bh::status::ok,
+                    .body = iobuf::from(R"(["s1", ":.dev:s2", ":.prod:s3"])")});
+            });
+      }),
+      endpoint,
+      std::nullopt,
+      pps::qualified_subjects_enabled::yes};
+
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client
+                 .list_subjects(
+                   rtc, pps::include_deleted::no, pps::context{".dev"})
+                 .get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_THAT(
+      *res,
+      ElementsAre(
+        pps::context_subject(pps::context{".dev"}, pps::subject{"s2"})));
+}
+
 TEST(rest_client, list_subjects_no_credentials_omits_auth_header) {
     rc::client client{
       make_http_client([](mock_client& m) {

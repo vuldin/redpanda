@@ -212,6 +212,9 @@ TEST_F(mirroring_task_test, full_sync_imports_and_reports) {
     EXPECT_EQ(status->last_full_sync->subject_versions_changed, 3);
     EXPECT_EQ(status->last_full_sync->errors, 0);
     EXPECT_EQ(status->totals_since_task_start.subject_versions_changed, 3);
+    // The cumulative summary's start time is stamped once on the task's first
+    // run; it was previously left unset (only current_sync carried a start).
+    EXPECT_TRUE(status->totals_since_task_start.start_time.has_value());
 
     // Create-only replication imports schema versions but never touches
     // compatibility configs, subject modes, or unsupported-feature handling,

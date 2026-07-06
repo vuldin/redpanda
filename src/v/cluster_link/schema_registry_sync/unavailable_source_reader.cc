@@ -15,13 +15,13 @@
 
 namespace cluster_link::schema_registry_sync {
 
-namespace {
-source_error unavailable() {
+unavailable_source_reader::unavailable_source_reader(ss::sstring message)
+  : _message(std::move(message)) {}
+
+source_error unavailable_source_reader::unavailable() const {
     return source_error{
-      .kind = source_error_kind::source_unavailable,
-      .message = "Source Schema Registry reader is not implemented yet"};
+      .kind = source_error_kind::source_unavailable, .message = _message};
 }
-} // namespace
 
 ss::future<source_result<chunked_vector<ppsr::context>>>
 unavailable_source_reader::list_contexts(ss::abort_source&) {
@@ -45,7 +45,8 @@ unavailable_source_reader::read_subject_version(
     co_return std::unexpected(unavailable());
 }
 
-std::unique_ptr<source_reader> unavailable_source_reader_factory::create() {
+std::unique_ptr<source_reader> unavailable_source_reader_factory::create(
+  const model::schema_registry_sync_config::shadow_schema_registry_api*) {
     return std::make_unique<unavailable_source_reader>();
 }
 

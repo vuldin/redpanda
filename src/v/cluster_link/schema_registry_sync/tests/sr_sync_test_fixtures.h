@@ -207,16 +207,28 @@ public:
             co_return std::unexpected(it->second);
         }
         chunked_vector<ppsr::schema_version> versions;
+        bool subject_exists = false;
         for (const auto& s : _state->schemas) {
             if (s.schema.sub() != sub) {
                 continue;
             }
+            subject_exists = true;
             if (
               include_deleted == ppsr::include_deleted::no
               && s.deleted == ppsr::is_deleted::yes) {
                 continue;
             }
             versions.push_back(s.version);
+        }
+        // Mirror the real SR: active-only listing of a fully soft-deleted
+        // subject 404s rather than returning an empty list.
+        if (
+          include_deleted == ppsr::include_deleted::no && subject_exists
+          && versions.empty()) {
+            co_return std::unexpected(
+              srs::source_error{
+                .kind = srs::source_error_kind::subject_not_found,
+                .message = "subject not found (fully soft-deleted)"});
         }
         co_return versions;
     }
@@ -252,7 +264,9 @@ public:
     explicit fake_source_reader_factory(fake_source_state* state)
       : _state(state) {}
 
-    std::unique_ptr<srs::source_reader> create() override {
+    std::unique_ptr<srs::source_reader> create(
+      const cluster_link::model::schema_registry_sync_config::
+        shadow_schema_registry_api*) override {
         return std::make_unique<fake_source_reader>(_state);
     }
 
@@ -308,6 +322,9 @@ public:
         return _inner->import_schema(std::move(schema));
     }
     bool is_enabled() const override { return _inner->is_enabled(); }
+    ss::future<> ensure_internal_topic() override {
+        return _inner->ensure_internal_topic();
+    }
     ss::future<ppsr::schema_getter*> getter() const override {
         return _inner->getter();
     }

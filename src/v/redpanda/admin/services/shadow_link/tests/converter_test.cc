@@ -1943,12 +1943,10 @@ TEST(converter_test, metadata_to_shadow_link_schema_registry_api_options) {
       proto_api.get_unsupported_schema_feature_policy(),
       proto::admin::unsupported_schema_feature_policy::remove);
 
-    EXPECT_EQ(
-      sl.get_status()
-        .get_schema_registry_sync_status()
-        .get_current_sync()
-        .get_sync_type(),
-      proto::admin::schema_registry_sync_type::unspecified);
+    // No task status report was supplied, so no sync is running: current_sync
+    // must be absent rather than materialized as an empty (UNSPECIFIED) sync.
+    EXPECT_FALSE(
+      sl.get_status().get_schema_registry_sync_status().has_current_sync());
 }
 
 namespace {
@@ -2018,25 +2016,59 @@ TEST(converter_test, metadata_to_shadow_link_schema_registry_sync_status) {
     EXPECT_EQ(inv.get_destination_subjects(), 2);
     EXPECT_EQ(inv.get_destination_subject_versions(), 5);
 
+    // A running full sync must report as present and carry its real sync_type
+    // (not the UNSPECIFIED default a materialized-empty current_sync carries).
+    ASSERT_TRUE(proto.has_current_sync());
     EXPECT_EQ(
       proto.get_current_sync().get_sync_type(),
       proto::admin::schema_registry_sync_type::full);
+    EXPECT_TRUE(proto.get_current_sync().get_summary().has_start_time());
     EXPECT_EQ(
       proto.get_current_sync().get_summary().get_start_time(),
       absl::FromUnixMillis(1000));
+    // The sync is still running, so its summary has no finish_time.
+    EXPECT_FALSE(proto.get_current_sync().get_summary().has_finish_time());
 
+    ASSERT_TRUE(proto.has_last_full_sync());
+    EXPECT_TRUE(proto.get_last_full_sync().has_start_time());
     EXPECT_EQ(
       proto.get_last_full_sync().get_start_time(), absl::FromUnixMillis(2000));
+    EXPECT_TRUE(proto.get_last_full_sync().has_finish_time());
     EXPECT_EQ(
       proto.get_last_full_sync().get_finish_time(), absl::FromUnixMillis(3000));
     EXPECT_EQ(proto.get_last_full_sync().get_subject_versions_changed(), 9);
     EXPECT_EQ(proto.get_last_full_sync().get_errors(), 1);
 
+    // Cumulative totals are always present but never carry a finish_time.
+    EXPECT_FALSE(proto.get_totals_since_task_start().has_finish_time());
     EXPECT_EQ(
       proto.get_totals_since_task_start().get_subject_versions_changed(), 42);
     EXPECT_EQ(proto.get_totals_since_task_start().get_errors(), 2);
 
     EXPECT_EQ(proto.get_last_error_message(), "boom");
+}
+
+// A parked task that has never synced must report current_sync and
+// last_full_sync as absent, not as present-but-empty. Regression test for the
+// admin proto materializing unset singular message fields (pre-`optional`).
+TEST(converter_test, metadata_to_shadow_link_schema_registry_sync_status_idle) {
+    cluster_link::model::schema_registry_sync_status sr;
+    sr.inventory.selected_source_subjects = 1;
+    // A fresh task instance stamps only the cumulative start time.
+    sr.totals_since_task_start.start_time = model::timestamp{1000};
+
+    chunked_vector<cluster_link::model::task_status_report> reports;
+    reports.push_back(
+      sr_task_report(cluster_link::model::task_state::active, std::move(sr)));
+    auto sl = admin::metadata_to_shadow_link(
+      sr_api_metadata(), sr_status_report(std::move(reports)));
+
+    const auto& proto = sl.get_status().get_schema_registry_sync_status();
+
+    EXPECT_FALSE(proto.has_current_sync());
+    EXPECT_FALSE(proto.has_last_full_sync());
+    EXPECT_TRUE(proto.get_totals_since_task_start().has_start_time());
+    EXPECT_FALSE(proto.get_totals_since_task_start().has_finish_time());
 }
 
 // The SR task runs only on the _schemas/0 leader shard; reports are aggregated

@@ -85,6 +85,7 @@
         "rptest/tests/cluster_bootstrap_test.py",
         "rptest/tests/cluster_health_overview_test.py",
         "rptest/tests/cluster_linking_e2e_test.py",
+        "rptest/tests/cluster_linking_schema_registry_sync_test.py",
         "rptest/tests/cluster_linking_topic_syncing_test.py",
         "rptest/tests/cluster_recovery_test.py",
         "rptest/tests/compacted_term_rolled_recovery_test.py",

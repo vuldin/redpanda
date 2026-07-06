@@ -1595,10 +1595,18 @@ class SchemaRegistrySyncStatus(google.protobuf.message.Message):
     def __init__(self, *, inventory: Global___SchemaRegistryInventory | None=..., current_sync: Global___SchemaRegistryCurrentSync | None=..., last_full_sync: Global___SchemaRegistrySyncSummary | None=..., totals_since_task_start: Global___SchemaRegistrySyncSummary | None=..., last_error_message: builtins.str=...) -> None:
         ...
 
-    def HasField(self, field_name: typing.Literal['current_sync', b'current_sync', 'inventory', b'inventory', 'last_full_sync', b'last_full_sync', 'totals_since_task_start', b'totals_since_task_start']) -> builtins.bool:
+    def HasField(self, field_name: typing.Literal['_current_sync', b'_current_sync', '_last_full_sync', b'_last_full_sync', 'current_sync', b'current_sync', 'inventory', b'inventory', 'last_full_sync', b'last_full_sync', 'totals_since_task_start', b'totals_since_task_start']) -> builtins.bool:
         ...
 
-    def ClearField(self, field_name: typing.Literal['current_sync', b'current_sync', 'inventory', b'inventory', 'last_error_message', b'last_error_message', 'last_full_sync', b'last_full_sync', 'totals_since_task_start', b'totals_since_task_start']) -> None:
+    def ClearField(self, field_name: typing.Literal['_current_sync', b'_current_sync', '_last_full_sync', b'_last_full_sync', 'current_sync', b'current_sync', 'inventory', b'inventory', 'last_error_message', b'last_error_message', 'last_full_sync', b'last_full_sync', 'totals_since_task_start', b'totals_since_task_start']) -> None:
+        ...
+
+    @typing.overload
+    def WhichOneof(self, oneof_group: typing.Literal['_current_sync', b'_current_sync']) -> typing.Literal['current_sync'] | None:
+        ...
+
+    @typing.overload
+    def WhichOneof(self, oneof_group: typing.Literal['_last_full_sync', b'_last_full_sync']) -> typing.Literal['last_full_sync'] | None:
         ...
 Global___SchemaRegistrySyncStatus: typing_extensions.TypeAlias = SchemaRegistrySyncStatus
 
@@ -1686,9 +1694,17 @@ class SchemaRegistrySyncSummary(google.protobuf.message.Message):
     def __init__(self, *, start_time: google.protobuf.timestamp_pb2.Timestamp | None=..., finish_time: google.protobuf.timestamp_pb2.Timestamp | None=..., subject_versions_changed: builtins.int=..., compatibility_configs_changed: builtins.int=..., modes_changed: builtins.int=..., unsupported_features_removed: builtins.int=..., errors: builtins.int=...) -> None:
         ...
 
-    def HasField(self, field_name: typing.Literal['finish_time', b'finish_time', 'start_time', b'start_time']) -> builtins.bool:
+    def HasField(self, field_name: typing.Literal['_finish_time', b'_finish_time', '_start_time', b'_start_time', 'finish_time', b'finish_time', 'start_time', b'start_time']) -> builtins.bool:
         ...
 
-    def ClearField(self, field_name: typing.Literal['compatibility_configs_changed', b'compatibility_configs_changed', 'errors', b'errors', 'finish_time', b'finish_time', 'modes_changed', b'modes_changed', 'start_time', b'start_time', 'subject_versions_changed', b'subject_versions_changed', 'unsupported_features_removed', b'unsupported_features_removed']) -> None:
+    def ClearField(self, field_name: typing.Literal['_finish_time', b'_finish_time', '_start_time', b'_start_time', 'compatibility_configs_changed', b'compatibility_configs_changed', 'errors', b'errors', 'finish_time', b'finish_time', 'modes_changed', b'modes_changed', 'start_time', b'start_time', 'subject_versions_changed', b'subject_versions_changed', 'unsupported_features_removed', b'unsupported_features_removed']) -> None:
+        ...
+
+    @typing.overload
+    def WhichOneof(self, oneof_group: typing.Literal['_finish_time', b'_finish_time']) -> typing.Literal['finish_time'] | None:
+        ...
+
+    @typing.overload
+    def WhichOneof(self, oneof_group: typing.Literal['_start_time', b'_start_time']) -> typing.Literal['start_time'] | None:
         ...
 Global___SchemaRegistrySyncSummary: typing_extensions.TypeAlias = SchemaRegistrySyncSummary

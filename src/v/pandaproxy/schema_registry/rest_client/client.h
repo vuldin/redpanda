@@ -67,11 +67,21 @@ public:
     client& operator=(client&&) = delete;
     ~client() = default;
 
-    /// GET /subjects — list all subjects across all contexts. With \p deleted
-    /// set to yes, soft-deleted subjects are included in the listing.
+    /// GET /subjects — list subjects in the registry. With \p deleted set to
+    /// yes, soft-deleted subjects are included in the listing.
+    ///
+    /// When \p ctx is set, only subjects in that context are returned. The
+    /// context is both sent as a `subjectPrefix=":<ctx>:"` query parameter (so
+    /// a server that supports it filters at the source — e.g. ":.dev:", or
+    /// ":.:" for the default context) AND applied client-side by exact context
+    /// match, so the result is correctly scoped even against a server that
+    /// ignores the parameter (Redpanda's own server honors it). nullopt (the
+    /// default) lists subjects across all contexts.
     ss::future<std::expected<chunked_vector<context_subject>, domain_error>>
     list_subjects(
-      retry_chain_node& rtc, include_deleted deleted = include_deleted::no);
+      retry_chain_node& rtc,
+      include_deleted deleted = include_deleted::no,
+      std::optional<context> ctx = std::nullopt);
 
     /// GET /contexts — list the contexts that currently exist in the registry.
     /// The default context is always present, returned as the one-character

@@ -66,6 +66,8 @@ public:
 
     void update_config(const model::metadata& link_metadata) override;
 
+    ss::future<cl_result<void>> stop() noexcept override;
+
     model::enabled_t is_enabled() const final;
 
     model::task_status_report get_status_report() const override;
@@ -79,6 +81,19 @@ protected:
 
 private:
     bool leads_schema_registry_partition() const;
+
+    /// Rebuilds the source reader from the current API-mode config, releasing
+    /// the previous reader's transport first. Called on a config change so a
+    /// new source URL, auth, or TLS setting takes effect on the next run.
+    ss::future<> reset_reader();
+
+    /// Clears the in-memory sync state (status counters, destination inventory,
+    /// last-full-sync timestamp) on losing leadership, so the next leader -- a
+    /// new instance or this same one regaining leadership -- re-derives
+    /// everything from the durable destination store instead of a prior
+    /// tenure's view. `_config`/`_config_changed` are preserved: config is
+    /// authoritative and a change queued while stopped must still take effect.
+    void reset_sync_state();
 
     /// Whether a periodic full scan is due (first run, or the full-sync
     /// interval has elapsed). A config change additionally forces one via
