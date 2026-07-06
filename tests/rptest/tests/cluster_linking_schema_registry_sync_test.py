@@ -645,6 +645,42 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         )
 
     @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_hard_delete(self):
+        # A source hard-delete (which requires a soft-delete first on the
+        # destination) being propagated as a purge -- a path the reconciler unit
+        # fakes cannot cover.
+        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+
+        keep, gone = "keep-value", "gone-value"
+        schema = self._record("V", [{"name": "v", "type": "string"}])
+        self._register(src, keep, schema)
+        self._register(src, gone, schema)
+
+        self._create_sr_link()
+        self._wait_synced(src, dest, [(keep, 1), (gone, 1)])
+
+        # Hard-delete gone-value at the source (soft then permanent). The next
+        # full sync must purge it from the destination, soft-deleting the still
+        # active destination version before the permanent delete.
+        assert src.delete_subject(gone).status_code == 200
+        assert src.delete_subject(gone, permanent=True).status_code == 200
+
+        def gone_purged() -> bool:
+            active, deleted = self._version_state(dest, gone)
+            return not active and not deleted
+
+        wait_until(
+            gone_purged,
+            timeout_sec=90,
+            backoff_sec=1,
+            err_msg="source hard-delete was not propagated to the destination",
+        )
+
+        # The in-source subject is untouched by the purge.
+        assert self._schema_view(dest, keep, 1) is not None
+
+    @cluster(num_nodes=6)
     def test_schema_registry_api_sync_out_of_scope_reference(self):
         src = SchemaRegistryRedpandaClient(self.source_cluster_service)
         dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
