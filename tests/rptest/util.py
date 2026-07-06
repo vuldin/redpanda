@@ -218,6 +218,66 @@ def wait_until_with_progress_check(
     ) from last_exception
 
 
+class ConditionNotHeldError(AssertionError):
+    """Raised when `check_consistently` observes the checked condition returning false."""
+
+    pass
+
+
+def check_consistently(
+    condition: Callable[[], bool],
+    duration_sec: float,
+    interval_sec: float = 0.1,
+    err_msg: str | Callable[[], str] = "",
+) -> None:
+    """
+    Safety check: passes only if `condition` stays true for the whole
+    `duration_sec` window, and fails fast the moment it becomes false.
+
+    The safety counterpart to `wait_until`'s liveness check: `wait_until`
+    asserts that something good eventually happens (it blocks until a
+    condition becomes true), whereas `check_consistently` asserts that nothing
+    bad happens (it blocks while the condition *remains* true, raising
+    `ConditionNotHeldError` the moment it returns false).
+
+    `condition` is polled every `interval_sec`; the `duration_sec` window is
+    measured from after the first poll, so at least `duration_sec` elapses
+    between the first check and the last. Exceptions propagate to the caller
+    unchanged.
+
+    Note: a passing safety assertion establishes only that the guarded event
+    did not occur within `duration_sec`; it does not establish that the window
+    was long enough for that event to occur at all. Too short a `duration_sec`
+    therefore yields a meaningless pass.
+
+    To make the assertion solid, pair it with a positive control -- a companion
+    test in which, under conditions that should trigger the behavior, the event
+    is observed within the same `duration_sec`. Ideally the two are
+    parameterization of a single test rather than independently written cases,
+    so that they share setup and window and cannot silently drift out of sync.
+
+    For example, a test asserting that data is not evicted while disk headroom
+    is sufficient should be accompanied by one demonstrating that the same
+    window suffices to evict data under disk pressure.
+    """
+
+    def poll() -> None:
+        if not condition():
+            msg = err_msg() if callable(err_msg) else err_msg
+            raise ConditionNotHeldError(
+                msg or f"condition did not hold for {duration_sec}s"
+            )
+
+    poll()
+    stop = time.monotonic() + duration_sec
+    while True:
+        time.sleep(interval_sec)
+        started = time.monotonic()
+        poll()
+        if started >= stop:
+            return
+
+
 def segments_count(redpanda, topic, partition_idx):
     storage = redpanda.storage(scan_cache=False)
     topic_partitions = storage.partitions("kafka", topic)
@@ -414,7 +474,9 @@ def wait_for_local_storage_truncate(
         is_truncated,
         timeout_sec=timeout_sec,
         backoff_sec=1,
-        err_msg=lambda: f"truncation couldn't be verified for {topic=} and {target_bytes=}. last run partition_sizes={sizes}",
+        err_msg=lambda: (
+            f"truncation couldn't be verified for {topic=} and {target_bytes=}. last run partition_sizes={sizes}"
+        ),
     )
 
 
@@ -560,8 +622,10 @@ def wait_for_recovery_throttle_rate(
                     return True
                 metrics = list(redpanda.metrics(node))
                 family = filter(
-                    lambda fam: fam.name
-                    == "vectorized_raft_recovery_partition_movement_assigned_bandwidth",
+                    lambda fam: (
+                        fam.name
+                        == "vectorized_raft_recovery_partition_movement_assigned_bandwidth"
+                    ),
                     metrics,
                 )
                 shard_rates = next(family).samples
