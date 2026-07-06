@@ -18,6 +18,8 @@
 #include "container/chunked_hash_map.h"
 #include "container/chunked_vector.h"
 #include "model/namespace.h"
+#include "pandaproxy/schema_registry/error.h"
+#include "pandaproxy/schema_registry/exceptions.h"
 #include "pandaproxy/schema_registry/types.h"
 #include "ssx/future-util.h"
 
@@ -48,6 +50,18 @@ full_sync_interval(const model::schema_registry_sync_config& cfg) {
     }
     return model::schema_registry_sync_config::shadow_schema_registry_api::
       default_full_sync_interval;
+}
+
+// A hard-delete blocked by a live reference; the only failure the purge loop
+// retries (after the referencing version is deleted first).
+bool is_reference_blocked(const std::exception_ptr& ep) {
+    try {
+        std::rethrow_exception(ep);
+    } catch (const ppsr::exception& e) {
+        return e.code() == ppsr::error_code::subject_version_has_references;
+    } catch (...) {
+    }
+    return false;
 }
 
 } // namespace
@@ -213,6 +227,80 @@ ss::future<> mirroring_task::refresh_destination_inventory(
       _destination_inventory.active.size());
 }
 
+ss::future<> mirroring_task::hard_delete_target(
+  const ppsr::context_subject& dest_sub,
+  ppsr::schema_version version,
+  bool was_active) {
+    if (was_active) {
+        co_await _destination->soft_delete_schema(dest_sub, version);
+    }
+    co_await _destination->permanent_delete_schema(dest_sub, version);
+}
+
+ss::future<> mirroring_task::purge_one(
+  purge_target target,
+  ss::abort_source& as,
+  uint64_t& purged,
+  chunked_vector<purge_target>& next_round) {
+    as.check();
+    auto fut = co_await ss::coroutine::as_future(hard_delete_target(
+      target.node.sub, target.node.version, target.was_active));
+    if (fut.failed()) {
+        auto ex = fut.get_exception();
+        if (ssx::is_shutdown_exception(ex)) {
+            std::rethrow_exception(ex);
+        }
+        if (is_reference_blocked(ex)) {
+            // Referenced by a version not yet purged this round; retry later.
+            vlog(
+              logger().debug,
+              "Deferring hard-delete of {}/{}: {}",
+              target.node.sub,
+              target.node.version,
+              ex);
+            next_round.push_back(std::move(target));
+            co_return;
+        }
+        record_error(
+          fmt::format(
+            "failed to hard-delete {}/{}: {}",
+            target.node.sub,
+            target.node.version,
+            ex));
+        co_return;
+    }
+    ++purged;
+    ++_status.current_sync->summary.subject_versions_changed;
+    ++_status.totals_since_task_start.subject_versions_changed;
+}
+
+ss::future<uint64_t> mirroring_task::purge_destination_only_versions(
+  chunked_vector<purge_target> targets, ss::abort_source& as) {
+    uint64_t purged = 0;
+    // Rounds retry reference-blocked deletes (see header); stop when a round
+    // makes no progress and count the stuck remainder as errors.
+    const auto parallelism = std::max<size_t>(
+      1, config::shard_local_cfg().schema_registry_sync_parallelism());
+    while (!targets.empty()) {
+        const auto before = purged;
+        chunked_vector<purge_target> next_round;
+        co_await ss::max_concurrent_for_each(
+          targets, parallelism, [&](purge_target& t) {
+              return purge_one(std::move(t), as, purged, next_round);
+          });
+        if (purged == before) {
+            for (const auto& t : next_round) {
+                record_error(
+                  fmt::format(
+                    "failed to hard-delete {}/{}", t.node.sub, t.node.version));
+            }
+            break;
+        }
+        targets = std::move(next_round);
+    }
+    co_return purged;
+}
+
 ss::future<> mirroring_task::sync_mode_and_config(
   const ppsr::context_subject& target,
   ss::abort_source& as,
@@ -327,22 +415,29 @@ ss::future<> mirroring_task::list_one_subject(
   ss::abort_source& as,
   chunked_hash_set<ppsr::subject_version>& source_active,
   chunked_hash_set<ppsr::subject_version>& source_deleted,
+  chunked_hash_set<ppsr::context_subject>& failed_subjects,
   std::optional<source_error>& unavailable) {
     // A peer fiber already hit source_unavailable; skip the remaining work.
     if (unavailable.has_value()) {
         co_return;
     }
+    // A nullopt from a reachable error (not source_unavailable, which sets
+    // `unavailable`) leaves this subject's versions undiscovered, so exclude it
+    // from the hard-delete: its destination versions must not be read as
+    // source-absent.
     // List all versions first: unlike the active-only listing, it succeeds
     // for a fully soft-deleted subject. The two listings partition versions
     // into active vs. soft-deleted.
     auto all = co_await list_versions_once(
       subject, ppsr::include_deleted::yes, as, unavailable);
     if (!all.has_value()) {
+        failed_subjects.insert(subject);
         co_return;
     }
     auto active = co_await list_versions_once(
       subject, ppsr::include_deleted::no, as, unavailable);
     if (!active.has_value()) {
+        failed_subjects.insert(subject);
         co_return;
     }
     chunked_hash_set<ppsr::schema_version> active_set;
@@ -377,6 +472,12 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
     chunked_hash_set<ppsr::subject_version> source_active;
     chunked_hash_set<ppsr::subject_version> source_deleted;
 
+    // Track failed context and subject listing calls to narrow the hard-delete
+    // purge to only what discovery saw whole and avoid hard-deleting subjects
+    // based on incomplete discovery.
+    chunked_hash_set<ppsr::context> failed_contexts;
+    chunked_hash_set<ppsr::context_subject> failed_subjects;
+
     // Contexts are few, so enumerate their subjects sequentially. in_scope also
     // scopes discovery, keeping source and destination sides consistent.
     chunked_vector<ppsr::context_subject> subjects;
@@ -388,8 +489,10 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
               == source_error_kind::source_unavailable) {
                 co_return make_unavailable(subjects_res.error().message);
             }
-            // Reachable but failed (rare delete race): count and skip.
+            // Reachable but failed (rare delete race): count and skip, and
+            // spare this context's destination subjects from the purge.
             record_error(subjects_res.error().message);
+            failed_contexts.insert(ctx);
             continue;
         }
         for (auto& subject : subjects_res.value()) {
@@ -409,7 +512,12 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
       std::max<size_t>(1, limits.parallelism),
       [&](const ppsr::context_subject& subject) {
           return list_one_subject(
-            subject, as, source_active, source_deleted, unavailable);
+            subject,
+            as,
+            source_active,
+            source_deleted,
+            failed_subjects,
+            unavailable);
       });
     if (unavailable.has_value()) {
         co_return make_unavailable(unavailable->message);
@@ -429,10 +537,10 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
     // soft-deleted, and one still active on the destination has its deleted
     // body re-imported to propagate the soft-delete (import overwrites the
     // version's deleted flag). Soft-delete propagation covers source-present
-    // versions in both directions; purging destination-only versions
-    // (hard-delete propagation) is deferred, as is detecting divergent
-    // same-key content (a matching key is assumed to mean matching content --
-    // the destination is a managed mirror).
+    // versions in both directions; a version present on the destination but
+    // absent from the source entirely is hard-deleted below. Detecting
+    // divergent same-key content is out of scope (a matching key is assumed to
+    // mean matching content -- the destination is a managed mirror).
     work_set work;
     for (const auto& node : source_active) {
         if (!_destination_inventory.active.contains(node)) {
@@ -446,6 +554,23 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
         if (!dest_deleted) {
             work.upserts.push_back(node);
         }
+    }
+
+    // Hard-delete set: destination versions the source no longer has at all.
+    chunked_vector<purge_target> to_purge;
+    for (const auto& node : _destination_inventory.all) {
+        if (source_active.contains(node) || source_deleted.contains(node)) {
+            continue;
+        }
+        if (
+          failed_contexts.contains(node.sub.ctx)
+          || failed_subjects.contains(node.sub)) {
+            continue;
+        }
+        to_purge.push_back(
+          purge_target{
+            .node = node,
+            .was_active = _destination_inventory.active.contains(node)});
     }
 
     // The reconciler sinks the predicate by value; forward the borrowed one.
@@ -488,6 +613,9 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
       += stats.versions_changed;
     _status.totals_since_task_start.errors += stats.errors;
 
+    const auto purged = co_await purge_destination_only_versions(
+      std::move(to_purge), as);
+
     // Replicate modes/configs after the import (the destination contexts and
     // subjects now exist)
     chunked_vector<ppsr::context_subject> mode_config_targets;
@@ -528,12 +656,13 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
     vlog(
       logger().info,
       "Schema Registry full sync: {} source subjects ({} versions), {} "
-      "destination subjects; imported {} versions, {} modes, {} configs, {} "
-      "errors",
+      "destination subjects; imported {} versions, hard-deleted {} versions, "
+      "{} modes, {} configs, {} errors",
       _status.inventory.selected_source_subjects,
       _status.inventory.selected_source_subject_versions,
       _status.inventory.destination_subjects,
       stats.versions_changed,
+      purged,
       _status.current_sync->summary.modes_changed,
       _status.current_sync->summary.compatibility_configs_changed,
       _status.current_sync->summary.errors);

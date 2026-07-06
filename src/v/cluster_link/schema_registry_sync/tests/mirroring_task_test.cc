@@ -66,7 +66,7 @@ public:
 
         co_await _clmtf->get_manager().invoke_on_all([this](manager& m) {
             return m.register_task_factory<srs::mirroring_task_factory>(
-              &_registry, &_source_factory);
+              dest(), &_source_factory);
         });
 
         fixture()->elect_leader(::model::controller_ntp, self(), std::nullopt);
@@ -156,6 +156,10 @@ public:
         co_return result;
     }
 
+    // The destination registry the task writes to. Overridable so a test can
+    // wrap `_registry` (e.g. to reject deletes); defaults to `_registry`.
+    virtual schema::registry* dest() { return &_registry; }
+
     fake_source_state _source_state;
     fake_source_reader_factory _source_factory{&_source_state};
     schema::fake_registry _registry;
@@ -178,14 +182,15 @@ TEST_F(mirroring_task_test, populates_source_and_destination_inventory) {
     ASSERT_TRUE(status.has_value());
     EXPECT_EQ(status->inventory.selected_source_subjects, 1);
     EXPECT_EQ(status->inventory.selected_source_subject_versions, 2);
-    // The destination counters are refreshed after the import, so they reflect
-    // the post-sync state: the seeded payments-value plus the two imported
-    // orders-value versions.
-    EXPECT_EQ(status->inventory.destination_subjects, 2);
-    EXPECT_EQ(status->inventory.destination_subject_versions, 3);
-    // The two source versions are absent from the destination, so the reconcile
-    // imports both.
-    EXPECT_EQ(status->totals_since_task_start.subject_versions_changed, 2);
+    // The destination counters are refreshed after the sync, so they reflect
+    // the post-sync state. The seeded payments-value is absent from the source,
+    // so hard-delete propagation purges it; only the two imported orders-value
+    // versions remain.
+    EXPECT_EQ(status->inventory.destination_subjects, 1);
+    EXPECT_EQ(status->inventory.destination_subject_versions, 2);
+    // Two orders-value versions imported plus the source-absent payments-value
+    // hard-deleted: three subject-version changes.
+    EXPECT_EQ(status->totals_since_task_start.subject_versions_changed, 3);
     EXPECT_EQ(status->last_full_sync->errors, 0);
 }
 
@@ -502,6 +507,195 @@ TEST_F(
     EXPECT_EQ(all[0].deleted, ppsr::is_deleted::yes);
 }
 
+TEST_F(mirroring_task_test, hard_deletes_source_absent_versions) {
+    auto orders = ppsr::context_subject::unqualified("orders-value");
+    auto payments = ppsr::context_subject::unqualified("payments-value");
+    // The destination has two active subjects; the source only has
+    // orders-value. The source-absent payments-value must be soft-deleted then
+    // hard-deleted, while orders-value is kept.
+    seed_destination("orders-value", 1);
+    seed_destination("payments-value", 1);
+    _source_state.add(orders, 1);
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+
+    // orders-value was already present (no import); the one change is the
+    // payments-value hard-delete.
+    EXPECT_EQ(status->last_full_sync->subject_versions_changed, 1);
+    EXPECT_EQ(status->last_full_sync->errors, 0);
+
+    const auto& all = _registry.get_all();
+    ASSERT_EQ(all.size(), 1);
+    EXPECT_EQ(all[0].schema.sub(), orders);
+}
+
+TEST_F(
+  mirroring_task_test,
+  out_of_scope_destination_subject_spared_from_hard_delete) {
+    auto orders = ppsr::context_subject::unqualified("orders-value");
+    // Both subjects sit in the default context on the destination, but the
+    // subject filter selects only orders-value, so payments-value is out of
+    // scope. It is absent from the scoped source view -- yet must not be read
+    // as a source hard-delete.
+    seed_destination("orders-value", 1);
+    seed_destination("payments-value", 1);
+    _source_state.add(orders, 1);
+
+    auto metadata = get_default_metadata();
+    metadata.configuration.schema_registry_sync_cfg.api_mode()
+      ->filter.subjects.push_back("orders-value");
+
+    lead_schema_registry();
+    fixture()->upsert_link(std::move(metadata)).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+
+    // orders-value is already present (no import) and payments-value is out of
+    // scope (no purge), so the sync changes nothing.
+    EXPECT_EQ(status->last_full_sync->subject_versions_changed, 0);
+    EXPECT_EQ(status->last_full_sync->errors, 0);
+
+    // Both destination subjects survive: the in-scope one untouched, the
+    // out-of-scope one spared rather than purged.
+    const auto& all = _registry.get_all();
+    chunked_vector<ppsr::subject> subjects;
+    for (const auto& s : all) {
+        subjects.push_back(s.schema.sub().sub);
+    }
+    EXPECT_THAT(
+      subjects,
+      testing::UnorderedElementsAre(
+        ppsr::subject{"orders-value"}, ppsr::subject{"payments-value"}));
+}
+
+TEST_F(mirroring_task_test, hard_deletes_already_soft_deleted_version) {
+    auto orders = ppsr::context_subject::unqualified("orders-value");
+    // The destination holds orders-value:v1 already soft-deleted; the source no
+    // longer has it at all, so it is purged (directly, no re-soft-delete).
+    _registry
+      .import_schema(
+        make_schema(orders, 1, R"({"v":1})", ppsr::is_deleted::yes))
+      .get();
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+
+    EXPECT_EQ(status->last_full_sync->subject_versions_changed, 1);
+    EXPECT_TRUE(_registry.get_all().empty());
+}
+
+TEST_F(mirroring_task_test, unlisted_subject_spared_from_hard_delete) {
+    auto orders = ppsr::context_subject::unqualified("orders-value");
+    auto flaky = ppsr::context_subject::unqualified("payments-value");
+    // Both subjects were mirrored on the destination by a prior sync. The
+    // source still has both, but listing flaky's versions fails transiently
+    // (reachable, not unavailable), so it drops out of the discovered source
+    // set and would look source-absent to the purge phase.
+    seed_destination("orders-value", 1);
+    seed_destination("payments-value", 1);
+    _source_state.add(orders, 1);
+    _source_state.add(flaky, 1);
+    _source_state.list_versions_errors.emplace(
+      flaky,
+      srs::source_error{
+        .kind = srs::source_error_kind::operation_failed,
+        .message = "version listing failed"});
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->last_full_sync->errors, 1);
+
+    // The unlistable subject is excluded from the purge, so it survives rather
+    // than being erased on a discovery gap; nothing is hard-deleted.
+    EXPECT_EQ(status->last_full_sync->subject_versions_changed, 0);
+    EXPECT_EQ(_registry.get_all().size(), 2u);
+}
+
+TEST_F(mirroring_task_test, deleted_subject_purged_despite_unlisted_peer) {
+    auto flaky = ppsr::context_subject::unqualified("payments-value");
+    auto gone = ppsr::context_subject::unqualified("orders-value");
+    // The destination mirrors two subjects. The source still has flaky (but its
+    // version listing fails transiently) and no longer has gone at all. The
+    // failed peer must not block purging gone: discovery saw the source lacks
+    // it, so it is a real deletion.
+    seed_destination("payments-value", 1);
+    seed_destination("orders-value", 1);
+    _source_state.add(flaky, 1);
+    _source_state.list_versions_errors.emplace(
+      flaky,
+      srs::source_error{
+        .kind = srs::source_error_kind::operation_failed,
+        .message = "version listing failed"});
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->last_full_sync->errors, 1);
+
+    // gone is purged (one change); the unlistable flaky is spared and remains.
+    EXPECT_EQ(status->last_full_sync->subject_versions_changed, 1);
+    const auto& all = _registry.get_all();
+    ASSERT_EQ(all.size(), 1u);
+    EXPECT_EQ(all[0].schema.sub(), flaky);
+}
+
+TEST_F(mirroring_task_test, failed_context_listing_spares_its_subjects) {
+    auto kept = ppsr::context_subject::unqualified("orders-value");
+    // The in-scope context's subject listing fails reachably (not unavailable,
+    // which would park the link), so its whole subject set is undiscovered. A
+    // destination subject in that context must be spared the purge rather than
+    // treated as source-absent.
+    seed_destination("orders-value", 1);
+    _source_state.list_subjects_error = srs::source_error{
+      .kind = srs::source_error_kind::operation_failed,
+      .message = "subject listing failed"};
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->last_full_sync->errors, 1);
+
+    // The whole context was spared, so its seeded subject survives and nothing
+    // is hard-deleted.
+    EXPECT_EQ(status->last_full_sync->subject_versions_changed, 0);
+    const auto& all = _registry.get_all();
+    ASSERT_EQ(all.size(), 1u);
+    EXPECT_EQ(all[0].schema.sub(), kept);
+}
+
 TEST_F(mirroring_task_test, replicates_modes_and_configs) {
     auto orders = ppsr::context_subject::unqualified("orders-value");
     _source_state.add(orders, 1);
@@ -728,6 +922,87 @@ TEST_F(mirroring_task_test, destination_inventory_spans_contexts_and_deleted) {
 
     EXPECT_THAT(inv.active, testing::UnorderedElementsAre(a_v1, c_v1));
     EXPECT_THAT(inv.all, testing::UnorderedElementsAre(a_v1, c_v1, a_v2));
+}
+
+// Fixture whose destination wraps `_registry` so a test can make permanent
+// deletes fail, exercising the hard-delete retry loop the plain fake cannot.
+class mirroring_task_delete_retry_test : public mirroring_task_test {
+protected:
+    schema::registry* dest() override { return &_deferring; }
+    deferred_delete_registry _deferring{&_registry};
+};
+
+TEST_F(
+  mirroring_task_delete_retry_test,
+  hard_delete_retries_reference_blocked_purge) {
+    auto referrer = ppsr::context_subject::unqualified("referrer-value");
+    auto referent = ppsr::context_subject::unqualified("referent-value");
+    // Both are on the destination but absent from the source, so both are
+    // purged. The referent cannot be deleted until the referrer is, so its
+    // first attempt is rejected; the sync must delete the referrer and retry
+    // the referent in a later round rather than count an error.
+    seed_destination("referrer-value", 1);
+    seed_destination("referent-value", 1);
+    _deferring.block_until_purged(referent, referrer);
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+    // Both drained within the one sync, no error counted for the retry.
+    EXPECT_EQ(status->last_full_sync->subject_versions_changed, 2);
+    EXPECT_EQ(status->last_full_sync->errors, 0);
+    EXPECT_TRUE(_registry.get_all().empty());
+}
+
+TEST_F(mirroring_task_delete_retry_test, hard_delete_gives_up_on_stuck_purge) {
+    auto orders = ppsr::context_subject::unqualified("orders-value");
+    // A purge that never succeeds (a reference cycle the source can't have, but
+    // defensively handled): once a whole round makes no progress the sync stops
+    // retrying and counts it as one error rather than looping forever.
+    seed_destination("orders-value", 1);
+    _deferring.reject_forever(orders);
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->last_full_sync->subject_versions_changed, 0);
+    EXPECT_EQ(status->last_full_sync->errors, 1);
+}
+
+TEST_F(
+  mirroring_task_delete_retry_test,
+  hard_delete_counts_non_reference_error_without_retry) {
+    auto stuck = ppsr::context_subject::unqualified("stuck-value");
+    auto ok = ppsr::context_subject::unqualified("ok-value");
+    // A non-reference destination fault (writes disabled) must be counted once,
+    // immediately -- not deferred and retried like a reference-ordering block.
+    // `ok` purges normally, so a retry loop would re-attempt `stuck` in a later
+    // round; asserting a single attempt pins the no-retry behavior.
+    seed_destination("stuck-value", 1);
+    seed_destination("ok-value", 1);
+    _deferring.fail_with(stuck, ppsr::error_code::writes_disabled);
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->last_full_sync->subject_versions_changed, 1);
+    EXPECT_EQ(status->last_full_sync->errors, 1);
+    EXPECT_EQ(_deferring.permanent_delete_attempts(stuck), 1);
 }
 
 } // namespace cluster_link::tests

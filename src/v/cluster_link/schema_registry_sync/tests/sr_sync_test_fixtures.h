@@ -495,4 +495,71 @@ private:
     chunked_hash_map<ppsr::subject_version, ppsr::error_info> _failures;
 };
 
+// Wraps a destination registry, modeling the real Schema Registry's refusal to
+// permanently delete a version still referenced by a live one (the in-memory
+// fake never rejects a delete). Lets a test drive the hard-delete retry loop: a
+// referent stays blocked until its referrer is purged, so the sync must delete
+// the referrer first and retry the referent in a later round rather than count
+// an error; a permanently-blocked delete ends up counted once.
+class deferred_delete_registry final : public delegating_registry {
+public:
+    using delegating_registry::delegating_registry;
+
+    // Reject permanent deletes of `referent` until `referrer` has been
+    // permanently deleted -- models a live reference the purge must clear
+    // first.
+    void block_until_purged(
+      const ppsr::context_subject& referent,
+      const ppsr::context_subject& referrer) {
+        _blocked_on.insert_or_assign(referent, referrer);
+    }
+    // Reject every permanent delete of `subject` -- models a permanently-stuck
+    // delete (e.g. a reference cycle) that must end up counted as an error.
+    void reject_forever(const ppsr::context_subject& subject) {
+        _forever.insert(subject);
+    }
+    // Reject every permanent delete of `subject` with a non-reference error --
+    // models a real destination fault the purge must count immediately rather
+    // than retry as if it were reference ordering.
+    void fail_with(const ppsr::context_subject& subject, ppsr::error_code ec) {
+        _fail_with.insert_or_assign(subject, ec);
+    }
+    size_t
+    permanent_delete_attempts(const ppsr::context_subject& subject) const {
+        auto it = _attempts.find(subject);
+        return it == _attempts.end() ? 0 : it->second;
+    }
+
+    ss::future<chunked_vector<ppsr::schema_version>> permanent_delete_schema(
+      ppsr::context_subject sub,
+      std::optional<ppsr::schema_version> v) override {
+        ++_attempts[sub];
+        if (auto f = _fail_with.find(sub); f != _fail_with.end()) {
+            return ss::make_exception_future<
+              chunked_vector<ppsr::schema_version>>(ppsr::as_exception(
+              ppsr::error_info{f->second, "destination fault"}));
+        }
+        auto it = _blocked_on.find(sub);
+        const bool blocked
+          = _forever.contains(sub)
+            || (it != _blocked_on.end() && !_purged.contains(it->second));
+        if (blocked) {
+            return ss::make_exception_future<
+              chunked_vector<ppsr::schema_version>>(ppsr::as_exception(
+              ppsr::error_info{
+                ppsr::error_code::subject_version_has_references,
+                "referenced by a live schema"}));
+        }
+        _purged.insert(sub);
+        return _inner->permanent_delete_schema(std::move(sub), v);
+    }
+
+private:
+    chunked_hash_map<ppsr::context_subject, ppsr::context_subject> _blocked_on;
+    chunked_hash_set<ppsr::context_subject> _forever;
+    chunked_hash_map<ppsr::context_subject, ppsr::error_code> _fail_with;
+    chunked_hash_map<ppsr::context_subject, size_t> _attempts;
+    chunked_hash_set<ppsr::context_subject> _purged;
+};
+
 } // namespace cluster_link::tests
