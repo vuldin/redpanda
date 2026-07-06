@@ -111,6 +111,171 @@ TEST(scope, in_scope_filter_union_semantics) {
     }
 }
 
+TEST(scope, context_mapper_identity_passes_through) {
+    // No destination configured: forward and reverse are the identity, so the
+    // whole sync stays in the source namespace unchanged.
+    auto mapper = srs::context_mapper::make(config_with());
+    EXPECT_TRUE(mapper.is_identity());
+    EXPECT_EQ(mapper.forward(ppsr::context{".prod"}), ppsr::context{".prod"});
+    EXPECT_EQ(mapper.forward(ppsr::default_context), ppsr::default_context);
+    EXPECT_EQ(mapper.reverse(ppsr::context{".prod"}), ppsr::context{".prod"});
+
+    // An explicit identity mapping is equivalent to no destination.
+    model::schema_registry_sync_config::shadow_schema_registry_api api;
+    api.destination
+      = model::schema_registry_sync_config::identity_context_mapping{};
+    auto explicit_identity = srs::context_mapper::make(
+      config_with(std::move(api)));
+    EXPECT_TRUE(explicit_identity.is_identity());
+    EXPECT_EQ(
+      explicit_identity.forward(ppsr::context{".x"}), ppsr::context{".x"});
+}
+
+TEST(scope, context_mapper_exact_maps_both_ways) {
+    model::schema_registry_sync_config::shadow_schema_registry_api api;
+    model::schema_registry_sync_config::exact_context_mapping mapping;
+    mapping.mappings.emplace(".prod", ".dest");
+    mapping.mappings.emplace(".stage", ".dest-stage");
+    api.destination = std::move(mapping);
+    auto mapper = srs::context_mapper::make(config_with(std::move(api)));
+
+    EXPECT_FALSE(mapper.is_identity());
+    // Forward rewrites a configured source context to its destination.
+    EXPECT_EQ(mapper.forward(ppsr::context{".prod"}), ppsr::context{".dest"});
+    EXPECT_EQ(
+      mapper.forward(ppsr::context{".stage"}), ppsr::context{".dest-stage"});
+    // Reverse recovers the source context from its destination.
+    EXPECT_EQ(mapper.reverse(ppsr::context{".dest"}), ppsr::context{".prod"});
+    EXPECT_EQ(
+      mapper.reverse(ppsr::context{".dest-stage"}), ppsr::context{".stage"});
+    // A destination context no source maps to is out of scope.
+    EXPECT_EQ(mapper.reverse(ppsr::context{".prod"}), std::nullopt);
+    EXPECT_EQ(mapper.reverse(ppsr::default_context), std::nullopt);
+    // An unmapped source context has no destination -> nullopt, so callers drop
+    // the unit rather than leak an un-remapped context (check_preconditions
+    // covers every in-scope context; this guards one appearing afterwards).
+    EXPECT_EQ(mapper.forward(ppsr::context{".other"}), std::nullopt);
+    // The registry-wide global is never remapped, so it passes through even
+    // under an exact mapping (its mode/config is written to the dest global).
+    EXPECT_EQ(mapper.forward(ppsr::global_context), ppsr::global_context);
+}
+
+TEST(scope, context_mapper_empty_exact_rejects_all_not_identity) {
+    // An exact mapping with an empty table covers no source context, so it is
+    // NOT identity: forward/reverse must reject every non-global context rather
+    // than pass it through. (This is distinct from an identity or
+    // no-destination config, which pass everything through -- see
+    // context_mapper_identity_passes_through.) check_preconditions rejects such
+    // a config before the mapper is built whenever any context is in scope, but
+    // the mapper must still encode reject-all so the two modes never alias.
+    model::schema_registry_sync_config::shadow_schema_registry_api api;
+    api.destination
+      = model::schema_registry_sync_config::exact_context_mapping{};
+    auto mapper = srs::context_mapper::make(config_with(std::move(api)));
+
+    EXPECT_FALSE(mapper.is_identity());
+    EXPECT_EQ(mapper.forward(ppsr::context{".prod"}), std::nullopt);
+    EXPECT_EQ(mapper.forward(ppsr::default_context), std::nullopt);
+    EXPECT_EQ(mapper.reverse(ppsr::context{".prod"}), std::nullopt);
+    EXPECT_EQ(mapper.reverse(ppsr::default_context), std::nullopt);
+    // The global is still written to the destination global directly, so it
+    // passes through even under an (empty) exact mapping.
+    EXPECT_EQ(mapper.forward(ppsr::global_context), ppsr::global_context);
+}
+
+TEST(scope, preconditions_exact_mapping_requires_full_coverage) {
+    model::schema_registry_sync_config::shadow_schema_registry_api api;
+    model::schema_registry_sync_config::exact_context_mapping mapping;
+    mapping.mappings.emplace(".prod", ".dest");
+    api.destination = std::move(mapping);
+    auto config = config_with(std::move(api));
+
+    // The default context is in scope but unmapped: a source context with no
+    // destination would be dropped silently, so it faults regardless of the
+    // qualified-subjects flag (a usability check, not the qualified rule).
+    chunked_hash_set<ppsr::context> uncovered;
+    uncovered.insert(ppsr::default_context);
+    uncovered.insert(ppsr::context{".prod"});
+    EXPECT_TRUE(srs::check_preconditions(config, uncovered, true).has_value());
+    EXPECT_TRUE(srs::check_preconditions(config, uncovered, false).has_value());
+
+    // With only the mapped context in scope, the mapping fully covers it (the
+    // non-default target still needs qualified subjects, so check with the flag
+    // on).
+    chunked_hash_set<ppsr::context> covered;
+    covered.insert(ppsr::context{".prod"});
+    EXPECT_FALSE(srs::check_preconditions(config, covered, true).has_value());
+}
+
+TEST(scope, preconditions_exact_mapping_requires_coverage_of_filter_contexts) {
+    // A schema is imported only if it is in scope, and a context-qualified
+    // reference to another context is imported only if that context is in scope
+    // too (else the referrer is failed at reconcile time). "In scope" is
+    // defined by the source filter, so a context the filter names -- as a
+    // referenced context would be -- but the exact mapping omits must fault at
+    // config validation, before forward() would silently pass the unmapped
+    // context through to the destination. Checked with qualified subjects ON so
+    // only the mapping-coverage rule can fault (the qualified rule
+    // short-circuits), and with an empty discovered-context set so the fault
+    // comes purely from the filter, not from list_contexts.
+    chunked_hash_set<ppsr::context> no_discovered;
+
+    // A context filter names an unmapped context.
+    {
+        model::schema_registry_sync_config::shadow_schema_registry_api api;
+        api.filter.contexts.push_back(".a");
+        api.filter.contexts.push_back(".b"); // in scope, no destination mapping
+        model::schema_registry_sync_config::exact_context_mapping mapping;
+        mapping.mappings.emplace(".a", ".x");
+        api.destination = std::move(mapping);
+        auto config = config_with(std::move(api));
+        EXPECT_TRUE(
+          srs::check_preconditions(config, no_discovered, true).has_value());
+    }
+    // A subject filter in qualified syntax names a subject in an unmapped
+    // context -- the individual-subject shape a reference takes.
+    {
+        model::schema_registry_sync_config::shadow_schema_registry_api api;
+        api.filter.subjects.push_back(":.b:orders"); // .b in scope, unmapped
+        model::schema_registry_sync_config::exact_context_mapping mapping;
+        mapping.mappings.emplace(".a", ".x");
+        api.destination = std::move(mapping);
+        auto config = config_with(std::move(api));
+        EXPECT_TRUE(
+          srs::check_preconditions(config, no_discovered, true).has_value());
+    }
+    // Mapping every filtered context clears the fault.
+    {
+        model::schema_registry_sync_config::shadow_schema_registry_api api;
+        api.filter.contexts.push_back(".a");
+        api.filter.contexts.push_back(".b");
+        model::schema_registry_sync_config::exact_context_mapping mapping;
+        mapping.mappings.emplace(".a", ".x");
+        mapping.mappings.emplace(".b", ".y");
+        api.destination = std::move(mapping);
+        auto config = config_with(std::move(api));
+        EXPECT_FALSE(
+          srs::check_preconditions(config, no_discovered, true).has_value());
+    }
+}
+
+TEST(scope, preconditions_exact_mapping_rejects_duplicate_destination) {
+    model::schema_registry_sync_config::shadow_schema_registry_api api;
+    model::schema_registry_sync_config::exact_context_mapping mapping;
+    mapping.mappings.emplace(".a", ".x");
+    mapping.mappings.emplace(".b", ".x"); // collision: two sources -> .x
+    api.destination = std::move(mapping);
+    auto config = config_with(std::move(api));
+
+    chunked_hash_set<ppsr::context> in_scope;
+    in_scope.insert(ppsr::context{".a"});
+    in_scope.insert(ppsr::context{".b"});
+    // A shared destination makes the reverse map ambiguous, so it is rejected
+    // regardless of the qualified-subjects flag.
+    EXPECT_TRUE(srs::check_preconditions(config, in_scope, true).has_value());
+    EXPECT_TRUE(srs::check_preconditions(config, in_scope, false).has_value());
+}
+
 TEST(scope, preconditions_remapping_target_requires_qualified) {
     model::schema_registry_sync_config::shadow_schema_registry_api api;
     model::schema_registry_sync_config::exact_context_mapping mapping;
@@ -160,6 +325,36 @@ TEST(scope, preconditions_nondefault_filter_requires_qualified) {
         auto config = config_with(std::move(api));
         EXPECT_TRUE(srs::check_preconditions(config, empty, false).has_value());
         EXPECT_FALSE(srs::check_preconditions(config, empty, true).has_value());
+    }
+}
+
+TEST(scope, preconditions_global_context_exempt) {
+    // The registry-wide global (.__GLOBAL) is written to the destination global
+    // directly -- never remapped and independent of qualified subjects -- so
+    // naming it in a filter must not fault, unlike a real non-default context.
+    const auto global = ss::sstring{ppsr::global_context()};
+    chunked_hash_set<ppsr::context> empty;
+
+    // Under an exact mapping that covers the real source context but not
+    // .__GLOBAL, the global is exempt from the mapping-coverage check.
+    {
+        model::schema_registry_sync_config::shadow_schema_registry_api api;
+        api.filter.contexts.push_back(".prod");
+        api.filter.contexts.push_back(global);
+        model::schema_registry_sync_config::exact_context_mapping mapping;
+        mapping.mappings.emplace(".prod", ".dest");
+        api.destination = std::move(mapping);
+        auto config = config_with(std::move(api));
+        EXPECT_FALSE(srs::check_preconditions(config, empty, true).has_value());
+    }
+    // With qualified subjects off, a non-default context filter faults, but
+    // .__GLOBAL alone does not.
+    {
+        model::schema_registry_sync_config::shadow_schema_registry_api api;
+        api.filter.contexts.push_back(global);
+        auto config = config_with(std::move(api));
+        EXPECT_FALSE(
+          srs::check_preconditions(config, empty, false).has_value());
     }
 }
 
