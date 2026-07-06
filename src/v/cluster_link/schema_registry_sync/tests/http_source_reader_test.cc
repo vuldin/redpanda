@@ -311,6 +311,151 @@ TEST(http_source_reader, not_found_maps_to_subject_not_found) {
     EXPECT_EQ(res.error().kind, srs::source_error_kind::subject_not_found);
 }
 
+// read_mode narrows the source's open-enum mode to Redpanda's three-valued
+// mode. READONLY_OVERRIDE has no direct destination value but is read-only, so
+// it is preserved as READONLY rather than dropped.
+TEST(http_source_reader, read_mode_narrows_supported_modes) {
+    struct tc {
+        std::string_view wire;
+        pps::mode expected;
+    };
+    for (auto [wire, expected] : {
+           tc{"READWRITE", pps::mode::read_write},
+           tc{"READONLY", pps::mode::read_only},
+           tc{"READONLY_OVERRIDE", pps::mode::read_only},
+           tc{"IMPORT", pps::mode::import},
+         }) {
+        auto reader = reader_over([wire](mock_client& m) {
+            EXPECT_CALL(m, request_and_collect_response(_, _, _))
+              .WillOnce(respond(
+                bh::status::ok, fmt::format(R"({{"mode":"{}"}})", wire)));
+        });
+        ss::abort_source as;
+        auto res
+          = reader.read_mode(pps::context_subject::unqualified("s1"), as).get();
+        reader.stop().get();
+        ASSERT_TRUE(res.has_value()) << "wire=" << wire;
+        ASSERT_TRUE(res->has_value()) << "wire=" << wire;
+        EXPECT_EQ(**res, expected) << "wire=" << wire;
+    }
+}
+
+// A source mode Redpanda cannot represent (FORWARD, or an unknown value a newer
+// server reports) is a per-item operation_failed the task counts as an error,
+// not a nullopt (which would be misread as "no override").
+TEST(http_source_reader, read_mode_unmappable_is_operation_failed) {
+    for (auto wire : {"FORWARD", "SOMETHING_NEW"}) {
+        auto reader = reader_over([wire](mock_client& m) {
+            EXPECT_CALL(m, request_and_collect_response(_, _, _))
+              .WillOnce(respond(
+                bh::status::ok, fmt::format(R"({{"mode":"{}"}})", wire)));
+        });
+        ss::abort_source as;
+        auto res
+          = reader.read_mode(pps::context_subject::unqualified("s1"), as).get();
+        reader.stop().get();
+        ASSERT_FALSE(res.has_value()) << "wire=" << wire;
+        EXPECT_EQ(res.error().kind, srs::source_error_kind::operation_failed)
+          << "wire=" << wire;
+    }
+}
+
+// A subject with no explicit mode override (HTTP 404 / error_code 40409) is not
+// an error: it reads back as nullopt so the sync knows there is nothing to
+// replicate at this level.
+TEST(http_source_reader, read_mode_absent_override_is_nullopt) {
+    auto reader = reader_over([](mock_client& m) {
+        EXPECT_CALL(m, request_and_collect_response(_, _, _))
+          .WillOnce(respond(bh::status::not_found, R"({"error_code": 40409})"));
+    });
+    ss::abort_source as;
+    auto res
+      = reader.read_mode(pps::context_subject::unqualified("s1"), as).get();
+    reader.stop().get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_FALSE(res->has_value());
+}
+
+// The registry-wide global context is read via GET /mode/:.__GLOBAL: (a
+// context-qualified subject), not the subject-less GET /mode.
+TEST(http_source_reader, read_mode_global_context_hits_global_endpoint) {
+    auto reader = reader_over([](mock_client& m) {
+        EXPECT_CALL(m, request_and_collect_response(_, _, _))
+          .WillOnce([](
+                      bh::request_header<>&& r,
+                      std::optional<iobuf>,
+                      ss::lowres_clock::duration) {
+              EXPECT_THAT(
+                std::string(r.target().data(), r.target().size()),
+                HasSubstr(".__GLOBAL"));
+              return ss::make_ready_future<http::downloaded_response>(
+                http::downloaded_response{
+                  .status = bh::status::ok,
+                  .body = iobuf::from(R"({"mode":"READONLY"})")});
+          });
+    });
+    ss::abort_source as;
+    auto res = reader
+                 .read_mode(
+                   pps::context_subject{pps::global_context, pps::subject{""}},
+                   as)
+                 .get();
+    reader.stop().get();
+
+    ASSERT_TRUE(res.has_value());
+    ASSERT_TRUE(res->has_value());
+    EXPECT_EQ(**res, pps::mode::read_only);
+}
+
+// read_config mirrors read_mode: the seven defined levels narrow one-to-one, an
+// absent override (40408) is nullopt, and an unknown level is operation_failed.
+TEST(http_source_reader, read_config_narrows_and_classifies) {
+    {
+        auto reader = reader_over([](mock_client& m) {
+            EXPECT_CALL(m, request_and_collect_response(_, _, _))
+              .WillOnce(respond(
+                bh::status::ok, R"({"compatibilityLevel":"FULL_TRANSITIVE"})"));
+        });
+        ss::abort_source as;
+        auto res = reader
+                     .read_config(pps::context_subject::unqualified("s1"), as)
+                     .get();
+        reader.stop().get();
+        ASSERT_TRUE(res.has_value());
+        ASSERT_TRUE(res->has_value());
+        EXPECT_EQ(**res, pps::compatibility_level::full_transitive);
+    }
+    {
+        auto reader = reader_over([](mock_client& m) {
+            EXPECT_CALL(m, request_and_collect_response(_, _, _))
+              .WillOnce(
+                respond(bh::status::not_found, R"({"error_code": 40408})"));
+        });
+        ss::abort_source as;
+        auto res = reader
+                     .read_config(pps::context_subject::unqualified("s1"), as)
+                     .get();
+        reader.stop().get();
+        ASSERT_TRUE(res.has_value());
+        EXPECT_FALSE(res->has_value());
+    }
+    {
+        auto reader = reader_over([](mock_client& m) {
+            EXPECT_CALL(m, request_and_collect_response(_, _, _))
+              .WillOnce(respond(
+                bh::status::ok, R"({"compatibilityLevel":"WEIRD_LEVEL"})"));
+        });
+        ss::abort_source as;
+        auto res = reader
+                     .read_config(pps::context_subject::unqualified("s1"), as)
+                     .get();
+        reader.stop().get();
+        ASSERT_FALSE(res.has_value());
+        EXPECT_EQ(res.error().kind, srs::source_error_kind::operation_failed);
+    }
+}
+
 // A null config (not in API mode) or an unparseable URL yields an unavailable
 // reader, so the link parks rather than faulting.
 TEST(http_source_reader, factory_parks_on_missing_or_unparseable_config) {

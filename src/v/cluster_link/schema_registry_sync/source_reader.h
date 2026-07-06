@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <optional>
 
 namespace cluster_link::schema_registry_sync {
 
@@ -76,6 +77,18 @@ public:
     /// schema-body fetch path: called for every node it discovers and imports.
     virtual ss::future<source_result<ppsr::stored_schema>> read_subject_version(
       ppsr::context_subject, ppsr::schema_version, ss::abort_source&) = 0;
+
+    /// Reads the source's own (non-inherited) mode override for a subject or
+    /// context: nullopt for no explicit override (subject_mode_not_found), a
+    /// value to mirror, or an operation_failed error for a mode Redpanda cannot
+    /// represent (e.g. FORWARD), which the caller counts rather than treating
+    /// as nullopt.
+    virtual ss::future<source_result<std::optional<ppsr::mode>>>
+    read_mode(ppsr::context_subject, ss::abort_source&) = 0;
+
+    /// As read_mode, for the compatibility-level override.
+    virtual ss::future<source_result<std::optional<ppsr::compatibility_level>>>
+    read_config(ppsr::context_subject, ss::abort_source&) = 0;
 
     /// Releases any resources the reader holds (e.g. an HTTP transport). Called
     /// once before the reader is destroyed; the default is a no-op for readers

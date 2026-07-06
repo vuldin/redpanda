@@ -120,6 +120,17 @@ struct fake_source_state {
     // nodes, letting a test inject a mid-run source fault (e.g.
     // source_unavailable).
     chunked_hash_map<ppsr::subject_version, srs::source_error> read_errors;
+    // Source own-override modes/configs, keyed by subject or context-only
+    // target. Absence means "no explicit override" (read_mode/read_config
+    // return nullopt). The default context, if present, models the global
+    // mode/config.
+    chunked_hash_map<ppsr::context_subject, ppsr::mode> modes;
+    chunked_hash_map<ppsr::context_subject, ppsr::compatibility_level> configs;
+    // Forces read_mode/read_config to fail for specific targets, letting a test
+    // model an unmappable source value (operation_failed) or a fault.
+    chunked_hash_map<ppsr::context_subject, srs::source_error> read_mode_errors;
+    chunked_hash_map<ppsr::context_subject, srs::source_error>
+      read_config_errors;
 
     void fail_read(
       const ppsr::context_subject& sub,
@@ -253,6 +264,32 @@ public:
           srs::source_error{
             .kind = srs::source_error_kind::operation_failed,
             .message = "not found in source"});
+    }
+
+    ss::future<srs::source_result<std::optional<ppsr::mode>>>
+    read_mode(ppsr::context_subject sub, ss::abort_source&) override {
+        if (
+          auto it = _state->read_mode_errors.find(sub);
+          it != _state->read_mode_errors.end()) {
+            co_return std::unexpected(it->second);
+        }
+        if (auto it = _state->modes.find(sub); it != _state->modes.end()) {
+            co_return std::optional<ppsr::mode>{it->second};
+        }
+        co_return std::optional<ppsr::mode>{std::nullopt};
+    }
+
+    ss::future<srs::source_result<std::optional<ppsr::compatibility_level>>>
+    read_config(ppsr::context_subject sub, ss::abort_source&) override {
+        if (
+          auto it = _state->read_config_errors.find(sub);
+          it != _state->read_config_errors.end()) {
+            co_return std::unexpected(it->second);
+        }
+        if (auto it = _state->configs.find(sub); it != _state->configs.end()) {
+            co_return std::optional<ppsr::compatibility_level>{it->second};
+        }
+        co_return std::optional<ppsr::compatibility_level>{std::nullopt};
     }
 
 private:

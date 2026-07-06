@@ -46,6 +46,12 @@ public:
     ss::future<source_result<ppsr::stored_schema>> read_subject_version(
       ppsr::context_subject, ppsr::schema_version, ss::abort_source&) override;
 
+    ss::future<source_result<std::optional<ppsr::mode>>>
+    read_mode(ppsr::context_subject, ss::abort_source&) override;
+
+    ss::future<source_result<std::optional<ppsr::compatibility_level>>>
+    read_config(ppsr::context_subject, ss::abort_source&) override;
+
 private:
     source_error unavailable() const;
 

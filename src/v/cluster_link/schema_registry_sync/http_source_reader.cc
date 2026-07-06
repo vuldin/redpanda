@@ -78,6 +78,51 @@ source_error to_source_error(rc::domain_error err) {
     return source_error{.kind = kind, .message = fmt::format("{}", err)};
 }
 
+// Narrow the open-enum source mode to Redpanda's mode. READONLY_OVERRIDE is
+// preserved as read_only; FORWARD and unknown have no representation and yield
+// nullopt, which the caller counts as a per-item error.
+std::optional<ppsr::mode> narrow_mode(rc::registry_mode m) {
+    switch (m) {
+    case rc::registry_mode::read_write:
+        return ppsr::mode::read_write;
+    case rc::registry_mode::read_only:
+    case rc::registry_mode::read_only_override:
+        return ppsr::mode::read_only;
+    case rc::registry_mode::import:
+        return ppsr::mode::import;
+    case rc::registry_mode::forward:
+    case rc::registry_mode::unknown:
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+// Narrow the open-enum compatibility level to Redpanda's closed enum; only
+// unknown has no representation and yields nullopt.
+std::optional<ppsr::compatibility_level>
+narrow_compat(rc::registry_compatibility_level c) {
+    using enum rc::registry_compatibility_level;
+    switch (c) {
+    case none:
+        return ppsr::compatibility_level::none;
+    case backward:
+        return ppsr::compatibility_level::backward;
+    case backward_transitive:
+        return ppsr::compatibility_level::backward_transitive;
+    case forward:
+        return ppsr::compatibility_level::forward;
+    case forward_transitive:
+        return ppsr::compatibility_level::forward_transitive;
+    case full:
+        return ppsr::compatibility_level::full;
+    case full_transitive:
+        return ppsr::compatibility_level::full_transitive;
+    case unknown:
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 std::optional<net::unresolved_address>
@@ -243,6 +288,78 @@ http_source_reader::read_subject_version(
     // Unmodeled response fields (parsed_schema::unknown_fields) are ignored;
     // honoring the unsupported-feature policy is future work.
     co_return std::move(res.value().schema);
+}
+
+ss::future<source_result<std::optional<ppsr::mode>>>
+http_source_reader::read_mode(ppsr::context_subject sub, ss::abort_source& as) {
+    auto units = co_await ss::get_units(_inflight, 1, as);
+    auto client = co_await ensure_client(as);
+    if (!client.has_value()) {
+        co_return std::unexpected(std::move(client.error()));
+    }
+    retry_chain_node rtc(as, request_timeout, request_backoff);
+    // Prefer GET /mode over GET /mode/. for the default context to be
+    // backwards-compatible with a source that does not implement contexts.
+    auto res = sub.is_default_context()
+                 ? co_await client.value()->get_mode(rtc)
+                 : co_await client.value()->get_subject_mode(
+                     sub, rtc, ppsr::default_to_global::no);
+    if (!res.has_value()) {
+        if (std::holds_alternative<rc::subject_mode_not_found>(res.error())) {
+            co_return std::optional<ppsr::mode>{std::nullopt};
+        }
+        co_return std::unexpected(to_source_error(std::move(res.error())));
+    }
+    auto narrowed = narrow_mode(res.value().mode);
+    if (!narrowed.has_value()) {
+        co_return std::unexpected(
+          source_error{
+            .kind = source_error_kind::operation_failed,
+            .message = fmt::format(
+              "source mode '{}' of {} is not supported by the destination",
+              res.value().raw,
+              sub)});
+    }
+    co_return narrowed;
+}
+
+ss::future<source_result<std::optional<ppsr::compatibility_level>>>
+http_source_reader::read_config(
+  ppsr::context_subject sub, ss::abort_source& as) {
+    auto units = co_await ss::get_units(_inflight, 1, as);
+    auto client = co_await ensure_client(as);
+    if (!client.has_value()) {
+        co_return std::unexpected(std::move(client.error()));
+    }
+    retry_chain_node rtc(as, request_timeout, request_backoff);
+    // Prefer GET /config over GET /config/. for the default context to be
+    // backwards-compatible with a source that does not implement contexts.
+    auto res = sub.is_default_context()
+                 ? co_await client.value()->get_config(rtc)
+                 : co_await client.value()->get_subject_config(
+                     sub, rtc, ppsr::default_to_global::no);
+    if (!res.has_value()) {
+        if (std::holds_alternative<rc::subject_config_not_found>(res.error())) {
+            co_return std::optional<ppsr::compatibility_level>{std::nullopt};
+        }
+        co_return std::unexpected(to_source_error(std::move(res.error())));
+    }
+    auto narrowed = narrow_compat(res.value().level);
+    if (!narrowed.has_value()) {
+        co_return std::unexpected(
+          source_error{
+            .kind = source_error_kind::operation_failed,
+            .message = fmt::format(
+              "source compatibility level '{}' of {} is not supported by the "
+              "destination",
+              res.value().raw,
+              sub)});
+    }
+    // Unsupported config fields (config_info::unknown_fields, e.g.
+    // defaultRuleSet or compatibilityGroup) are ignored; honoring
+    // unsupported_schema_feature_policy is future work, as it is for the
+    // schema-body path in read_subject_version.
+    co_return narrowed;
 }
 
 ss::future<> http_source_reader::stop() {
