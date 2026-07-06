@@ -148,6 +148,14 @@ private:
       ss::abort_source& as,
       std::optional<source_error>& unavailable);
 
+    /// Replicates one target's (subject or context-only) source mode and
+    /// compatibility config onto the destination: writes the source's own
+    /// override when it has one, deletes the destination override otherwise.
+    ss::future<> sync_mode_and_config(
+      const ppsr::context_subject& target,
+      ss::abort_source& as,
+      std::optional<source_error>& unavailable);
+
     // Requires a sync in progress (`current_sync` engaged).
     void record_error(std::string_view what);
 

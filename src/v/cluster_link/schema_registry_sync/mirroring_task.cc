@@ -19,6 +19,7 @@
 #include "container/chunked_vector.h"
 #include "model/namespace.h"
 #include "pandaproxy/schema_registry/types.h"
+#include "ssx/future-util.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/loop.hh>
@@ -210,6 +211,78 @@ ss::future<> mirroring_task::refresh_destination_inventory(
       subjects.size());
     _status.inventory.destination_subject_versions = static_cast<uint64_t>(
       _destination_inventory.active.size());
+}
+
+ss::future<> mirroring_task::sync_mode_and_config(
+  const ppsr::context_subject& target,
+  ss::abort_source& as,
+  std::optional<source_error>& unavailable) {
+    // A peer fiber already hit source_unavailable; skip the remaining work.
+    if (unavailable.has_value()) {
+        co_return;
+    }
+    auto mode = co_await _reader->read_mode(target, as);
+    if (!mode.has_value()) {
+        if (mode.error().kind == source_error_kind::source_unavailable) {
+            if (!unavailable.has_value()) {
+                unavailable = std::move(mode.error());
+            }
+            co_return;
+        }
+        // Unmappable value or other reachable failure: count and continue.
+        record_error(mode.error().message);
+    } else {
+        // Present -> mirror the override; absent -> remove any destination
+        // override
+        auto write = co_await ss::coroutine::as_future(
+          mode.value().has_value()
+            ? _destination->write_mode(target, *mode.value())
+            : _destination->delete_mode(target));
+        if (write.failed()) {
+            auto ex = write.get_exception();
+            if (ssx::is_shutdown_exception(ex)) {
+                std::rethrow_exception(ex);
+            }
+            record_error(
+              fmt::format("failed to sync mode for {}: {}", target, ex));
+        } else if (write.get()) {
+            ++_status.current_sync->summary.modes_changed;
+            ++_status.totals_since_task_start.modes_changed;
+        }
+    }
+
+    if (unavailable.has_value()) {
+        co_return;
+    }
+    auto config = co_await _reader->read_config(target, as);
+    if (!config.has_value()) {
+        if (config.error().kind == source_error_kind::source_unavailable) {
+            if (!unavailable.has_value()) {
+                unavailable = std::move(config.error());
+            }
+            co_return;
+        }
+        record_error(config.error().message);
+        co_return;
+    }
+
+    auto write = co_await ss::coroutine::as_future(
+      config.value().has_value()
+        ? _destination->write_config(target, *config.value())
+        : _destination->delete_config(target));
+    if (write.failed()) {
+        auto ex = write.get_exception();
+        if (ssx::is_shutdown_exception(ex)) {
+            std::rethrow_exception(ex);
+        }
+        record_error(
+          fmt::format("failed to sync config for {}: {}", target, ex));
+        co_return;
+    }
+    if (write.get()) {
+        ++_status.current_sync->summary.compatibility_configs_changed;
+        ++_status.totals_since_task_start.compatibility_configs_changed;
+    }
 }
 
 void mirroring_task::record_error(std::string_view what) {
@@ -415,6 +488,39 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
       += stats.versions_changed;
     _status.totals_since_task_start.errors += stats.errors;
 
+    // Replicate modes/configs after the import (the destination contexts and
+    // subjects now exist)
+    chunked_vector<ppsr::context_subject> mode_config_targets;
+
+    // The registry-wide global mode/config (GET /mode/:.__GLOBAL:) is synced
+    // only when in scope.
+    const auto global = ppsr::context_subject{
+      ppsr::global_context, ppsr::subject{""}};
+    if (in_scope(global)) {
+        mode_config_targets.push_back(global);
+    }
+    for (const auto& ctx : contexts) {
+        // A context in scope only via a subject filter is not in scope as a
+        // whole, so its context-level mode/config must not be touched.
+        ppsr::context_subject ctx_target{ctx, ppsr::subject{""}};
+        if (in_scope(ctx_target)) {
+            mode_config_targets.push_back(std::move(ctx_target));
+        }
+    }
+    for (const auto& subject : subjects) {
+        mode_config_targets.push_back(subject);
+    }
+    std::optional<source_error> mc_unavailable;
+    co_await ss::max_concurrent_for_each(
+      mode_config_targets,
+      std::max<size_t>(1, limits.parallelism),
+      [&](const ppsr::context_subject& target) {
+          return sync_mode_and_config(target, as, mc_unavailable);
+      });
+    if (mc_unavailable.has_value()) {
+        co_return make_unavailable(mc_unavailable->message);
+    }
+
     // Re-scan now that imports have landed so the reported destination counts
     // reflect the post-sync state, not the pre-import baseline the diff used.
     co_await refresh_destination_inventory(in_scope, as);
@@ -422,12 +528,15 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
     vlog(
       logger().info,
       "Schema Registry full sync: {} source subjects ({} versions), {} "
-      "destination subjects; imported {} versions, {} errors",
+      "destination subjects; imported {} versions, {} modes, {} configs, {} "
+      "errors",
       _status.inventory.selected_source_subjects,
       _status.inventory.selected_source_subject_versions,
       _status.inventory.destination_subjects,
       stats.versions_changed,
-      stats.errors);
+      _status.current_sync->summary.modes_changed,
+      _status.current_sync->summary.compatibility_configs_changed,
+      _status.current_sync->summary.errors);
 
     _status.current_sync->summary.finish_time = ::model::timestamp::now();
     _status.last_full_sync = _status.current_sync->summary;

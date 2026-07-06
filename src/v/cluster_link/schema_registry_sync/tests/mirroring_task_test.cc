@@ -502,6 +502,163 @@ TEST_F(
     EXPECT_EQ(all[0].deleted, ppsr::is_deleted::yes);
 }
 
+TEST_F(mirroring_task_test, replicates_modes_and_configs) {
+    auto orders = ppsr::context_subject::unqualified("orders-value");
+    _source_state.add(orders, 1);
+    // A subject-level mode and compatibility override on the source.
+    _source_state.modes.emplace(orders, ppsr::mode::read_only);
+    _source_state.configs.emplace(orders, ppsr::compatibility_level::full);
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+
+    // Exactly one mode and one config change: the subject override. The
+    // context-level and global targets have no source override, so their
+    // no-op deletes do not count.
+    EXPECT_EQ(status->last_full_sync->modes_changed, 1);
+    EXPECT_EQ(status->last_full_sync->compatibility_configs_changed, 1);
+    EXPECT_EQ(status->last_full_sync->errors, 0);
+
+    ASSERT_TRUE(_registry.modes().contains(orders));
+    EXPECT_EQ(_registry.modes().at(orders), ppsr::mode::read_only);
+    ASSERT_TRUE(_registry.configs().contains(orders));
+    EXPECT_EQ(_registry.configs().at(orders), ppsr::compatibility_level::full);
+
+    // A second full sync over unchanged source state applies nothing: the
+    // destination writes short-circuit, so the per-sync counters stay zero
+    // (the totals do not double-count).
+    fixture()->update_link(model::id_t{0}, get_default_metadata()).get();
+    auto second = wait_for_sync_status([&](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value()
+                             && s.last_full_sync->finish_time
+                                  != status->last_full_sync->finish_time;
+                  }).get();
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->last_full_sync->modes_changed, 0);
+    EXPECT_EQ(second->last_full_sync->compatibility_configs_changed, 0);
+    EXPECT_EQ(second->totals_since_task_start.modes_changed, 1);
+    EXPECT_EQ(second->totals_since_task_start.compatibility_configs_changed, 1);
+}
+
+TEST_F(mirroring_task_test, removes_destination_override_absent_at_source) {
+    auto orders = ppsr::context_subject::unqualified("orders-value");
+    // The destination carries mode/config overrides from a prior state; the
+    // source subject exists but has no explicit override. The sync must remove
+    // the stale destination overrides.
+    seed_destination("orders-value", 1);
+    _registry.write_mode(orders, ppsr::mode::read_only).get();
+    _registry.write_config(orders, ppsr::compatibility_level::full).get();
+    _source_state.add(orders, 1);
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+
+    EXPECT_EQ(status->last_full_sync->modes_changed, 1);
+    EXPECT_EQ(status->last_full_sync->compatibility_configs_changed, 1);
+    EXPECT_FALSE(_registry.modes().contains(orders));
+    EXPECT_FALSE(_registry.configs().contains(orders));
+}
+
+TEST_F(mirroring_task_test, unmappable_source_mode_counted_not_applied) {
+    auto orders = ppsr::context_subject::unqualified("orders-value");
+    _source_state.add(orders, 1);
+    // The source reports a mode Redpanda cannot represent (the http reader
+    // surfaces this as operation_failed); it must be counted as a per-item
+    // error and skipped, not applied to the destination.
+    _source_state.read_mode_errors.emplace(
+      orders,
+      srs::source_error{
+        .kind = srs::source_error_kind::operation_failed,
+        .message = "source mode 'FORWARD' is not supported"});
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+
+    // Exactly one error: the single unmappable mode. Every other target (the
+    // subject's config, the default-context mode/config) is a no-op.
+    EXPECT_EQ(status->last_full_sync->errors, 1);
+    EXPECT_EQ(status->last_full_sync->modes_changed, 0);
+    // The unmappable mode does not block the subject's config sync, which has
+    // no source override here and so applies nothing.
+    EXPECT_FALSE(_registry.modes().contains(orders));
+}
+
+TEST_F(mirroring_task_test, syncs_global_context_mode_and_config) {
+    // An unfiltered sync mirrors the registry-wide global (.__GLOBAL)
+    // mode/config, even though it is not a listable context and holds no
+    // subject.
+    auto global = ppsr::context_subject{
+      ppsr::global_context, ppsr::subject{""}};
+    _source_state.add(ppsr::context_subject::unqualified("orders-value"), 1);
+    _source_state.modes.emplace(global, ppsr::mode::read_only);
+    _source_state.configs.emplace(global, ppsr::compatibility_level::full);
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+
+    ASSERT_TRUE(_registry.modes().contains(global));
+    EXPECT_EQ(_registry.modes().at(global), ppsr::mode::read_only);
+    ASSERT_TRUE(_registry.configs().contains(global));
+    EXPECT_EQ(_registry.configs().at(global), ppsr::compatibility_level::full);
+    // Exactly the global mode + global config change (no subject/context
+    // override in this DAG).
+    EXPECT_EQ(status->last_full_sync->modes_changed, 1);
+    EXPECT_EQ(status->last_full_sync->compatibility_configs_changed, 1);
+}
+
+TEST_F(mirroring_task_test, skips_global_context_mode_when_filtered_out) {
+    // A link scoped to a specific context must leave the registry-wide global
+    // (.__GLOBAL) alone -- it is synced only by an unfiltered sync or a filter
+    // that names the global context.
+    auto global = ppsr::context_subject{
+      ppsr::global_context, ppsr::subject{""}};
+    auto orders = ppsr::context_subject::unqualified("orders-value");
+    _source_state.add(orders, 1);
+    _source_state.modes.emplace(global, ppsr::mode::read_only);
+
+    auto metadata = get_default_metadata();
+    metadata.configuration.schema_registry_sync_cfg.api_mode()
+      ->filter.contexts.push_back(std::string{ppsr::default_context()});
+
+    lead_schema_registry();
+    fixture()->upsert_link(std::move(metadata)).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+
+    // The source global override is neither read nor written.
+    EXPECT_FALSE(_registry.modes().contains(global));
+    EXPECT_EQ(status->last_full_sync->modes_changed, 0);
+}
+
 TEST_F(mirroring_task_test, pauses_when_config_paused) {
     lead_schema_registry();
     fixture()->upsert_link(get_default_metadata()).get();
