@@ -141,10 +141,22 @@ private:
     ss::abort_source& _as;
     cloud_io::group_id _gid;
 
+    /// Outcome of an in-flight chunk fetch, published to coalesced waiters.
+    /// Failure is encoded as a value.
+    enum class chunk_fetch_outcome : uint8_t {
+        /// The object exists and the chunk was hydrated into the cache.
+        present,
+        /// The object does not exist (404).
+        absent,
+        /// The fetch failed transiently.
+        failed,
+    };
+
     // In-flight chunk fetches keyed by chunk start. An entry exists only while
-    // a download is in progress; the value is true if the object exists, false
-    // on 404. Coalesces concurrent fetches of the same chunk.
-    chunked_hash_map<uint64_t, ss::shared_future<bool>> _in_flight;
+    // a download is in progress. Coalesces concurrent fetches of the same
+    // chunk.
+    chunked_hash_map<uint64_t, ss::shared_future<chunk_fetch_outcome>>
+      _in_flight;
     ss::gate _gate;
 };
 

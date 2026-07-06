@@ -170,26 +170,43 @@ chunked_remote_file_reader::ensure_chunk_cached(
         }
         if (auto it = _in_flight.find(chunk.start); it != _in_flight.end()) {
             auto found_fut = it->second.get_future();
-            // A download is already in flight. Wait for it, then re-open in
-            // the next iteration.
-            if (!co_await std::move(found_fut)) {
+            // A download is already in flight. Wait for its outcome, then
+            // re-open in the next iteration.
+            switch (co_await std::move(found_fut)) {
+            case chunk_fetch_outcome::present:
+                break; // fall through and re-open from cache
+            case chunk_fetch_outcome::absent:
                 co_return std::nullopt;
+            case chunk_fetch_outcome::failed:
+                // The leader's fetch failed and rethrew the underlying error to
+                // its own caller. Surface an equivalent failure here rather
+                // than routing an exception through the shared future, which
+                // could be dropped as an ignored exceptional future if a waiter
+                // is torn down during shutdown.
+                throw io_error_exception(
+                  "in-flight fetch of chunk {} of {} failed",
+                  chunk.start,
+                  _key);
             }
         } else {
             // There isn't an in-flight download; kick one off and publish a
             // shared future.
-            ss::shared_promise<bool> sp;
+            ss::shared_promise<chunk_fetch_outcome> sp;
             _in_flight.emplace(chunk.start, sp.get_shared_future());
             auto fetched = co_await ss::coroutine::as_future(
               download_chunk(chunk, parent));
             _in_flight.erase(chunk.start);
             if (fetched.failed()) {
+                // Publish the failure to waiters and rethrow to
+                // this caller.
                 auto eptr = fetched.get_exception();
-                sp.set_exception(eptr);
+                sp.set_value(chunk_fetch_outcome::failed);
                 std::rethrow_exception(eptr);
             }
             bool found = fetched.get();
-            sp.set_value(found);
+            sp.set_value(
+              found ? chunk_fetch_outcome::present
+                    : chunk_fetch_outcome::absent);
             if (!found) {
                 co_return std::nullopt;
             }
