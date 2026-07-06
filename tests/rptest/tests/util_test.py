@@ -12,7 +12,7 @@ import time
 from ducktape.mark.resource import cluster
 from ducktape.tests.test import Test
 
-from rptest.util import check_consistently, expect_exception
+from rptest.util import ConditionNotHeldError, check_consistently, expect_exception
 
 
 class CheckConsistentlyTest(Test):
@@ -56,7 +56,7 @@ class CheckConsistentlyTest(Test):
             calls += 1
             return False
 
-        with expect_exception(AssertionError, lambda _: True):
+        with expect_exception(ConditionNotHeldError, lambda _: True):
             check_consistently(false_from_start, duration_sec=5, interval_sec=0.01)
         assert calls == 1
 
@@ -68,6 +68,11 @@ class CheckConsistentlyTest(Test):
             calls += 1
             return calls < 3
 
-        with expect_exception(AssertionError, lambda _: True):
+        with expect_exception(ConditionNotHeldError, lambda _: True):
             check_consistently(flips, duration_sec=5, interval_sec=0.001)
         assert calls == 3
+
+    @cluster(num_nodes=0)
+    def test_check_failure_is_still_an_assertion_error(self) -> None:
+        with expect_exception(AssertionError, lambda _: True):
+            check_consistently(lambda: False, duration_sec=5, interval_sec=0.01)

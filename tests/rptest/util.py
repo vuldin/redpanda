@@ -218,6 +218,12 @@ def wait_until_with_progress_check(
     ) from last_exception
 
 
+class ConditionNotHeldError(AssertionError):
+    """Raised when `check_consistently` observes the checked condition returning false."""
+
+    pass
+
+
 def check_consistently(
     condition: Callable[[], bool],
     duration_sec: float,
@@ -232,7 +238,7 @@ def check_consistently(
     asserts that something good eventually happens (it blocks until a
     condition becomes true), whereas `check_consistently` asserts that nothing
     bad happens (it blocks while the condition *remains* true, raising
-    AssertionError the moment it returns false).
+    `ConditionNotHeldError` the moment it returns false).
 
     `condition` is polled every `interval_sec`; the `duration_sec` window is
     measured from after the first poll, so at least `duration_sec` elapses
@@ -258,7 +264,9 @@ def check_consistently(
     def poll() -> None:
         if not condition():
             msg = err_msg() if callable(err_msg) else err_msg
-            raise AssertionError(msg or f"condition did not hold for {duration_sec}s")
+            raise ConditionNotHeldError(
+                msg or f"condition did not hold for {duration_sec}s"
+            )
 
     poll()
     stop = time.monotonic() + duration_sec
