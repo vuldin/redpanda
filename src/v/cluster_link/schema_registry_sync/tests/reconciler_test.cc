@@ -57,6 +57,28 @@ TEST(reconciler, replicates_chain_in_reference_order) {
     EXPECT_LT(ia, ib);
 }
 
+// A read carrying unsupported-feature diagnostics still imports normally: the
+// source_reader interface carries `unsupported` through, but the reconciler
+// does not yet act on it (policy enforcement is a later commit).
+TEST(reconciler, imports_schema_with_unsupported_diagnostics) {
+    reconcile_harness h;
+    auto a = ppsr::context_subject::unqualified("a");
+    h.source.add(a, 1);
+    chunked_vector<ppsr::unsupported_feature> unsupported;
+    unsupported.push_back(
+      ppsr::unsupported_feature{.json_pointer = "/ruleSet"});
+    h.source.set_unsupported(a, 1, std::move(unsupported));
+
+    srs::work_set work;
+    work.upserts.push_back(key(a, 1));
+
+    auto stats = h.run(std::move(work)).get();
+    ASSERT_TRUE(stats.has_value());
+    EXPECT_EQ(stats->versions_changed, 1);
+    EXPECT_EQ(stats->errors, 0);
+    EXPECT_GE(index_of(h.destination.get_all(), "a"), 0);
+}
+
 // Tolerance test: a schema that lists the same reference twice is handled and
 // the referrer still imports referent-first. Holds with or without the dedup.
 TEST(reconciler, duplicate_reference_still_imports) {

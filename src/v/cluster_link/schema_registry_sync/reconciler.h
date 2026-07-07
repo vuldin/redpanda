@@ -160,10 +160,13 @@ private:
     ss::future<source_result<void>>
     do_import(const ppsr::subject_version& n, ss::abort_source& as);
 
-    /// Imports a fetched body, classifying conflicts as per-item failures.
-    /// Returns true on a successful import.
+    /// Imports a fetched read, classifying conflicts as per-item failures.
+    /// Returns true on a successful import. Carries the whole
+    /// source_schema_read (not just the schema) so the unsupported-feature
+    /// policy can act on `read.unsupported` at the single per-node import
+    /// point.
     ss::future<bool>
-    import_body(const ppsr::subject_version& n, ppsr::stored_schema schema);
+    import_body(const ppsr::subject_version& n, ppsr::source_schema_read read);
 
     /// Marks a node replicated and releases dependents whose in-degree hits 0.
     void wake(const ppsr::subject_version& n);

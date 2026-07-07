@@ -289,9 +289,9 @@ reconciler::discover(const ppsr::subject_version& n, ss::abort_source& as) {
         co_return source_result<void>{};
     }
 
-    adjust_units(_mem, units, body_size(fetched.value()));
+    adjust_units(_mem, units, body_size(fetched.value().schema));
 
-    auto refs = resolve_refs(fetched.value());
+    auto refs = resolve_refs(fetched.value().schema);
     chunked_hash_set<ppsr::subject_version> missing;
     for (auto& ref : refs) {
         if (!_in_scope(ref.sub)) {
@@ -369,18 +369,18 @@ reconciler::do_import(const ppsr::subject_version& n, ss::abort_source& as) {
         co_return source_result<void>{};
     }
 
-    adjust_units(_mem, units, body_size(fetched.value()));
+    adjust_units(_mem, units, body_size(fetched.value().schema));
 
     co_await import_body(n, std::move(fetched.value()));
     co_return source_result<void>{};
 }
 
 ss::future<bool> reconciler::import_body(
-  const ppsr::subject_version& n, ppsr::stored_schema schema) {
+  const ppsr::subject_version& n, ppsr::source_schema_read read) {
     data(n).state = node_state::importing;
     // The graph key `n` stays in the source namespace; only the schema written
     // to the destination is remapped.
-    auto remapped = remap_for_import(*_mapper, std::move(schema));
+    auto remapped = remap_for_import(*_mapper, std::move(read.schema));
     if (!remapped.has_value()) {
         vlog(
           cllog.warn,

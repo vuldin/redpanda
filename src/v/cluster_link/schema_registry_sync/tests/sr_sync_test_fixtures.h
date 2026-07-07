@@ -141,6 +141,21 @@ struct fake_source_state {
           std::move(err));
     }
 
+    // Unsupported features to attach to a specific (subject, version)'s read,
+    // letting a test drive the reconciler's unsupported-feature policy.
+    chunked_hash_map<
+      ppsr::subject_version,
+      chunked_vector<ppsr::unsupported_feature>>
+      unsupported_features;
+
+    void set_unsupported(
+      const ppsr::context_subject& sub,
+      int32_t version,
+      chunked_vector<ppsr::unsupported_feature> features) {
+        unsupported_features[ppsr::subject_version{
+          sub, ppsr::schema_version{version}}] = std::move(features);
+    }
+
     void add(
       const ppsr::context_subject& sub,
       int32_t version,
@@ -244,7 +259,8 @@ public:
         co_return versions;
     }
 
-    ss::future<srs::source_result<ppsr::stored_schema>> read_subject_version(
+    ss::future<srs::source_result<ppsr::source_schema_read>>
+    read_subject_version(
       ppsr::context_subject sub,
       ppsr::schema_version version,
       ss::abort_source&) override {
@@ -257,7 +273,15 @@ public:
         }
         for (const auto& s : _state->schemas) {
             if (s.schema.sub() == sub && s.version == version) {
-                co_return s.share();
+                chunked_vector<ppsr::unsupported_feature> unsupported;
+                if (
+                  auto it = _state->unsupported_features.find(
+                    ppsr::subject_version{sub, version});
+                  it != _state->unsupported_features.end()) {
+                    unsupported = it->second.copy();
+                }
+                co_return ppsr::source_schema_read{
+                  .schema = s.share(), .unsupported = std::move(unsupported)};
             }
         }
         co_return std::unexpected(

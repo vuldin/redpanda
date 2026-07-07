@@ -75,7 +75,11 @@ public:
 
     /// Reads a specific subject version's schema. The reconcile engine's
     /// schema-body fetch path: called for every node it discovers and imports.
-    virtual ss::future<source_result<ppsr::stored_schema>> read_subject_version(
+    /// Returns the schema projected into Redpanda's supported model plus any
+    /// unsupported fields the source carried but Redpanda cannot store, for the
+    /// caller to apply its unsupported-feature policy.
+    virtual ss::future<source_result<ppsr::source_schema_read>>
+    read_subject_version(
       ppsr::context_subject, ppsr::schema_version, ss::abort_source&) = 0;
 
     /// Reads the source's own (non-inherited) mode override for a subject or

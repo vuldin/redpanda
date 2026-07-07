@@ -39,7 +39,7 @@ unavailable_source_reader::list_subject_versions(
     co_return std::unexpected(unavailable());
 }
 
-ss::future<source_result<ppsr::stored_schema>>
+ss::future<source_result<ppsr::source_schema_read>>
 unavailable_source_reader::read_subject_version(
   ppsr::context_subject, ppsr::schema_version, ss::abort_source&) {
     co_return std::unexpected(unavailable());
