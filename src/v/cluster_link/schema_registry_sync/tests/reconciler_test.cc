@@ -57,16 +57,16 @@ TEST(reconciler, replicates_chain_in_reference_order) {
     EXPECT_LT(ia, ib);
 }
 
-// A read carrying unsupported-feature diagnostics still imports normally: the
-// source_reader interface carries `unsupported` through, but the reconciler
-// does not yet act on it (policy enforcement is a later commit).
-TEST(reconciler, imports_schema_with_unsupported_diagnostics) {
+// Under the REMOVE policy a schema carrying unsupported features is imported
+// (only the supported projection is stored) and the removals are counted.
+TEST(reconciler, remove_policy_imports_and_counts_unsupported) {
     reconcile_harness h;
+    h.feature_policy
+      = model::schema_registry_sync_config::unsupported_feature_policy::remove;
     auto a = ppsr::context_subject::unqualified("a");
     h.source.add(a, 1);
-    chunked_vector<ppsr::unsupported_feature> unsupported;
-    unsupported.push_back(
-      ppsr::unsupported_feature{.json_pointer = "/ruleSet"});
+    chunked_vector<ppsr::unsupported_feature> unsupported{
+      {.json_pointer = "/ruleSet"}, {.json_pointer = "/metadata/tags"}};
     h.source.set_unsupported(a, 1, std::move(unsupported));
 
     srs::work_set work;
@@ -75,8 +75,108 @@ TEST(reconciler, imports_schema_with_unsupported_diagnostics) {
     auto stats = h.run(std::move(work)).get();
     ASSERT_TRUE(stats.has_value());
     EXPECT_EQ(stats->versions_changed, 1);
+    EXPECT_EQ(stats->unsupported_features_removed, 2);
     EXPECT_EQ(stats->errors, 0);
     EXPECT_GE(index_of(h.destination.get_all(), "a"), 0);
+}
+
+// Under REMOVE the removed-features counter must reflect only projections that
+// actually landed: a schema carrying unsupported features whose import is
+// rejected counts a single error and leaves unsupported_features_removed at 0.
+TEST(reconciler, remove_policy_does_not_count_on_import_failure) {
+    fake_source_state source;
+    schema::fake_registry inner;
+    failing_import_registry destination{&inner};
+
+    auto a = ppsr::context_subject::unqualified("a");
+    source.add(a, 1);
+    source.set_unsupported(a, 1, {{.json_pointer = "/ruleSet"}});
+    destination.fail_import(
+      key(a, 1), ppsr::error_code::schema_invalid, "unparseable body");
+
+    srs::work_set work;
+    work.upserts.push_back(key(a, 1));
+
+    fake_source_reader reader{&source};
+    srs::context_mapper mapper;
+    srs::reconciler::limits lim{
+      .memory_bytes = no_memory_limit, .parallelism = 1};
+    auto r = srs::reconciler{
+      &reader,
+      &destination,
+      [](const ppsr::context_subject&) { return true; },
+      mapper,
+      lim,
+      model::schema_registry_sync_config::unsupported_feature_policy::remove};
+
+    ss::abort_source as;
+    srs::reconcile_stats stats;
+    auto res = r.reconcile(std::move(work), {}, stats, as).get();
+
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(stats.errors, 1);
+    EXPECT_EQ(stats.versions_changed, 0);
+    EXPECT_EQ(stats.unsupported_features_removed, 0);
+    EXPECT_EQ(index_of(inner.get_all(), "a"), -1);
+}
+
+// Under the FAIL policy an unsupported feature is a per-item failure, not a
+// whole-sync abort: the offending node is counted as an error and skipped
+// (never imported), while the rest of the work still replicates.
+TEST(reconciler, fail_policy_counts_and_skips_unsupported) {
+    reconcile_harness h;
+    h.feature_policy
+      = model::schema_registry_sync_config::unsupported_feature_policy::fail;
+    auto a = ppsr::context_subject::unqualified("a"); // unsupported -> skipped
+    auto b = ppsr::context_subject::unqualified("b"); // clean -> imported
+    h.source.add(a, 1);
+    h.source.add(b, 1);
+    h.source.set_unsupported(a, 1, {{.json_pointer = "/ruleSet"}});
+
+    srs::work_set work;
+    work.upserts.push_back(key(a, 1));
+    work.upserts.push_back(key(b, 1));
+
+    // The run completes (no throw); the unsupported node is counted and
+    // skipped.
+    auto stats = h.run(std::move(work)).get();
+    ASSERT_TRUE(stats.has_value());
+    EXPECT_EQ(stats->errors, 1);
+    EXPECT_EQ(stats->versions_changed, 1);
+    EXPECT_EQ(stats->unsupported_features_removed, 0);
+    EXPECT_EQ(index_of(h.destination.get_all(), "a"), -1);
+    EXPECT_GE(index_of(h.destination.get_all(), "b"), 0);
+}
+
+// Under FAIL a rejected schema is skipped before its references are queued, so
+// a reference pulled in solely for the rejected schema is not dragged into the
+// destination. Here b references a and only b is selected for replication; b
+// turns out to carry unsupported features (discovered on fetch) and is
+// rejected, so a -- reachable only as b's reference -- is never imported.
+TEST(reconciler, fail_policy_skips_references_of_rejected_schema) {
+    reconcile_harness h;
+    h.feature_policy
+      = model::schema_registry_sync_config::unsupported_feature_policy::fail;
+    auto a = ppsr::context_subject::unqualified("a"); // ref of b, pulled for b
+    auto b = ppsr::context_subject::unqualified("b"); // unsupported -> rejected
+    h.source.add(a, 1);
+    h.source.add_with_refs(b, 1, refs_to({ref_to(a, 1)}));
+    h.source.set_unsupported(b, 1, {{.json_pointer = "/ruleSet"}});
+
+    // Select only b for replication; a would be discovered solely as b's ref.
+    srs::work_set work;
+    work.upserts.push_back(key(b, 1));
+
+    auto stats = h.run(std::move(work)).get();
+    ASSERT_TRUE(stats.has_value());
+    EXPECT_EQ(stats->errors, 1);
+    EXPECT_EQ(stats->versions_changed, 0);
+    EXPECT_EQ(stats->unsupported_features_removed, 0);
+    EXPECT_EQ(index_of(h.destination.get_all(), "b"), -1);
+    EXPECT_EQ(index_of(h.destination.get_all(), "a"), -1);
+    // a is never even fetched: rejecting b before queuing its references means
+    // a is never discovered/enqueued, not merely dropped before import.
+    EXPECT_EQ(h.source.reads(a, 1), 0);
 }
 
 // Tolerance test: a schema that lists the same reference twice is handled and
@@ -409,7 +509,8 @@ TEST(reconciler, import_errors_are_per_item_and_cascade) {
       &destination,
       [](const ppsr::context_subject&) { return true; },
       mapper,
-      lim};
+      lim,
+      model::schema_registry_sync_config::unsupported_feature_policy::fail};
 
     ss::abort_source as;
     srs::reconcile_stats stats;
@@ -496,7 +597,8 @@ TEST(reconciler, abort_mid_sync_drains_cleanly) {
       &destination,
       [](const ppsr::context_subject&) { return true; },
       mapper,
-      lim};
+      lim,
+      model::schema_registry_sync_config::unsupported_feature_policy::fail};
 
     srs::work_set work;
     work.upserts.push_back(key(ppsr::context_subject::unqualified("a"), 1));
@@ -551,7 +653,8 @@ TEST(reconciler, reports_progress_live) {
       &destination,
       [](const ppsr::context_subject&) { return true; },
       mapper,
-      lim};
+      lim,
+      model::schema_registry_sync_config::unsupported_feature_policy::fail};
 
     srs::work_set work;
     work.upserts.push_back(key(a, 1));
@@ -743,7 +846,8 @@ TEST(reconciler, remaps_context_at_import) {
       &destination,
       [](const ppsr::context_subject&) { return true; },
       mapper,
-      lim};
+      lim,
+      model::schema_registry_sync_config::unsupported_feature_policy::fail};
 
     srs::work_set work;
     work.upserts.push_back(key(base, 1));

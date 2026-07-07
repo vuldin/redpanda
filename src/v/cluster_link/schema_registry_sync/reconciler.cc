@@ -22,6 +22,8 @@
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/util/defer.hh>
 
+#include <fmt/ranges.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -110,12 +112,14 @@ reconciler::reconciler(
   schema::registry* destination,
   ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope,
   const context_mapper& mapper,
-  limits lim)
+  limits lim,
+  model::schema_registry_sync_config::unsupported_feature_policy feature_policy)
   : _source(source)
   , _destination(destination)
   , _in_scope(std::move(in_scope))
   , _mapper(&mapper)
   , _limits(lim)
+  , _feature_policy(feature_policy)
   , _mem(std::max<size_t>(1, lim.memory_bytes), "schema_registry_sync/memory") {
     // Floor the budget so the clamp `min(body_size, memory_bytes)` and the
     // semaphore agree; a degenerate 0 admits one over-budget body at a time.
@@ -138,6 +142,7 @@ ss::future<source_result<void>> reconciler::reconcile(
     _stats = &stats;
     _stats->versions_changed = 0;
     _stats->errors = 0;
+    _stats->unsupported_features_removed = 0;
     _outstanding = 0;
     _done = false;
     _fault.reset();
@@ -316,6 +321,12 @@ reconciler::discover(const ppsr::subject_version& n, ss::abort_source& as) {
         co_return source_result<void>{};
     }
 
+    // Reject under FAIL before queuing references, so a schema we are going to
+    // reject does not drag its dependency subtree into the destination.
+    if (fail_if_contains_unsupported(n, fetched.value().unsupported)) {
+        co_return source_result<void>{};
+    }
+
     // The body is released here (fetched goes out of scope): the node will be
     // re-fetched once its references complete, leading to it being fetched
     // twice in this case; and at most twice on average overall.
@@ -375,8 +386,58 @@ reconciler::do_import(const ppsr::subject_version& n, ss::abort_source& as) {
     co_return source_result<void>{};
 }
 
+bool reconciler::fail_if_contains_unsupported(
+  const ppsr::subject_version& n,
+  const chunked_vector<ppsr::unsupported_feature>& unsupported) {
+    if (
+      _feature_policy
+        != model::schema_registry_sync_config::unsupported_feature_policy::fail
+      || unsupported.empty()) {
+        return false;
+    }
+    // The FAIL policy refuses to import a schema the destination cannot store
+    // faithfully, but this is a per-item failure, not a whole-sync abort: count
+    // it, log the offending fields, and let the rest of the subjects replicate.
+    vlog(
+      cllog.warn,
+      "{}/{} carries {} unsupported schema feature(s) the destination cannot "
+      "store; failing it under the FAIL policy: {}",
+      n.sub,
+      n.version,
+      unsupported.size(),
+      fmt::join(unsupported, ", "));
+    fail(n);
+    return true;
+}
+
+void reconciler::count_if_contains_unsupported_removed(
+  const ppsr::subject_version& n,
+  const chunked_vector<ppsr::unsupported_feature>& unsupported) {
+    if (
+      _feature_policy
+        != model::schema_registry_sync_config::unsupported_feature_policy::
+          remove
+      || unsupported.empty()) {
+        return;
+    }
+    vlog(
+      cllog.info,
+      "Removed {} unsupported schema feature(s) from {}/{}: {}",
+      unsupported.size(),
+      n.sub,
+      n.version,
+      fmt::join(unsupported, ", "));
+    _stats->unsupported_features_removed += unsupported.size();
+}
+
 ss::future<bool> reconciler::import_body(
   const ppsr::subject_version& n, ppsr::source_schema_read read) {
+    // Authoritative policy gate, next to the REMOVE handling below: every
+    // import path funnels through here (discover also rejects early, before
+    // queuing refs).
+    if (fail_if_contains_unsupported(n, read.unsupported)) {
+        co_return false;
+    }
     data(n).state = node_state::importing;
     // The graph key `n` stays in the source namespace; only the schema written
     // to the destination is remapped.
@@ -414,6 +475,10 @@ ss::future<bool> reconciler::import_body(
     }
     data(n).state = node_state::done;
     ++_stats->versions_changed;
+    // Account for REMOVE-stripped features only after the projection actually
+    // lands on the destination, so a failed import does not report features as
+    // removed. Only read.schema was moved above; read.unsupported is intact.
+    count_if_contains_unsupported_removed(n, read.unsupported);
     wake(n);
     co_return true;
 }

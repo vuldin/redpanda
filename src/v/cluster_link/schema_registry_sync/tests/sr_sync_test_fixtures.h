@@ -350,6 +350,9 @@ struct reconcile_harness {
     // that exercise concurrency override `lim` and avoid exact fetch-count
     // assertions.
     srs::reconciler::limits lim{.memory_bytes = 1u << 20, .parallelism = 1};
+    model::schema_registry_sync_config::unsupported_feature_policy
+      feature_policy
+      = model::schema_registry_sync_config::unsupported_feature_policy::fail;
 
     // Identity mapping by default: source and destination contexts coincide, so
     // reconcile tests need no remapping.
@@ -359,7 +362,12 @@ struct reconcile_harness {
       ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope =
         [](const ppsr::context_subject&) { return true; }) {
         return srs::reconciler{
-          &reader, &destination, std::move(in_scope), mapper, lim};
+          &reader,
+          &destination,
+          std::move(in_scope),
+          mapper,
+          lim,
+          feature_policy};
     }
 
     ss::future<srs::source_result<srs::reconcile_stats>>
