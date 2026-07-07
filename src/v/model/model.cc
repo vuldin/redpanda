@@ -990,7 +990,8 @@ fmt::iterator iceberg_mode::format_to(fmt::iterator it) const {
         }
     }
 
-    // Section-based format. Only emit sections that differ from defaults.
+    // Section-based format. Always emit all sections and options so that
+    // defaults are frozen at set-time (prevents schema drift on upgrade).
     bool any = false;
     auto sep = [&]() {
         if (any) {
@@ -1000,9 +1001,6 @@ fmt::iterator iceberg_mode::format_to(fmt::iterator it) const {
     };
 
     auto emit_key_section = [&](const key_config& cfg) {
-        if (cfg.mode == schema_mode::binary) {
-            return;
-        }
         sep();
         it = fmt::format_to(it, "key:mode={}", to_sv(cfg.mode));
         if (!cfg.subject.empty()) {
@@ -1014,37 +1012,18 @@ fmt::iterator iceberg_mode::format_to(fmt::iterator it) const {
     };
 
     auto emit_value_section = [&](const value_config& cfg) {
-        if (cfg.mode == schema_mode::binary && cfg.is_legacy_compatible()) {
-            return;
-        }
         sep();
-        it = fmt::format_to(it, "value:");
-        bool first = true;
-        auto opt = [&](std::string_view k, std::string_view v) {
-            if (!first) {
-                it = fmt::format_to(it, ",");
-            }
-            it = fmt::format_to(it, "{}={}", k, v);
-            first = false;
-        };
-        if (cfg.mode != schema_mode::binary) {
-            opt("mode", to_sv(cfg.mode));
-        }
+        it = fmt::format_to(it, "value:mode={}", to_sv(cfg.mode));
         if (!cfg.subject.empty()) {
-            opt("subject", cfg.subject);
+            it = fmt::format_to(it, ",subject={}", cfg.subject);
         }
         if (!cfg.protobuf_name.empty()) {
-            opt("protobuf_name", cfg.protobuf_name);
+            it = fmt::format_to(it, ",protobuf_name={}", cfg.protobuf_name);
         }
-        if (cfg.layout != value_layout::flat) {
-            opt("layout", to_sv(cfg.layout));
-        }
+        it = fmt::format_to(it, ",layout={}", to_sv(cfg.layout));
     };
 
     auto emit_headers_section = [&](const headers_config& cfg) {
-        if (cfg.value_type == header_schema_mode::binary) {
-            return;
-        }
         sep();
         it = fmt::format_to(it, "headers:value_type={}", to_sv(cfg.value_type));
     };
