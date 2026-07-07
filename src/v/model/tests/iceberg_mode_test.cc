@@ -288,14 +288,20 @@ TEST(IcebergModeFormat, NewKeySchema) {
     enabled e{};
     e.key.mode = sm::schema_id_prefix;
     model::iceberg_mode m{std::move(e)};
-    EXPECT_EQ(to_string(m), "key:mode=schema_id_prefix");
+    EXPECT_EQ(
+      to_string(m),
+      "key:mode=schema_id_prefix;value:mode=binary,layout=flat;"
+      "headers:value_type=binary");
 }
 
 TEST(IcebergModeFormat, NewHeadersString) {
     enabled e{};
     e.headers.value_type = hsm::string;
     model::iceberg_mode m{std::move(e)};
-    EXPECT_EQ(to_string(m), "headers:value_type=string");
+    EXPECT_EQ(
+      to_string(m),
+      "key:mode=binary;value:mode=binary,layout=flat;"
+      "headers:value_type=string");
 }
 
 // New-format string that is equivalent to an old-format string serializes
@@ -540,14 +546,20 @@ TEST(IcebergModeFormat, KeyModeString) {
     enabled e{};
     e.key.mode = sm::string;
     model::iceberg_mode m{std::move(e)};
-    EXPECT_EQ(to_string(m), "key:mode=string");
+    EXPECT_EQ(
+      to_string(m),
+      "key:mode=string;value:mode=binary,layout=flat;"
+      "headers:value_type=binary");
 }
 
 TEST(IcebergModeFormat, ValueModeString) {
     enabled e{};
     e.value.mode = sm::string;
     model::iceberg_mode m{std::move(e)};
-    EXPECT_EQ(to_string(m), "value:mode=string");
+    EXPECT_EQ(
+      to_string(m),
+      "key:mode=binary;value:mode=string,layout=flat;"
+      "headers:value_type=binary");
 }
 
 TEST(IcebergModeFormat, KeyAndValueModeString) {
@@ -555,7 +567,10 @@ TEST(IcebergModeFormat, KeyAndValueModeString) {
     e.key.mode = sm::string;
     e.value.mode = sm::string;
     model::iceberg_mode m{std::move(e)};
-    EXPECT_EQ(to_string(m), "key:mode=string;value:mode=string");
+    EXPECT_EQ(
+      to_string(m),
+      "key:mode=string;value:mode=string,layout=flat;"
+      "headers:value_type=binary");
 }
 
 TEST(IcebergModeStringRoundtrip, KeyModeString) {
@@ -666,7 +681,10 @@ TEST(IcebergModeLayout, FormatNested) {
     e.value.mode = sm::schema_id_prefix;
     e.value.layout = vl::nested;
     model::iceberg_mode m{std::move(e)};
-    EXPECT_EQ(to_string(m), "value:mode=schema_id_prefix,layout=nested");
+    EXPECT_EQ(
+      to_string(m),
+      "key:mode=binary;value:mode=schema_id_prefix,layout=nested;"
+      "headers:value_type=binary");
 }
 
 TEST(IcebergModeLayout, StringRoundtripNested) {
