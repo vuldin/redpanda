@@ -354,6 +354,10 @@ public:
     has_subjects(ppsr::context ctx, ppsr::include_deleted inc) const override {
         return _inner->has_subjects(std::move(ctx), inc);
     }
+    ss::future<chunked_vector<ppsr::context_subject>>
+    get_subjects(ppsr::include_deleted inc) const override {
+        return _inner->get_subjects(inc);
+    }
     ss::future<ppsr::context_schema_id>
     create_schema(ppsr::subject_schema s) override {
         return _inner->create_schema(std::move(s));
