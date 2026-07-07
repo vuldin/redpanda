@@ -497,7 +497,7 @@ redpanda_cc_library(
     ],
     visibility = [":__subpackages__"],
     deps = [
-        ":schema_identifier",
+        ":record_translator",
         "//src/v/base",
     ],
 )

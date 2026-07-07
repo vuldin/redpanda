@@ -283,7 +283,7 @@ ss::future<ss::stop_iteration> record_multiplexer::do_multiplex(
             auto record_type = _record_translator.build_type(
               std::move(key_type), std::move(val_type));
             auto ensure_res = co_await _table_creator.ensure_table(
-              _ntp.tp.topic, _topic_revision, record_type.comps);
+              _ntp.tp.topic, _topic_revision, record_type);
             if (ensure_res.has_error()) {
                 auto e = ensure_res.error();
                 switch (e) {

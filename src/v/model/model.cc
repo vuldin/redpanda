@@ -675,6 +675,16 @@ constexpr std::string_view to_sv(iceberg_mode::header_schema_mode t) {
     __builtin_unreachable();
 }
 
+constexpr std::string_view to_sv(iceberg_mode::value_layout l) {
+    switch (l) {
+    case iceberg_mode::value_layout::flat:
+        return "flat";
+    case iceberg_mode::value_layout::nested:
+        return "nested";
+    }
+    return "unknown";
+}
+
 // Parse "opt1=val1,opt2=val2" into a map, enforcing no duplicate keys and no
 // empty keys or values. An empty string returns an empty map (all defaults).
 std::optional<absl::flat_hash_map<std::string, std::string>>
@@ -776,6 +786,29 @@ parse_extended_iceberg_mode(std::string_view str) {
                 cfg.subject = ss::sstring(v);
             } else if (k == "protobuf_name") {
                 cfg.protobuf_name = ss::sstring(v);
+            } else if (k == "layout") {
+                // layout is value-only; key_config has no layout field.
+                if constexpr (requires { cfg.layout; }) {
+                    using vl = iceberg_mode::value_layout;
+                    auto l = string_switch<std::optional<vl>>(v)
+                               .match("flat", vl::flat)
+                               .match("nested", vl::nested)
+                               .default_match(std::nullopt);
+                    if (!l) {
+                        return std::unexpected(
+                          fmt::format(
+                            "unknown layout '{}' in section '{}'",
+                            v,
+                            sec_name));
+                    }
+                    cfg.layout = *l;
+                } else {
+                    return std::unexpected(
+                      fmt::format(
+                        "layout is only valid in the value section, "
+                        "not '{}'",
+                        sec_name));
+                }
             } else {
                 return std::unexpected(
                   fmt::format(
@@ -790,6 +823,19 @@ parse_extended_iceberg_mode(std::string_view str) {
                 "subject and protobuf_name require mode=schema_latest in "
                 "section '{}'",
                 sec_name));
+        }
+        if constexpr (requires { cfg.layout; }) {
+            using sm = iceberg_mode::schema_mode;
+            if (
+              cfg.layout == iceberg_mode::value_layout::nested
+              && cfg.mode != sm::schema_id_prefix
+              && cfg.mode != sm::schema_latest) {
+                return std::unexpected(
+                  fmt::format(
+                    "layout=nested requires a schema mode "
+                    "(schema_id_prefix or schema_latest) in section '{}'",
+                    sec_name));
+            }
         }
         return {};
     };
@@ -841,7 +887,8 @@ void write_nested(iobuf& out, const iceberg_mode& m) {
     // with the old wire discriminants so that old nodes can read them.
     if (
       e.key == iceberg_mode::key_config{}
-      && e.headers == iceberg_mode::headers_config{}) {
+      && e.headers == iceberg_mode::headers_config{}
+      && e.value.is_legacy_compatible()) {
         switch (e.value.mode) {
         case iceberg_mode::schema_mode::binary:
             write(out, wire_key_value);
@@ -910,9 +957,11 @@ fmt::iterator iceberg_mode::format_to(fmt::iterator it) const {
     }
     const auto& e = std::get<enabled_impl>(_impl);
 
-    // If key and headers are at their defaults the config is expressible as a
-    // legacy string; prefer that for maximal compatibility.
-    if (e.key == key_config{} && e.headers == headers_config{}) {
+    // If key, headers, and value are legacy-compatible the config is
+    // expressible as a legacy string; prefer that for maximal compatibility.
+    if (
+      e.key == key_config{} && e.headers == headers_config{}
+      && e.value.is_legacy_compatible()) {
         switch (e.value.mode) {
         case schema_mode::binary:
             return fmt::format_to(it, "key_value");
@@ -950,12 +999,12 @@ fmt::iterator iceberg_mode::format_to(fmt::iterator it) const {
         any = true;
     };
 
-    auto emit_schema_section = [&](std::string_view name, const auto& cfg) {
+    auto emit_key_section = [&](const key_config& cfg) {
         if (cfg.mode == schema_mode::binary) {
-            return; // all defaults, omit
+            return;
         }
         sep();
-        it = fmt::format_to(it, "{}:mode={}", name, to_sv(cfg.mode));
+        it = fmt::format_to(it, "key:mode={}", to_sv(cfg.mode));
         if (!cfg.subject.empty()) {
             it = fmt::format_to(it, ",subject={}", cfg.subject);
         }
@@ -964,14 +1013,45 @@ fmt::iterator iceberg_mode::format_to(fmt::iterator it) const {
         }
     };
 
-    emit_schema_section("key", e.key);
-    emit_schema_section("value", e.value);
-
-    if (e.headers.value_type != header_schema_mode::binary) {
+    auto emit_value_section = [&](const value_config& cfg) {
+        if (cfg.mode == schema_mode::binary && cfg.is_legacy_compatible()) {
+            return;
+        }
         sep();
-        it = fmt::format_to(
-          it, "headers:value_type={}", to_sv(e.headers.value_type));
-    }
+        it = fmt::format_to(it, "value:");
+        bool first = true;
+        auto opt = [&](std::string_view k, std::string_view v) {
+            if (!first) {
+                it = fmt::format_to(it, ",");
+            }
+            it = fmt::format_to(it, "{}={}", k, v);
+            first = false;
+        };
+        if (cfg.mode != schema_mode::binary) {
+            opt("mode", to_sv(cfg.mode));
+        }
+        if (!cfg.subject.empty()) {
+            opt("subject", cfg.subject);
+        }
+        if (!cfg.protobuf_name.empty()) {
+            opt("protobuf_name", cfg.protobuf_name);
+        }
+        if (cfg.layout != value_layout::flat) {
+            opt("layout", to_sv(cfg.layout));
+        }
+    };
+
+    auto emit_headers_section = [&](const headers_config& cfg) {
+        if (cfg.value_type == header_schema_mode::binary) {
+            return;
+        }
+        sep();
+        it = fmt::format_to(it, "headers:value_type={}", to_sv(cfg.value_type));
+    };
+
+    emit_key_section(e.key);
+    emit_value_section(e.value);
+    emit_headers_section(e.headers);
 
     return it;
 }

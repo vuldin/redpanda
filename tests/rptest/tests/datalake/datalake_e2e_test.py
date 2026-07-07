@@ -1803,6 +1803,100 @@ message_type {
                 f_name = f_tuple[0]
                 validate_data_file_path(f_name)
 
+    @cluster(num_nodes=3)
+    @matrix(
+        cloud_storage_type=supported_storage_types(),
+        catalog_type=[CatalogType.REST_JDBC],
+    )
+    def test_iceberg_value_layout(self, cloud_storage_type, catalog_type):
+        """Verify layout=flat and layout=nested produce the expected Iceberg
+        schema shapes and that values are queryable via Spark SQL.
+
+        Flat layout (default): user schema fields are promoted to the top
+        level of the row alongside the 'redpanda' system struct.
+
+        Nested layout: all user fields are wrapped inside a top-level
+        'value' struct, keeping the user schema separate from system fields.
+        """
+        layout_schema_str = json.dumps(
+            {
+                "type": "record",
+                "name": "LayoutTest",
+                "fields": [
+                    {"name": "mynum", "type": "int"},
+                    {"name": "mylong", "type": "long"},
+                ],
+            }
+        )
+        flat_topic = "flat_layout"
+        nested_topic = "nested_layout"
+        record = {"mynum": 42, "mylong": 99}
+
+        with DatalakeServices(
+            self.test_ctx,
+            redpanda=self.redpanda,
+            include_query_engines=[QueryEngineType.SPARK],
+            catalog_type=catalog_type,
+        ) as dl:
+            dl.create_iceberg_enabled_topic(
+                flat_topic,
+                iceberg_mode="value:mode=schema_id_prefix",
+            )
+            dl.create_iceberg_enabled_topic(
+                nested_topic,
+                iceberg_mode="value:mode=schema_id_prefix,layout=nested",
+            )
+
+            schema = avro.loads(layout_schema_str)
+            producer = AvroProducer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "schema.registry.url": self.redpanda.schema_reg().split(",")[0],
+                },
+                default_value_schema=schema,
+            )
+            producer.produce(topic=flat_topic, value=record)
+            producer.produce(topic=nested_topic, value=record)
+            producer.flush()
+
+            dl.wait_for_translation(flat_topic, msg_count=1)
+            dl.wait_for_translation(nested_topic, msg_count=1)
+
+            # Flat: mynum and mylong are top-level fields; no 'value' wrapper.
+            flat_tbl = dl.catalog_client().load_table(("redpanda", flat_topic))
+            flat_names = [f.name for f in flat_tbl.schema().fields]
+            assert "mynum" in flat_names, flat_names
+            assert "mylong" in flat_names, flat_names
+            assert "value" not in flat_names, flat_names
+
+            # Nested: a top-level 'value' struct holds the user fields.
+            nested_tbl = dl.catalog_client().load_table(("redpanda", nested_topic))
+            nested_top = [f.name for f in nested_tbl.schema().fields]
+            assert "value" in nested_top, nested_top
+            assert "mynum" not in nested_top, nested_top
+            assert "mylong" not in nested_top, nested_top
+            value_field = next(
+                f for f in nested_tbl.schema().fields if f.name == "value"
+            )
+            nested_value_names = [f.name for f in value_field.field_type.fields]
+            assert "mynum" in nested_value_names, nested_value_names
+            assert "mylong" in nested_value_names, nested_value_names
+
+            # SQL: flat fields accessible at top level.
+            spark = dl.spark()
+            flat_rows = spark.run_query_fetch_all(
+                f"SELECT mynum, mylong FROM redpanda.{flat_topic}"
+            )
+            assert len(flat_rows) == 1, flat_rows
+            assert flat_rows[0] == (42, 99), flat_rows[0]
+
+            # SQL: nested fields accessible via the 'value' struct.
+            nested_rows = spark.run_query_fetch_all(
+                f"SELECT value.mynum, value.mylong FROM redpanda.{nested_topic}"
+            )
+            assert len(nested_rows) == 1, nested_rows
+            assert nested_rows[0] == (42, 99), nested_rows[0]
+
 
 class DatalakeMultiBrokerE2ETest(RedpandaTest):
     def __init__(self, test_ctx, *args, **kwargs):

@@ -683,6 +683,12 @@ public:
     /// Whether header values are stored as binary or decoded as UTF-8 strings.
     enum class header_schema_mode : uint8_t { binary, string };
 
+    /// How translated value fields are placed in the Iceberg row.
+    enum class value_layout : uint8_t {
+        flat,   ///< User fields placed at top level of the row (default).
+        nested, ///< User fields wrapped inside a "value" struct.
+    };
+
     /// Schema decoding config for the key section.
     struct key_config {
         schema_mode mode{schema_mode::binary};
@@ -698,7 +704,14 @@ public:
         ss::sstring subject; ///< Empty = <topic>-value (topic name strategy).
         ss::sstring
           protobuf_name; ///< Empty = first proto message definition in schema.
+        value_layout layout{value_layout::flat};
         bool operator==(const value_config&) const = default;
+
+        /// Returns true if this config can be fully represented by the legacy
+        /// wire discriminants (0–3).
+        bool is_legacy_compatible() const noexcept {
+            return layout == value_layout::flat;
+        }
     };
 
     /// Config for the headers section.
@@ -749,7 +762,8 @@ public:
         }
         const auto& e = std::get<enabled_impl>(_impl);
         return e.key.mode != schema_mode::binary
-               || e.headers.value_type != header_schema_mode::binary;
+               || e.headers.value_type != header_schema_mode::binary
+               || !e.value.is_legacy_compatible();
     }
 
     /// \pre !is_disabled()

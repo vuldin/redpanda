@@ -212,12 +212,12 @@ public:
     ss::future<checked<std::nullopt_t, errc>> ensure_table(
       const model::topic& topic,
       model::revision_id topic_revision,
-      record_schema_components comps) const final {
+      const record_type& rt) const final {
         auto ensure_res = co_await coordinator_fe_.ensure_table_exists(
           coordinator::ensure_table_exists_request{
             topic,
             topic_revision,
-            comps,
+            rt.comps,
           });
         switch (ensure_res.errc) {
         case coordinator::errc::ok:

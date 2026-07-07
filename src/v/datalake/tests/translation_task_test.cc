@@ -59,8 +59,7 @@ public:
           std::make_unique<simple_schema_manager>(
             iceberg::uri_converter(sr->remote.local().provider())
               .to_uri(bucket_name, "test")))
-      , t_creator(
-          std::make_unique<direct_table_creator>(*schema_resolver, *schema_mgr))
+      , t_creator(std::make_unique<direct_table_creator>(*schema_mgr))
       , location_provider(sr->remote.local().provider(), bucket_name)
       , probe(ntp) {
         set_expectations_and_listen({});
