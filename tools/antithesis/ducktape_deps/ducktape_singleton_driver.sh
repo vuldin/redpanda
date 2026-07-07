@@ -33,7 +33,7 @@ if [ "${DUCKTAPE_DISABLE_FAULTS:-0}" = "1" ] && [ -n "${ANTITHESIS_STOP_FAULTS:-
   "${ANTITHESIS_STOP_FAULTS}" 86400
 fi
 
-pushd /root/tests
+pushd /root/
 
 COMMON_ARGS=(
   --cluster=ducktape.cluster.json.JsonCluster

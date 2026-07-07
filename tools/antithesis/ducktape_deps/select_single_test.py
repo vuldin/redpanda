@@ -27,7 +27,7 @@ def parse_collected_tests(lines):
         if not m:
             continue
         cls, func, args_str, fpath = m.groups()
-        fpath = fpath.replace("/root/tests/", "")
+        fpath = fpath.removeprefix("/root/")
         selector = f"{fpath}::{cls}.{func}"
 
         if args_str.strip() != "None":
