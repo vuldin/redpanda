@@ -19,7 +19,8 @@
 # Antithesis testing.
 #
 # This script:
-#   1. Builds Redpanda via Bazel (optionally with --config=antithesis)
+#   1. Builds Redpanda via Bazel (with --config=antithesis unless
+#      --no-instrumented)
 #   2. Builds the base test-node Docker image
 #   3. Builds the node image (test-node + baked-in Redpanda binaries)
 #   4. Builds the runner image (FROM node image + test code, config,
@@ -35,7 +36,7 @@
 #       --ducktape-args rptest/tests/e2e_shadow_indexing_test.py
 #   ./tools/antithesis/ducktape_test_package.py \
 #       --ducktape-args rptest/tests/e2e_shadow_indexing_test.py \
-#       --nodes 3 --instrumented
+#       --nodes 3 --no-instrumented
 #
 
 import argparse
@@ -266,8 +267,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--instrumented",
-        action="store_true",
-        help="Build with --config=antithesis for coverage",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Build with --config=antithesis for coverage (default: enabled)",
     )
     parser.add_argument(
         "--max-parallel",
