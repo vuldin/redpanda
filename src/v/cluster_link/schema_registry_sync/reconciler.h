@@ -51,8 +51,16 @@ struct reconcile_stats {
 /// version) node imported from the source with its source deleted state. The
 /// caller selects which nodes to upsert (create, reactivate, or propagate a
 /// soft-delete); the reconciler imports them in reference order.
+///
+/// `soft_deleted` names the upserts that are soft-deleted on the source, so the
+/// reconciler imports them soft-deleted regardless of the per-version source
+/// response, which cannot be relied on for deleted-state: a standard source
+/// (e.g. Confluent) omits the `deleted` flag from the per-version body by
+/// default. The caller instead derives this from its own active-vs-deleted
+/// listing partition, which is authoritative across SR vendors.
 struct work_set {
     chunked_vector<ppsr::subject_version> upserts;
+    chunked_hash_set<ppsr::subject_version> soft_deleted;
 };
 
 /// \brief Imports missing source schema versions into the destination in
@@ -222,6 +230,9 @@ private:
       _feature_policy;
 
     chunked_hash_set<ppsr::subject_version> _replicated;
+    /// Upserts the caller classified as soft-deleted on the source; imported
+    /// soft-deleted, overriding the per-version source body's deleted flag.
+    chunked_hash_set<ppsr::subject_version> _soft_deleted;
     chunked_hash_map<ppsr::subject_version, node_data> _nodes;
     chunked_vector<ppsr::subject_version> _discover_q;
     chunked_vector<ppsr::subject_version> _import_q;
