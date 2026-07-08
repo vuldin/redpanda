@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "cluster_link/schema_registry_sync/scope.h"
 #include "cluster_link/schema_registry_sync/source_reader.h"
 #include "container/chunked_hash_map.h"
 #include "container/chunked_vector.h"
@@ -87,10 +88,15 @@ public:
         size_t parallelism;
     };
 
+    /// \param mapper source->destination context remapping, applied only at the
+    ///        import boundary (the discovery graph, `in_scope`, and reference
+    ///        resolution all run in the source-context namespace). The mapper
+    ///        must outlive the reconciler.
     reconciler(
       source_reader* source,
       schema::registry* destination,
       ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope,
+      const context_mapper& mapper,
       limits lim);
 
     /// Imports `work_set.upserts` referent-first.
@@ -178,6 +184,7 @@ private:
     source_reader* _source;
     schema::registry* _destination;
     ss::noncopyable_function<bool(const ppsr::context_subject&)> _in_scope;
+    const context_mapper* _mapper;
     limits _limits;
 
     chunked_hash_set<ppsr::subject_version> _replicated;

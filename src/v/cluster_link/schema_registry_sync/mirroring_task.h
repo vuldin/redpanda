@@ -33,11 +33,18 @@ struct inventory {
 
 /// Scans the destination registry for every in-scope (subject, version) node.
 /// A single include_deleted scan reports each version's soft-delete state, so
-/// `active` is the non-deleted subset of `all` from one snapshot. `in_scope`
-/// must be pure; it runs on each registry shard.
+/// `active` is the non-deleted subset of `all` from one snapshot.
+///
+/// `in_scope` is a source-namespace predicate; the destination is scanned in
+/// the destination namespace, so the scan reverse-maps each destination context
+/// to its source context via `mapper` before applying `in_scope` and returns
+/// nodes in the source namespace, keeping the whole diff single-namespaced.
+/// Under the identity mapper this is a passthrough. `in_scope` must be pure; it
+/// runs on each registry shard.
 ss::future<inventory> scan_destination_inventory(
   schema::registry& destination,
   ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope,
+  const context_mapper& mapper,
   ss::abort_source& as);
 
 /// Shadows a source Schema Registry into the local (destination) Schema
@@ -124,16 +131,15 @@ private:
     /// two calls recover the per-version deleted state: include_deleted::no
     /// gives the active versions, and the rest of the include_deleted::yes
     /// listing are soft-deleted. A reachable-but-failed listing is a counted
-    /// per-item error; a source_unavailable is captured in `unavailable` to
-    /// back off the sync. A member, not a coroutine lambda: run under
-    /// max_concurrent_for_each, a lambda could be freed while suspended and
-    /// dangle its captures, whereas the member coroutine frame owns `this` and
-    /// the shared state.
+    /// per-item error and adds the subject to `failed_subjects` so its versions
+    /// (undiscovered, hence source-absent-looking) are spared the hard-delete;
+    /// a source_unavailable is captured in `unavailable` to back off the sync.
     ss::future<> list_one_subject(
       const ppsr::context_subject& subject,
       ss::abort_source& as,
       chunked_hash_set<ppsr::subject_version>& source_active,
       chunked_hash_set<ppsr::subject_version>& source_deleted,
+      chunked_hash_set<ppsr::context_subject>& failed_subjects,
       std::optional<source_error>& unavailable);
 
     /// One source version listing with shared error handling: returns the
@@ -148,6 +154,45 @@ private:
       ss::abort_source& as,
       std::optional<source_error>& unavailable);
 
+    /// A destination (subject, version) to hard-delete because the source no
+    /// longer has it.
+    struct purge_target {
+        ppsr::subject_version node;
+        bool was_active;
+    };
+
+    /// Hard-deletes the source-absent destination versions in `targets`. A
+    /// version still referenced by another not-yet-purged version cannot be
+    /// deleted, so reference-blocked deletes are retried across rounds until a
+    /// round makes no progress. Returns the number of versions purged (folded
+    /// into subject-version changes).
+    ss::future<uint64_t> purge_destination_only_versions(
+      chunked_vector<purge_target> targets, ss::abort_source& as);
+
+    /// Attempts one hard-delete of `target`. If it fails because the version is
+    /// still referenced by another version, it is re-queued into `next_round`.
+    /// On success, `purged` is incremented.
+    ss::future<> purge_one(
+      purge_target target,
+      ss::abort_source& as,
+      uint64_t& purged,
+      chunked_vector<purge_target>& next_round);
+
+    /// Soft-deletes `dest_sub`/`version` first if `was_active` (the store
+    /// refuses to tombstone an active version), then permanently deletes it.
+    ss::future<> hard_delete_target(
+      const ppsr::context_subject& dest_sub,
+      ppsr::schema_version version,
+      bool was_active);
+
+    /// Replicates one target's (subject or context-only) source mode and
+    /// compatibility config onto the destination: writes the source's own
+    /// override when it has one, deletes the destination override otherwise.
+    ss::future<> sync_mode_and_config(
+      const ppsr::context_subject& target,
+      ss::abort_source& as,
+      std::optional<source_error>& unavailable);
+
     // Requires a sync in progress (`current_sync` engaged).
     void record_error(std::string_view what);
 
@@ -156,6 +201,10 @@ private:
     [[nodiscard]] state_transition make_faulted(const ss::sstring& reason);
 
     model::schema_registry_sync_config _config;
+    // Source->destination context remapping for the current run, rebuilt from
+    // _config at the start of each full sync. Applied only at the destination
+    // boundary; identity when no remapping is configured.
+    context_mapper _mapper;
     schema::registry* _destination;
     source_reader_factory* _source_factory;
     std::unique_ptr<source_reader> _reader;

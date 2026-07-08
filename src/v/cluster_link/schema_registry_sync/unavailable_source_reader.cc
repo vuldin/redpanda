@@ -45,6 +45,17 @@ unavailable_source_reader::read_subject_version(
     co_return std::unexpected(unavailable());
 }
 
+ss::future<source_result<std::optional<ppsr::mode>>>
+unavailable_source_reader::read_mode(ppsr::context_subject, ss::abort_source&) {
+    co_return std::unexpected(unavailable());
+}
+
+ss::future<source_result<std::optional<ppsr::compatibility_level>>>
+unavailable_source_reader::read_config(
+  ppsr::context_subject, ss::abort_source&) {
+    co_return std::unexpected(unavailable());
+}
+
 std::unique_ptr<source_reader> unavailable_source_reader_factory::create(
   const model::schema_registry_sync_config::shadow_schema_registry_api*) {
     return std::make_unique<unavailable_source_reader>();

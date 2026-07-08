@@ -120,6 +120,17 @@ struct fake_source_state {
     // nodes, letting a test inject a mid-run source fault (e.g.
     // source_unavailable).
     chunked_hash_map<ppsr::subject_version, srs::source_error> read_errors;
+    // Source own-override modes/configs, keyed by subject or context-only
+    // target. Absence means "no explicit override" (read_mode/read_config
+    // return nullopt). The default context, if present, models the global
+    // mode/config.
+    chunked_hash_map<ppsr::context_subject, ppsr::mode> modes;
+    chunked_hash_map<ppsr::context_subject, ppsr::compatibility_level> configs;
+    // Forces read_mode/read_config to fail for specific targets, letting a test
+    // model an unmappable source value (operation_failed) or a fault.
+    chunked_hash_map<ppsr::context_subject, srs::source_error> read_mode_errors;
+    chunked_hash_map<ppsr::context_subject, srs::source_error>
+      read_config_errors;
 
     void fail_read(
       const ppsr::context_subject& sub,
@@ -255,6 +266,32 @@ public:
             .message = "not found in source"});
     }
 
+    ss::future<srs::source_result<std::optional<ppsr::mode>>>
+    read_mode(ppsr::context_subject sub, ss::abort_source&) override {
+        if (
+          auto it = _state->read_mode_errors.find(sub);
+          it != _state->read_mode_errors.end()) {
+            co_return std::unexpected(it->second);
+        }
+        if (auto it = _state->modes.find(sub); it != _state->modes.end()) {
+            co_return std::optional<ppsr::mode>{it->second};
+        }
+        co_return std::optional<ppsr::mode>{std::nullopt};
+    }
+
+    ss::future<srs::source_result<std::optional<ppsr::compatibility_level>>>
+    read_config(ppsr::context_subject sub, ss::abort_source&) override {
+        if (
+          auto it = _state->read_config_errors.find(sub);
+          it != _state->read_config_errors.end()) {
+            co_return std::unexpected(it->second);
+        }
+        if (auto it = _state->configs.find(sub); it != _state->configs.end()) {
+            co_return std::optional<ppsr::compatibility_level>{it->second};
+        }
+        co_return std::optional<ppsr::compatibility_level>{std::nullopt};
+    }
+
 private:
     fake_source_state* _state;
 };
@@ -290,10 +327,15 @@ struct reconcile_harness {
     // assertions.
     srs::reconciler::limits lim{.memory_bytes = 1u << 20, .parallelism = 1};
 
+    // Identity mapping by default: source and destination contexts coincide, so
+    // reconcile tests need no remapping.
+    srs::context_mapper mapper;
+
     srs::reconciler make(
       ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope =
         [](const ppsr::context_subject&) { return true; }) {
-        return srs::reconciler{&reader, &destination, std::move(in_scope), lim};
+        return srs::reconciler{
+          &reader, &destination, std::move(in_scope), mapper, lim};
     }
 
     ss::future<srs::source_result<srs::reconcile_stats>>
@@ -456,6 +498,73 @@ public:
 
 private:
     chunked_hash_map<ppsr::subject_version, ppsr::error_info> _failures;
+};
+
+// Wraps a destination registry, modeling the real Schema Registry's refusal to
+// permanently delete a version still referenced by a live one (the in-memory
+// fake never rejects a delete). Lets a test drive the hard-delete retry loop: a
+// referent stays blocked until its referrer is purged, so the sync must delete
+// the referrer first and retry the referent in a later round rather than count
+// an error; a permanently-blocked delete ends up counted once.
+class deferred_delete_registry final : public delegating_registry {
+public:
+    using delegating_registry::delegating_registry;
+
+    // Reject permanent deletes of `referent` until `referrer` has been
+    // permanently deleted -- models a live reference the purge must clear
+    // first.
+    void block_until_purged(
+      const ppsr::context_subject& referent,
+      const ppsr::context_subject& referrer) {
+        _blocked_on.insert_or_assign(referent, referrer);
+    }
+    // Reject every permanent delete of `subject` -- models a permanently-stuck
+    // delete (e.g. a reference cycle) that must end up counted as an error.
+    void reject_forever(const ppsr::context_subject& subject) {
+        _forever.insert(subject);
+    }
+    // Reject every permanent delete of `subject` with a non-reference error --
+    // models a real destination fault the purge must count immediately rather
+    // than retry as if it were reference ordering.
+    void fail_with(const ppsr::context_subject& subject, ppsr::error_code ec) {
+        _fail_with.insert_or_assign(subject, ec);
+    }
+    size_t
+    permanent_delete_attempts(const ppsr::context_subject& subject) const {
+        auto it = _attempts.find(subject);
+        return it == _attempts.end() ? 0 : it->second;
+    }
+
+    ss::future<chunked_vector<ppsr::schema_version>> permanent_delete_schema(
+      ppsr::context_subject sub,
+      std::optional<ppsr::schema_version> v) override {
+        ++_attempts[sub];
+        if (auto f = _fail_with.find(sub); f != _fail_with.end()) {
+            return ss::make_exception_future<
+              chunked_vector<ppsr::schema_version>>(ppsr::as_exception(
+              ppsr::error_info{f->second, "destination fault"}));
+        }
+        auto it = _blocked_on.find(sub);
+        const bool blocked
+          = _forever.contains(sub)
+            || (it != _blocked_on.end() && !_purged.contains(it->second));
+        if (blocked) {
+            return ss::make_exception_future<
+              chunked_vector<ppsr::schema_version>>(ppsr::as_exception(
+              ppsr::error_info{
+                ppsr::error_code::subject_version_has_references,
+                "referenced by a live schema"}));
+        }
+        _purged.insert(sub);
+        return _inner->permanent_delete_schema(std::move(sub), v);
+    }
+
+private:
+    chunked_hash_map<ppsr::context_subject, ppsr::context_subject> _blocked_on;
+    chunked_hash_set<ppsr::context_subject> _forever;
+    chunked_hash_map<ppsr::context_subject, ppsr::error_code> _fail_with;
+    chunked_hash_map<ppsr::context_subject, size_t> _attempts;
+    chunked_hash_set<ppsr::context_subject> _purged;
 };
 
 } // namespace cluster_link::tests

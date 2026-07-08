@@ -55,11 +55,13 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
     EXTRA_MIDS = 10
 
     def __init__(self, test_context: TestContext, *args: Any, **kwargs: Any):
+        source_sr_config = SchemaRegistryConfig()
+        source_sr_config.mode_mutability = True
         super().__init__(
             test_context,
             # Source (secondary) cluster runs a Schema Registry too.
             secondary_cluster_args=SecondaryClusterArgs(
-                schema_registry_config=SchemaRegistryConfig()
+                schema_registry_config=source_sr_config
             ),
             # Destination (primary) cluster Schema Registry.
             schema_registry_config=SchemaRegistryConfig(),
@@ -192,6 +194,8 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         source_url: str | None = None,
         full_sync_interval_sec: int = 2,
         source_filter_subjects: list[str] | None = None,
+        source_filter_contexts: list[str] | None = None,
+        exact_context_map: dict[str, str] | None = None,
     ) -> str:
         # Create a shadow link that syncs only the Schema Registry, in API mode,
         # pointing at the source cluster's SR endpoint (or an explicit URL, e.g.
@@ -215,6 +219,13 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         )
         if source_filter_subjects is not None:
             api.source_filter.subjects.extend(source_filter_subjects)
+        if source_filter_contexts is not None:
+            api.source_filter.contexts.extend(source_filter_contexts)
+        if exact_context_map is not None:
+            for source, destination in exact_context_map.items():
+                api.destination.exact.mappings.add(
+                    source=source, destination=destination
+                )
         req.shadow_link.configurations.schema_registry_sync_options.shadow_schema_registry_api.CopyFrom(
             api
         )
@@ -312,10 +323,12 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
 
     # --- status-counter checks ---------------------------------------------
 
-    # Counters the create-only reconcile does not yet populate: the admin API /
-    # rpk map them through, but they stay zero until compatibility, mode, and
-    # unsupported-feature handling are implemented.
-    UNPOPULATED_COUNTERS = (
+    # Counters expected to stay zero in the override-free DAG tests: those DAGs
+    # register no mode or compatibility overrides, so mode/config replication is
+    # a no-op, and unsupported-feature handling is unimplemented. A test that
+    # sets overrides (test_schema_registry_api_sync_compatibility) asserts the
+    # compatibility counter advances.
+    EXPECTED_ZERO_COUNTERS = (
         "compatibility_configs_changed",
         "modes_changed",
         "unsupported_features_removed",
@@ -393,7 +406,7 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         assert totals.HasField("start_time"), totals
         assert totals.start_time.seconds > 0, totals
         assert not totals.HasField("finish_time"), totals
-        for name in self.UNPOPULATED_COUNTERS:
+        for name in self.EXPECTED_ZERO_COUNTERS:
             assert getattr(totals, name) == 0, (
                 f"unexpected {name}={getattr(totals, name)}"
             )
@@ -435,7 +448,7 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         assert inv["destination_subject_versions"] == expected_versions, status
         assert totals["subject_versions_changed"] == expected_versions, status
         assert totals["errors"] == 0, status
-        for name in self.UNPOPULATED_COUNTERS:
+        for name in self.EXPECTED_ZERO_COUNTERS:
             assert totals[name] == 0, status
 
     @cluster(num_nodes=6)
@@ -556,6 +569,275 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         assert src.delete_subject_version(after, "2").status_code == 200
         assert src.delete_subject(whole).status_code == 200
         self._wait_delete_synced(src, dest, subjects)
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_compatibility(self):
+        # A subject-level compatibility override round-tripping through the
+        # destination's write API -- a path the reconciler unit fakes cannot
+        # cover -- then un-setting it so the destination reverts to the
+        # inherited default. Mode replication is covered e2e by
+        # test_schema_registry_api_sync_context_remap.
+        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+
+        keep = "keep-value"
+        schema = self._record("V", [{"name": "v", "type": "string"}])
+        self._register(src, keep, schema)
+        # A subject-level compatibility override on the source, to be mirrored.
+        assert (
+            src.set_config_subject(
+                keep, data=json.dumps({"compatibility": "FULL"})
+            ).status_code
+            == 200
+        )
+
+        self._create_sr_link()
+        self._wait_synced(src, dest, [(keep, 1)])
+
+        # The compatibility override replicates to the destination and moves the
+        # compatibility_configs_changed counter.
+        def config_synced() -> bool:
+            c = dest.get_config_subject(keep)
+            return c.status_code == 200 and c.json().get("compatibilityLevel") == "FULL"
+
+        wait_until(
+            config_synced,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="compatibility config did not replicate to the destination",
+        )
+        wait_until(
+            lambda: self._admin_sr_status().totals_since_task_start.compatibility_configs_changed
+            >= 1,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="compatibility_configs_changed counter did not advance",
+        )
+
+        # Un-setting the source override propagates as a delete, reverting the
+        # destination subject to the inherited (global) default rather than
+        # leaving the stale FULL override behind.
+        before = self._admin_sr_status().totals_since_task_start.compatibility_configs_changed
+        assert src.delete_config_subject(keep).status_code == 200
+
+        def config_delete_synced() -> bool:
+            # With no subject-level override remaining, a non-fallback GET on the
+            # destination reports it missing (40401); a fallback GET now yields
+            # the global default rather than the removed FULL override.
+            missing = dest.get_config_subject(keep).status_code == 404
+            fallback = dest.get_config_subject(keep, fallback=True)
+            reverted = (
+                fallback.status_code == 200
+                and fallback.json().get("compatibilityLevel") != "FULL"
+            )
+            return missing and reverted
+
+        wait_until(
+            config_delete_synced,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="config override deletion did not replicate to the destination",
+        )
+        wait_until(
+            lambda: self._admin_sr_status().totals_since_task_start.compatibility_configs_changed
+            > before,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="compatibility_configs_changed counter did not advance for the delete",
+        )
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_hard_delete(self):
+        # A source hard-delete (which requires a soft-delete first on the
+        # destination) being propagated as a purge -- a path the reconciler unit
+        # fakes cannot cover.
+        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+
+        keep, gone = "keep-value", "gone-value"
+        schema = self._record("V", [{"name": "v", "type": "string"}])
+        self._register(src, keep, schema)
+        self._register(src, gone, schema)
+
+        self._create_sr_link()
+        self._wait_synced(src, dest, [(keep, 1), (gone, 1)])
+
+        # Hard-delete gone-value at the source (soft then permanent). The next
+        # full sync must purge it from the destination, soft-deleting the still
+        # active destination version before the permanent delete.
+        assert src.delete_subject(gone).status_code == 200
+        assert src.delete_subject(gone, permanent=True).status_code == 200
+
+        def gone_purged() -> bool:
+            active, deleted = self._version_state(dest, gone)
+            return not active and not deleted
+
+        wait_until(
+            gone_purged,
+            timeout_sec=90,
+            backoff_sec=1,
+            err_msg="source hard-delete was not propagated to the destination",
+        )
+
+        # The in-source subject is untouched by the purge.
+        assert self._schema_view(dest, keep, 1) is not None
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_context_remap(self):
+        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+
+        def qualified(ctx: str, name: str) -> str:
+            return f":{ctx}:{name}"
+
+        def by_name(refs: list[dict]) -> list[dict]:
+            return sorted(refs, key=lambda r: r["name"])
+
+        base_src = qualified(".prod", "base-value")
+        leaf_src = qualified(".prod", "leaf-value")
+        orders_src = qualified(".prod", "orders-value")
+        base_dst = qualified(".dest", "base-value")
+        leaf_dst = qualified(".dest", "leaf-value")
+        orders_dst = qualified(".dest", "orders-value")
+
+        base_schema = self._record("Base", [{"name": "b", "type": "string"}])
+        leaf_schema = self._record("Leaf", [{"name": "l", "type": "string"}])
+        orders_schema = self._record(
+            "Orders",
+            [
+                {"name": "base", "type": f"{NS}.Base"},
+                {"name": "leaf", "type": f"{NS}.Leaf"},
+            ],
+        )
+
+        # Register referents first (the source SR validates references on
+        # registration). orders references base with a context-qualified
+        # reference (":.prod:base-value") and leaf with an unqualified one (the
+        # bare "leaf-value", which the source resolves against orders' own .prod
+        # context).
+        self._register(src, base_src, base_schema)
+        self._register(src, leaf_src, leaf_schema)
+        self._register(
+            src,
+            orders_src,
+            orders_schema,
+            references=[
+                self._ref(f"{NS}.Base", base_src),
+                self._ref(f"{NS}.Leaf", "leaf-value"),
+            ],
+        )
+
+        # Subject-level compatibility and mode overrides on the referrer, both to
+        # be mirrored under the remapped context. Set the mode last: READONLY
+        # blocks no further writes here, and the destination import bypasses it.
+        assert (
+            src.set_config_subject(
+                orders_src, data=json.dumps({"compatibility": "FULL"})
+            ).status_code
+            == 200
+        )
+        assert (
+            src.set_mode_subject(
+                orders_src, data=json.dumps({"mode": "READONLY"})
+            ).status_code
+            == 200
+        )
+
+        # The source's canonical stored forms; the destination is compared
+        # against these (not against the registered dicts) so the assertions do
+        # not depend on SR canonicalization. Capturing them also guards the test
+        # premise: the qualified reference is stored qualified and the
+        # unqualified one is NOT canonicalized into a qualified subject.
+        src_base = self._schema_view(src, base_src, 1)
+        src_leaf = self._schema_view(src, leaf_src, 1)
+        src_orders = self._schema_view(src, orders_src, 1)
+        assert src_base is not None and src_leaf is not None
+        assert src_orders is not None
+        assert by_name(src_orders["references"]) == by_name(
+            [
+                {"name": f"{NS}.Base", "subject": base_src, "version": 1},
+                {"name": f"{NS}.Leaf", "subject": "leaf-value", "version": 1},
+            ]
+        ), src_orders["references"]
+
+        # Replicate only .prod, remapping it onto the destination .dest context.
+        self._create_sr_link(
+            source_filter_contexts=[".prod"],
+            exact_context_map={".prod": ".dest"},
+        )
+
+        expected_orders_refs = by_name(
+            [
+                # The qualified reference's own context is remapped .prod -> .dest.
+                {"name": f"{NS}.Base", "subject": base_dst, "version": 1},
+                # The unqualified reference is untouched: on the destination it
+                # resolves against orders' remapped .dest parent.
+                {"name": f"{NS}.Leaf", "subject": "leaf-value", "version": 1},
+            ]
+        )
+
+        def remapped() -> bool:
+            b = self._schema_view(dest, base_dst, 1)
+            leaf = self._schema_view(dest, leaf_dst, 1)
+            o = self._schema_view(dest, orders_dst, 1)
+            if b is None or leaf is None or o is None:
+                return False
+            # Referents (no references of their own) replicate verbatim.
+            if b != src_base or leaf != src_leaf:
+                return False
+            # The referrer keeps its ID and body; only its reference contexts
+            # remap.
+            return (
+                o["id"] == src_orders["id"]
+                and o["schema"] == src_orders["schema"]
+                and by_name(o["references"]) == expected_orders_refs
+            )
+
+        wait_until(
+            remapped,
+            timeout_sec=90,
+            backoff_sec=1,
+            err_msg="schemas/references did not remap into the .dest context",
+        )
+
+        # Nothing is written under the original .prod context on the destination.
+        for sub in (base_src, leaf_src, orders_src):
+            assert self._schema_view(dest, sub, 1) is None, sub
+
+        # The compatibility and mode overrides replicate under the remapped
+        # context (read the explicit override, not the global fallback).
+        def overrides_remapped() -> bool:
+            c = dest.get_config_subject(orders_dst)
+            m = dest.get_mode_subject(orders_dst, fallback=False)
+            return (
+                c.status_code == 200
+                and c.json().get("compatibilityLevel") == "FULL"
+                and m.status_code == 200
+                and m.json().get("mode") == "READONLY"
+            )
+
+        wait_until(
+            overrides_remapped,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="compatibility/mode overrides did not remap into .dest",
+        )
+
+        # Both overrides are counted, and the remap completed error-free.
+        def counters_advanced() -> bool:
+            totals = self._admin_sr_status().totals_since_task_start
+            return (
+                totals.compatibility_configs_changed >= 1
+                and totals.modes_changed >= 1
+                and totals.errors == 0
+            )
+
+        wait_until(
+            counters_advanced,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="mode/compatibility counters did not advance under remap",
+        )
 
     @cluster(num_nodes=6)
     def test_schema_registry_api_sync_out_of_scope_reference(self):

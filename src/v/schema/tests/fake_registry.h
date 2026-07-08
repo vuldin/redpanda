@@ -105,6 +105,21 @@ public:
 
     const std::vector<pandaproxy::schema_registry::stored_schema>& get_all();
 
+    /// Test accessors for the mode/config overrides written to the registry, so
+    /// a test can assert what mode/config replication applied.
+    const std::map<
+      pandaproxy::schema_registry::context_subject,
+      pandaproxy::schema_registry::mode>&
+    modes() const {
+        return _modes;
+    }
+    const std::map<
+      pandaproxy::schema_registry::context_subject,
+      pandaproxy::schema_registry::compatibility_level>&
+    configs() const {
+        return _configs;
+    }
+
     void set_inject_failures(const std::exception_ptr& injected) {
         _injected_failure = injected;
     }
