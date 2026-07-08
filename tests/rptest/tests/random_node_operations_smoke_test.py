@@ -768,7 +768,9 @@ class RandomNodeOperationsBase(PreallocNodesTest):
                     "cleanup.policy": "delete",
                     "redpanda.remote.read": "false",
                     "redpanda.remote.write": "false",
-                    TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+                    **TopicSpec.storage_mode_config(
+                        TopicSpec.STORAGE_MODE_IMPL_TIERED_V2
+                    ),
                 },
             )
             self.maybe_enable_iceberg_for_topic(
@@ -785,7 +787,9 @@ class RandomNodeOperationsBase(PreallocNodesTest):
                     "cleanup.policy": "compact",
                     "redpanda.remote.read": "false",
                     "redpanda.remote.write": "false",
-                    TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+                    **TopicSpec.storage_mode_config(
+                        TopicSpec.STORAGE_MODE_IMPL_TIERED_V2
+                    ),
                 },
             )
             self.maybe_enable_iceberg_for_topic(

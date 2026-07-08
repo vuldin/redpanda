@@ -1461,8 +1461,9 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
         # (batch_mirror_topic_status additionally needs a second cluster).
 
     def _exercise_tiered_cloud_topics(self):
-        """tiered_cloud_topics gate: creating a topic with storage mode
-        `tiered_cloud` is refused until the feature is active. Drive that
+        """tiered_cloud_topics gate: creating a topic with the tiered_v2
+        (cloud-architecture) storage mode is refused until the feature is
+        active. Drive that
         validator path while unfinalized and confirm the feature is unavailable
         and the create is rejected. The topic is never created, so exercising
         the gate cannot leave state that would block a downgrade."""
@@ -1473,9 +1474,9 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
             RpkTool(self.redpanda).create_topic(
                 "perturb-tiered-cloud",
                 partitions=1,
-                config={
-                    TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_TIERED_CLOUD
-                },
+                config=TopicSpec.storage_mode_config(
+                    TopicSpec.STORAGE_MODE_IMPL_TIERED_V2
+                ),
             )
         except RpkException as e:
             # Confirm the create failed via the storage-mode gate, not an
