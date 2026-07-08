@@ -2099,6 +2099,22 @@ configuration::configuration()
        model::redpanda_storage_mode::tiered,
        model::redpanda_storage_mode::cloud,
        model::redpanda_storage_mode::unset})
+  , default_redpanda_storage_mode_tiered_impl(
+      *this,
+      "default_redpanda_storage_mode_tiered_impl",
+      "Default implementation of the `tiered` storage mode for "
+      "newly-created topics. When `redpanda.storage.mode` is set to "
+      "`tiered`, this property determines whether the topic uses the "
+      "classic tiered-storage architecture (`tiered_v1`) or the new "
+      "tiered-storage architecture (`tiered_v2`). The implementation of "
+      "each topic is reported by the read-only `redpanda.storage.mode.impl` "
+      "topic property.",
+      {.needs_restart = needs_restart::no,
+       .example = "tiered_v2",
+       .visibility = visibility::user},
+      model::redpanda_storage_mode_tiered_impl::tiered_v1,
+      {model::redpanda_storage_mode_tiered_impl::tiered_v1,
+       model::redpanda_storage_mode_tiered_impl::tiered_v2})
   , cloud_storage_disable_archiver_manager(
       *this,
       "cloud_storage_disable_archiver_manager",

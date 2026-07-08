@@ -602,6 +602,23 @@ struct convert<model::redpanda_storage_mode> {
 };
 
 template<>
+struct convert<model::redpanda_storage_mode_tiered_impl> {
+    using type = model::redpanda_storage_mode_tiered_impl;
+
+    static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
+
+    static bool decode(const Node& node, type& rhs) {
+        auto value = node.as<std::string>();
+        auto mode = model::redpanda_storage_mode_tiered_impl_from_string(value);
+        if (!mode) {
+            return false;
+        }
+        rhs = mode.value();
+        return true;
+    }
+};
+
+template<>
 struct convert<model::recovery_validation_mode> {
     using type = model::recovery_validation_mode;
     constexpr static auto acceptable_values = std::to_array(
