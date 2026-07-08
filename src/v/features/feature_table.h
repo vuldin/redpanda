@@ -62,6 +62,7 @@ enum class feature : std::uint64_t {
     fetch_controller_snapshot_rpc = 1ULL << 18U,
     node_isolation = 1ULL << 19U,
     group_offset_retention = 1ULL << 20U,
+    shadow_link_role_sync = 1ULL << 21U,
     membership_change_controller_cmds = 1ULL << 22U,
     controller_snapshots = 1ULL << 23U,
     cloud_storage_manifest_format_v2 = 1ULL << 24U,
@@ -572,6 +573,12 @@ inline constexpr std::array feature_schema{
     release_version::v26_2_1,
     "shadow_link_sr_api_sync",
     feature::shadow_link_sr_api_sync,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v26_2_1,
+    "shadow_link_role_sync",
+    feature::shadow_link_role_sync,
     feature_spec::available_policy::always,
     feature_spec::prepare_policy::always},
   feature_spec{
