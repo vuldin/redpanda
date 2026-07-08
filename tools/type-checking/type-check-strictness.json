@@ -51,6 +51,7 @@
         "rptest/services/compatibility/franzgo_examples.py",
         "rptest/services/compatibility/kafka_streams_examples.py",
         "rptest/services/compatibility/sarama_examples.py",
+        "rptest/services/confluent_schema_registry.py",
         "rptest/services/datalake/catalog/databricks_unity.py",
         "rptest/services/datalake/query_engine/databricks_sql.py",
         "rptest/services/datalake/query_engine/duckdb_py.py",
