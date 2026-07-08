@@ -667,7 +667,9 @@ class ShadowLinkTestBase(PreallocNodesTest):
                 )
                 sec_kwargs["extra_rp_conf"] = sec_extra
             secondary_cluster_args = SecondaryClusterArgs(
-                *secondary_cluster_args.args, **sec_kwargs
+                secondary_cluster_args.num_brokers,
+                *secondary_cluster_args.args,
+                **sec_kwargs,
             )
 
         kwargs.setdefault(
@@ -741,7 +743,6 @@ class ShadowLinkTestBase(PreallocNodesTest):
             self.logger,
             self.redpanda,
             secondary_spec=self.source_cluster_spec,
-            num_brokers=3,
             secondary_args=self.secondary_cluster_args,
         )
         self.services.setUp()
