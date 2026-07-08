@@ -4368,8 +4368,12 @@ class RedpandaService(Service, RedpandaServiceABC):
         cur_state = self.get_feature_state(feature_name)
         if active and cur_state == "unavailable":
             # If we have just restarted after an upgrade, wait for cluster version
-            # to progress and for the feature to become available.
-            self.await_feature(feature_name, "available", timeout_sec=timeout_sec)
+            # to progress and for the feature to become available. Features with
+            # available_policy::always auto-activate as soon as they become
+            # available, so accept "active" too.
+            self.await_feature(
+                feature_name, {"available", "active"}, timeout_sec=timeout_sec
+            )
         self._admin.put_feature(feature_name, {"state": target_state})
         self.await_feature(feature_name, target_state, timeout_sec=timeout_sec)
 
@@ -4385,7 +4389,7 @@ class RedpandaService(Service, RedpandaServiceABC):
     def await_feature(
         self,
         feature_name: str,
-        await_state: str,
+        await_state: str | set[str],
         *,
         timeout_sec: int,
         nodes: list[ClusterNode] | None = None,
@@ -4397,16 +4401,18 @@ class RedpandaService(Service, RedpandaServiceABC):
         if nodes is None:
             nodes = self.started_nodes()
 
+        await_states = {await_state} if isinstance(await_state, str) else await_state
+
         def is_awaited_state():
             for n in nodes:
                 state = self.get_feature_state(feature_name, node=n)
-                if state != await_state:
+                if state not in await_states:
                     self.logger.info(
-                        f"Feature {feature_name} not yet {await_state} on {n.name} (state {state})"
+                        f"Feature {feature_name} not yet in {await_states} on {n.name} (state {state})"
                     )
                     return False
 
-            self.logger.info(f"Feature {feature_name} is now {await_state}")
+            self.logger.info(f"Feature {feature_name} is now in {await_states}")
             return True
 
         wait_until(is_awaited_state, timeout_sec=timeout_sec, backoff_sec=1)

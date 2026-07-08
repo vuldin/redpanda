@@ -1550,23 +1550,15 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
 
     def _verify_tiered_cloud_topics_working(self):
         """After finalize the active version has advanced past the feature's
-        require_version, so the gate opens: the feature moves from unavailable to
-        available (it is explicit_only, so it does not auto-activate) and can
-        then be enabled to active -- the simple signal that it now works.
+        require_version, so the gate opens: the feature auto-activates (it is
+        available_policy::always) -- the simple signal that it now works.
         (Creating an actual tiered_cloud topic additionally needs cloud storage,
         which this test does not configure.)"""
-        wait_until(
-            lambda: self._feature_state("tiered_cloud_topics") == "available",
-            timeout_sec=30,
-            backoff_sec=1,
-            err_msg="tiered_cloud_topics did not become available after finalize",
-        )
-        self.admin.put_feature("tiered_cloud_topics", {"state": "active"})
         wait_until(
             lambda: self._feature_state("tiered_cloud_topics") == "active",
             timeout_sec=30,
             backoff_sec=1,
-            err_msg="tiered_cloud_topics did not activate after being enabled",
+            err_msg="tiered_cloud_topics did not auto-activate after finalize",
         )
 
     def _verify_shadow_link_role_sync_working(self):
