@@ -93,6 +93,7 @@ manager::manager(
   std::unique_ptr<kafka_rpc_client_service> kafka_rpc_client_service,
   std::unique_ptr<members_table_provider> members_table_provider,
   std::unique_ptr<sr_preflight_checker> sr_preflight,
+  ss::sharded<features::feature_table>* feature_table,
   ss::lowres_clock::duration task_reconciler_interval,
   config::binding<int16_t> default_topic_replication,
   ss::scheduling_group scheduling_group)
@@ -103,6 +104,7 @@ manager::manager(
   , _topic_creator(std::move(topic_creator))
   , _security_service(std::move(security_service))
   , _registry(std::move(registry))
+  , _feature_table(feature_table)
   , _link_factory(std::move(link_factory))
   , _cluster_factory(std::move(cluster_factory))
   , _group_router(std::move(group_router))
@@ -1000,6 +1002,7 @@ ss::future<> manager::on_controller_leadership(::model::term_id term) {
           _topic_creator.get(),
           _topic_metadata_cache.get(),
           _registry.get(),
+          _feature_table,
           topic_reconciler_interval,
           _default_topic_replication,
           _scheduling_group);

@@ -22,6 +22,7 @@
 #include "cluster_link/topic_reconciler.h"
 #include "cluster_link/types.h"
 #include "container/chunked_vector.h"
+#include "features/fwd.h"
 #include "kafka/data/rpc/deps.h"
 #include "kafka/data/rpc/fwd.h"
 #include "model/fundamental.h"
@@ -58,6 +59,7 @@ public:
       std::unique_ptr<kafka_rpc_client_service> kafka_rpc_client_service,
       std::unique_ptr<members_table_provider> members_table_provider,
       std::unique_ptr<sr_preflight_checker> sr_preflight,
+      ss::sharded<features::feature_table>* feature_table,
       ss::lowres_clock::duration task_reconciler_interval,
       config::binding<int16_t> default_topic_replication,
       ss::scheduling_group scheduling_group);
@@ -237,6 +239,7 @@ private:
     std::unique_ptr<kafka::data::rpc::topic_creator> _topic_creator;
     std::unique_ptr<security_service> _security_service;
     std::unique_ptr<link_registry> _registry;
+    ss::sharded<features::feature_table>* _feature_table;
     std::unique_ptr<link_factory> _link_factory;
     std::unique_ptr<cluster_factory> _cluster_factory;
     std::unique_ptr<topic_reconciler> _topic_reconciler;

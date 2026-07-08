@@ -1306,6 +1306,7 @@ ss::future<> service::maybe_start_manager() {
       members_table_provider::make_default(&_controller->get_members_table()),
       sr_preflight_checker::make_default(
         *_schema_registry_dest, source_sr_prober::make_default()),
+      &_controller->get_feature_table(),
       30s, // Temporary until we have a proper configuration for this
       config::shard_local_cfg().default_topic_replication.bind(),
       _scheduling_group);
