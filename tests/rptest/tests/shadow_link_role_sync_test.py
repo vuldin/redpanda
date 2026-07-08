@@ -7,6 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
+import time
 from typing import Callable
 
 from connectrpc.errors import ConnectError, ConnectErrorCode
@@ -14,6 +15,7 @@ from connectrpc.errors import ConnectError, ConnectErrorCode
 import google.protobuf.duration_pb2 as duration_pb2
 import google.protobuf.field_mask_pb2 as field_mask_pb2
 
+from ducktape.mark import parametrize
 from ducktape.tests.test import TestContext
 from ducktape.utils.util import wait_until
 
@@ -547,4 +549,154 @@ class ShadowLinkRoleSyncAuthTest(RoleSyncTestBase):
             timeout_sec=60,
             backoff_sec=1,
             err_msg="role did not mirror after the permission grant",
+        )
+
+
+class ShadowLinkRoleSyncScaleTest(RoleSyncTestBase):
+    """Scale characterization for the roles migrator. Each parametrized point
+    runs the full create -> update -> delete lifecycle (exercising all three
+    migrator apply loops at volume) while pushing one cost axis: role count,
+    total membership, or a single role's member set.
+    """
+
+    PREFIX = "synced-"
+
+    def __init__(self, test_context: TestContext):
+        super().__init__(
+            test_context=test_context,
+            num_brokers=3,
+            secondary_cluster_args=SecondaryClusterArgs(),
+        )
+
+    def setUp(self):
+        super().setUp()
+        self._src = AdminV2RoleWrapper(AdminV2(self.source_cluster_service))
+
+    def _retry_transient(
+        self, fn: Callable[..., object], *args: object, **kwargs: object
+    ) -> None:
+        """Run a source mutation, retrying the transient controller-backpressure
+        errors -- raft not_leader/timeout, surfaced as a ConnectError 'internal'
+        -- that thousands of rapid role mutations can provoke. Other error codes
+        and the final failure propagate."""
+        last: ConnectError | None = None
+        for attempt in range(6):
+            try:
+                fn(*args, **kwargs)
+                return
+            except ConnectError as e:
+                if e.code != ConnectErrorCode.INTERNAL:
+                    raise
+                last = e
+                self.logger.debug(f"retrying transient source mutation: {e}")
+                time.sleep(0.5 * (attempt + 1))
+        assert last is not None
+        raise last
+
+    def _seed_source_roles(self, num_roles: int, members_per_role: int) -> set[str]:
+        """Create num_roles in-scope roles on the source, each with
+        members_per_role distinct user members; return the role names. Members
+        are free-form principal names that need no backing user accounts -- the
+        migrator mirrors them as data."""
+        names: set[str] = set()
+        for i in range(num_roles):
+            name = f"{self.PREFIX}role-{i}"
+            members = [_user(f"u-{i}-{m}") for m in range(members_per_role)]
+            self._retry_transient(self._src.create_role, role=name, members=members)
+            names.add(name)
+        return names
+
+    def _synced_role_names(self) -> set[str]:
+        return {n for n in self._dst.list_role_names() if n.startswith(self.PREFIX)}
+
+    @cluster(num_nodes=6)
+    @parametrize(num_roles=5000, members_per_role=1)
+    @parametrize(num_roles=50, members_per_role=100)
+    @parametrize(num_roles=5, members_per_role=1000)
+    def test_role_sync_at_scale(self, num_roles: int, members_per_role: int) -> None:
+        # create + update + delete each write ~1 controller record per role, on
+        # both the source (seed/modify/delete) and the target (mirror), so each
+        # controller log grows by ~3*num_roles over the lifecycle. Raise the
+        # guard above its 1000 default to admit that while still catching runaway
+        # writes.
+        max_controller_records = 1000 + num_roles * 3
+        self.redpanda.set_expected_controller_records(max_controller_records)
+        self.source_cluster_service.set_expected_controller_records(
+            max_controller_records
+        )
+
+        first = f"{self.PREFIX}role-0"
+        last = f"{self.PREFIX}role-{num_roles - 1}"
+        mirror_timeout_sec = 240
+
+        # CREATE: seed the source, then mirror it to the destination.
+        seed_start = time.time()
+        expected = self._seed_source_roles(num_roles, members_per_role)
+        self.logger.info(
+            f"seeded {num_roles} source roles x {members_per_role} members "
+            f"in {time.time() - seed_start:.1f}s"
+        )
+        create_start = time.time()
+        self._create_link_with_role_sync()
+        wait_until(
+            lambda: self._synced_role_names() >= expected,
+            timeout_sec=mirror_timeout_sec,
+            backoff_sec=2,
+            err_msg=f"{num_roles} roles did not fully mirror within "
+            f"{mirror_timeout_sec}s",
+        )
+        self.logger.info(
+            f"role sync created {num_roles} roles in {time.time() - create_start:.1f}s"
+        )
+        # Membership integrity at the range ends (a full per-role check would add
+        # num_roles RPCs); the first and last seeded roles bound the range.
+        for i in sorted({0, num_roles - 1}):
+            name = f"{self.PREFIX}role-{i}"
+            want = {f"u-{i}-{m}" for m in range(members_per_role)}
+            assert self._dst_role_members(name) == want, (
+                f"membership mismatch for {name} after create"
+            )
+
+        # UPDATE: change every role's membership -- drop one member from each --
+        # so all num_roles roles flow through the update apply loop.
+        update_start = time.time()
+        for i in range(num_roles):
+            self._retry_transient(
+                self._src.remove_role_members,
+                role=f"{self.PREFIX}role-{i}",
+                members=[_user(f"u-{i}-0")],
+            )
+        wait_until(
+            lambda: (
+                "u-0-0" not in self._dst_role_members(first)
+                and f"u-{num_roles - 1}-0" not in self._dst_role_members(last)
+            ),
+            timeout_sec=mirror_timeout_sec,
+            backoff_sec=2,
+            err_msg=f"membership update did not mirror for {num_roles} roles",
+        )
+        self.logger.info(
+            f"role sync updated {num_roles} roles in {time.time() - update_start:.1f}s"
+        )
+
+        # DELETE: drop every source role and confirm the destination is pruned.
+        delete_start = time.time()
+        for name in expected:
+            self._retry_transient(self._src.delete_role, name, delete_acls=False)
+        wait_until(
+            lambda: len(self._synced_role_names()) == 0,
+            timeout_sec=mirror_timeout_sec,
+            backoff_sec=2,
+            err_msg=f"{num_roles} roles were not pruned from the destination",
+        )
+        self.logger.info(
+            f"role sync deleted {num_roles} roles in {time.time() - delete_start:.1f}s"
+        )
+
+        # The full lifecycle ran fault-free -> the task settles ACTIVE.
+        wait_until(
+            lambda: self._roles_task_state() == shadow_link_pb2.TASK_STATE_ACTIVE,
+            timeout_sec=30,
+            backoff_sec=1,
+            err_msg="roles task did not settle ACTIVE after the lifecycle",
         )
