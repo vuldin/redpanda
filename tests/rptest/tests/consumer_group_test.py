@@ -923,9 +923,6 @@ class ConsumerGroupTest(RedpandaTest):
         # Use a small batch size to ensure that fetches are distributed across all partitions
         batch_size = 1
         produce_msg_cnt_min = 1000
-        consume_count = (topic_count * partition_count * produce_msg_cnt_min) // (
-            2 * consumer_count
-        )
 
         self.redpanda.set_cluster_config(
             {
@@ -1010,12 +1007,70 @@ class ConsumerGroupTest(RedpandaTest):
             self.logger.debug(f"  Produced {tp} - flushed {offset} msgs")
 
         self.logger.info("Consuming")
-        for consumer in consumers:
-            consumer.consume(num_messages=consume_count, timeout=10)
-            assert len(consumer.assignment()) != 0, (
-                "Consumer was not assigned any partitions"
-            )
-            self.logger.debug("  Consumed")
+
+        # Consume until every consumer has read at least one record from each of
+        # its assigned partitions, so that every partition ends up with a
+        # committed offset (and therefore a committed-offset/lag metric).
+
+        # assigned
+        # consumer -> set{(topic, partition)}
+        # For each consumer, set of partitions assigned as of most recent request
+        assigned: list[set[tuple[str, int]]] = [set() for _ in consumers]
+
+        # consumed_from
+        # consumer -> set{(topic, partition)}
+        # For each consumer, set of all partitions ever consumed from
+        consumed_from: list[set[tuple[str, int]]] = [set() for _ in consumers]
+
+        def is_consumer_ready(i):
+            """
+            For consumer i, returns True if the consumer has read from
+            all assigned partitions, False otherwise.
+            """
+            if not assigned[i]:
+                self.logger.debug(f"Consumer {i} was not assigned any partitions.")
+                return False
+            elif not assigned[i] <= consumed_from[i]:
+                not_yet_assigned = {
+                    str(p) for p in assigned[i] if p not in consumed_from[i]
+                }
+                self.logger.debug(
+                    f"Consumer {i} has not yet consumed from assigned "
+                    f"partitions: {', '.join(not_yet_assigned)}."
+                )
+                return False
+            else:
+                return True
+
+        def all_consumers_ready():
+            return all(map(is_consumer_ready, range(len(consumers))))
+
+        def consume_and_check_ready():
+            """
+            For each consumer:
+            - consume partition_count messages.
+            - set assigned with the resulting set of partitions assigned to the
+              consumer.
+            - update consumed_from with each partition consumed from
+
+            Return true once all partitions have read at least one message from
+            each partition to which they were most recently assigned.
+            """
+            for i, consumer in enumerate(consumers):
+                msgs = consumer.consume(num_messages=partition_count, timeout=1)
+                assigned[i] = {(tp.topic, tp.partition) for tp in consumer.assignment()}
+                for msg in msgs:
+                    if msg is None or msg.error() is not None:
+                        continue
+                    consumed_from[i].add((msg.topic(), msg.partition()))
+            return all_consumers_ready()
+
+        wait_until(
+            consume_and_check_ready,
+            30,
+            1,
+            err_msg="Timed out waiting for all partitions to be consumed",
+        )
 
         self.logger.info("Waiting for lag_metrics")
         time.sleep(wait_for_lag_secs)
