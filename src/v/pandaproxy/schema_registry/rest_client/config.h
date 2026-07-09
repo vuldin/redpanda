@@ -105,9 +105,12 @@ registry_compatibility_level_from_wire(std::string_view sv) {
 /// flags, metadata, rule sets) that this client does not model; the names of
 /// any such top-level fields present are recorded in \ref unknown_fields, so a
 /// caller can tell config content was dropped without this client having to
-/// model it (mirroring parsed_schema::unknown_fields). Redpanda's own server
-/// emits only `compatibilityLevel`, so unknown_fields is empty against it; a
-/// third-party Confluent-compatible registry may populate it.
+/// model it. This serves the same intent as source_schema_read::unsupported on
+/// the schema-fetch path, but is a simpler representation: bare top-level field
+/// names only, not the structured JSON pointer + type that path records.
+/// Redpanda's own server emits only `compatibilityLevel`, so unknown_fields is
+/// empty against it; a third-party Confluent-compatible registry may populate
+/// it.
 struct config_info {
     registry_compatibility_level level;
     ss::sstring raw;

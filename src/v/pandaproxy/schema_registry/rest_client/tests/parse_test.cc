@@ -940,7 +940,7 @@ TEST_CORO(parse_subject_version_test, minimal_avro_defaults) {
         R"("schema":"{\"type\":\"string\"}"})"),
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(res.has_value());
-    ASSERT_TRUE_CORO(res.value().unknown_fields.empty());
+    ASSERT_TRUE_CORO(res.value().unsupported.empty());
     const auto& s = res.value().schema;
     ASSERT_EQ_CORO(
       s.schema.sub(), (context_subject{default_context, subject{"User"}}));
@@ -982,7 +982,7 @@ TEST_CORO(parse_subject_version_test, full_object_maps_all_fields) {
         R"("schema":"{\"type\":\"record\"}","deleted":true})"),
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(res.has_value());
-    ASSERT_TRUE_CORO(res.value().unknown_fields.empty());
+    ASSERT_TRUE_CORO(res.value().unsupported.empty());
     const auto& s = res.value().schema;
     ASSERT_EQ_CORO(
       s.schema.sub(), (context_subject{context{".ctx"}, subject{"MyRecord"}}));
@@ -1023,13 +1023,14 @@ TEST_CORO(parse_subject_version_test, reference_subject_honors_policy) {
       (context_subject{default_context, subject{":.ctx:Sub"}}));
 }
 
-TEST_CORO(parse_subject_version_test, records_unmodeled_fields) {
-    // guid/ts/ruleSet/schemaTags (and a future field) are not mapped into the
-    // schema, but their top-level names are recorded so the caller can decide
-    // whether dropping them is acceptable. A nested object/array under such a
-    // field is skipped without descending into it. metadata is special: its
-    // modeled `properties` is captured, while an unmodeled sub-key
-    // (`sensitive`) is reported under a `metadata.` prefix.
+TEST_CORO(parse_subject_version_test, surfaces_unsupported_fields) {
+    // ruleSet/schemaTags (and a future field) are not mapped into the schema;
+    // they are surfaced in `unsupported` as JSON pointers so the caller can
+    // apply its policy. A nested object/array under such a field is skipped
+    // without descending into it. metadata is special: its modeled `properties`
+    // is captured, while an unmodeled sub-key (`sensitive`) is reported as
+    // `/metadata/sensitive`. The server-assigned `guid`/`ts` are ignorable and
+    // dropped silently (not surfaced).
     auto res = co_await parse_subject_version(
       iobuf::from(
         R"({"guid":"abc","ts":1715000000000,"subject":"User","version":1,)"
@@ -1050,17 +1051,31 @@ TEST_CORO(parse_subject_version_test, records_unmodeled_fields) {
     const auto& props = *s.schema.def().meta()->properties;
     ASSERT_EQ_CORO(props.size(), size_t{1});
     ASSERT_EQ_CORO(props.at("owner"), "team-a");
-    // The unmodeled keys are reported, in encounter order; modeled nested keys
-    // (metadata.properties, ruleSet.domainRules, ...) are not. metadata's
-    // unmodeled `sensitive` sub-key is reported under a `metadata.` prefix.
-    const auto& unknown = res.value().unknown_fields;
-    ASSERT_EQ_CORO(unknown.size(), size_t{6});
-    ASSERT_EQ_CORO(unknown[0], "guid");
-    ASSERT_EQ_CORO(unknown[1], "ts");
-    ASSERT_EQ_CORO(unknown[2], "ruleSet");
-    ASSERT_EQ_CORO(unknown[3], "metadata.sensitive");
-    ASSERT_EQ_CORO(unknown[4], "schemaTags");
-    ASSERT_EQ_CORO(unknown[5], "futureField");
+    // Unsupported fields are surfaced as JSON pointers, in encounter order.
+    // guid/ts are ignorable (dropped); modeled nested keys
+    // (metadata.properties, ruleSet.domainRules, ...) are not reported.
+    const auto& unsupported = res.value().unsupported;
+    ASSERT_EQ_CORO(unsupported.size(), size_t{4});
+    ASSERT_EQ_CORO(unsupported[0].json_pointer, "/ruleSet");
+    ASSERT_EQ_CORO(unsupported[0].json_type, "object");
+    ASSERT_EQ_CORO(unsupported[1].json_pointer, "/metadata/sensitive");
+    ASSERT_EQ_CORO(unsupported[1].json_type, "array");
+    ASSERT_EQ_CORO(unsupported[2].json_pointer, "/schemaTags");
+    ASSERT_EQ_CORO(unsupported[2].json_type, "array");
+    ASSERT_EQ_CORO(unsupported[3].json_pointer, "/futureField");
+    ASSERT_EQ_CORO(unsupported[3].json_type, "array");
+}
+
+TEST_CORO(parse_subject_version_test, ignorable_and_null_unmodeled_fields) {
+    // Server-assigned guid/ts are ignorable, and a null-valued unmodeled field
+    // is treated as absent; none are surfaced.
+    auto res = co_await parse_subject_version(
+      iobuf::from(
+        R"({"subject":"r","version":1,"id":2,"schema":"x",)"
+        R"("guid":"g","ts":1,"ruleSet":null})"),
+      qualified_subjects_enabled::yes);
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_TRUE_CORO(res.value().unsupported.empty());
 }
 
 TEST_CORO(parse_subject_version_test, metadata_properties_coercion) {
@@ -1074,7 +1089,7 @@ TEST_CORO(parse_subject_version_test, metadata_properties_coercion) {
         R"("enabled":true,"hidden":false}}})"),
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(res.has_value());
-    ASSERT_TRUE_CORO(res.value().unknown_fields.empty());
+    ASSERT_TRUE_CORO(res.value().unsupported.empty());
     const auto& meta = res.value().schema.schema.def().meta();
     ASSERT_TRUE_CORO(meta.has_value());
     ASSERT_TRUE_CORO(meta->properties.has_value());
@@ -1099,10 +1114,12 @@ TEST_CORO(parse_subject_version_test, metadata_present_without_properties) {
     const auto& meta = res.value().schema.schema.def().meta();
     ASSERT_TRUE_CORO(meta.has_value());
     ASSERT_FALSE_CORO(meta->properties.has_value());
-    const auto& unknown = res.value().unknown_fields;
-    ASSERT_EQ_CORO(unknown.size(), size_t{2});
-    ASSERT_EQ_CORO(unknown[0], "metadata.tags");
-    ASSERT_EQ_CORO(unknown[1], "metadata.sensitive");
+    const auto& unsupported = res.value().unsupported;
+    ASSERT_EQ_CORO(unsupported.size(), size_t{2});
+    ASSERT_EQ_CORO(unsupported[0].json_pointer, "/metadata/tags");
+    ASSERT_EQ_CORO(unsupported[0].json_type, "object");
+    ASSERT_EQ_CORO(unsupported[1].json_pointer, "/metadata/sensitive");
+    ASSERT_EQ_CORO(unsupported[1].json_type, "array");
 }
 
 TEST_CORO(parse_subject_version_test, metadata_empty_and_null) {
@@ -1111,14 +1128,14 @@ TEST_CORO(parse_subject_version_test, metadata_empty_and_null) {
       iobuf::from(R"({"subject":"r","version":1,"id":2,"metadata":{}})"),
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(empty_obj.has_value());
-    ASSERT_TRUE_CORO(empty_obj.value().unknown_fields.empty());
+    ASSERT_TRUE_CORO(empty_obj.value().unsupported.empty());
     ASSERT_TRUE_CORO(empty_obj.value().schema.schema.def().meta().has_value());
 
     auto null_meta = co_await parse_subject_version(
       iobuf::from(R"({"subject":"r","version":1,"id":2,"metadata":null})"),
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(null_meta.has_value());
-    ASSERT_TRUE_CORO(null_meta.value().unknown_fields.empty());
+    ASSERT_TRUE_CORO(null_meta.value().unsupported.empty());
     ASSERT_FALSE_CORO(null_meta.value().schema.schema.def().meta().has_value());
 
     // metadata.properties: null leaves properties absent (metadata present).
@@ -1271,7 +1288,7 @@ TEST_CORO(parse_error_body_test, trailing_content_is_nullopt) {
 
 TEST_CORO(parse_subject_version_test, reference_unknown_keys_skipped) {
     // A reference may carry keys the client does not model; they are skipped
-    // (never rejected, never recorded in unknown_fields) and the modeled
+    // (never rejected, never surfaced in `unsupported`) and the modeled
     // name/subject/version are still recovered.
     auto res = co_await parse_subject_version(
       iobuf::from(
@@ -1279,7 +1296,7 @@ TEST_CORO(parse_subject_version_test, reference_unknown_keys_skipped) {
         R"([{"extra":{"nested":true},"name":"n","subject":"s","version":2}]})"),
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(res.has_value());
-    ASSERT_TRUE_CORO(res->unknown_fields.empty());
+    ASSERT_TRUE_CORO(res->unsupported.empty());
     const auto& refs = res->schema.schema.def().refs();
     ASSERT_EQ_CORO(refs.size(), size_t{1});
     ASSERT_EQ_CORO(refs[0].name, "n");

@@ -564,7 +564,7 @@ client::list_subject_versions(
     co_return std::move(parsed.value());
 }
 
-ss::future<std::expected<parsed_schema, domain_error>>
+ss::future<std::expected<source_schema_read, domain_error>>
 client::get_schema_by_version(
   const context_subject& subject,
   schema_version version,

@@ -1585,7 +1585,7 @@ TEST(rest_client, get_schema_by_version_success) {
     client.shutdown().get();
 
     ASSERT_TRUE(res.has_value());
-    EXPECT_TRUE(res->unknown_fields.empty());
+    EXPECT_TRUE(res->unsupported.empty());
     const auto& s = res->schema;
     EXPECT_EQ(s.schema.sub(), subject);
     EXPECT_EQ(s.version, pps::schema_version{3});

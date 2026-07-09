@@ -15,9 +15,12 @@
 
 #include <seastar/core/coroutine.hh>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string_view>
 #include <utility>
 
 namespace pandaproxy::schema_registry::rest_client {
@@ -41,6 +44,57 @@ std::optional<int32_t> checked_nonnegative_i32(int64_t v) {
         return std::nullopt;
     }
     return static_cast<int32_t>(v);
+}
+
+// Server-assigned response fields Redpanda does not model but which carry no
+// user content. If a source returns them, this list drops them rather than
+// surfacing them to the unsupported-feature policy, so a source that returns
+// them does not spuriously trip it.
+//
+// A constexpr array scanned with ranges::contains is a deliberate choice at
+// this size: it keeps the list trivially extensible (just add a literal) rather
+// than a switch/case, and for N=2 a linear scan beats a hash set (no static
+// init, stays constexpr). Promote to a flat_hash_set only if this list grows
+// large or gains a bulk-lookup site (cf. cluster_link's
+// disallowed_topic_properties, materialized into a set in its validator).
+constexpr auto ignorable_fields = std::to_array<std::string_view>(
+  {"guid", "ts"});
+
+bool is_ignorable_field(std::string_view key) {
+    return std::ranges::contains(ignorable_fields, key);
+}
+
+// The field's JSON type name, for unsupported-feature diagnostics; takes the
+// parser's current value token.
+const char* json_type_name(serde::json::token t) {
+    using token = serde::json::token;
+    switch (t) {
+    case token::start_object:
+        return "object";
+    case token::start_array:
+        return "array";
+    case token::value_string:
+        return "string";
+    case token::value_int:
+    case token::value_double:
+        return "number";
+    case token::value_true:
+    case token::value_false:
+        return "boolean";
+    case token::value_null:
+        return "null";
+    // Non-value tokens never reach here (this is called only on the parser's
+    // current value token). They are enumerated rather than folded into a
+    // default so the switch stays exhaustive: -Wswitch (via -Werror) then flags
+    // a newly-added token at compile time instead of silently returning
+    // "unknown".
+    case token::error:
+    case token::key:
+    case token::end_object:
+    case token::end_array:
+    case token::eof:
+        return "unknown";
+    }
 }
 
 } // namespace
@@ -517,21 +571,19 @@ parse_references(serde::json::parser& p, qualified_subjects_enabled qualified) {
       parse_error{.reason = "truncated or malformed references array"});
 }
 
-// The result of parsing a metadata object: the modeled portion plus the names
-// of any sub-keys we don't model.
+// The result of parsing a metadata object: the modeled portion plus any
+// unsupported sub-fields, each already reported as a `/metadata/<key>` pointer.
 struct parsed_metadata {
     schema_metadata metadata;
-    // Unmodeled keys found directly inside `metadata` (e.g. `tags`,
-    // `sensitive`), unqualified; the caller qualifies and propagates them.
-    chunked_vector<ss::sstring> unknown_fields;
+    chunked_vector<unsupported_feature> unsupported;
 };
 
 // Parse a metadata object of the form {"properties": {<str>: <str>}, ...}.
 // Entered with the current token at the object start; leaves the parser at the
 // end_object token. Only `properties` is modeled; its values are stored as
 // strings, with numbers and booleans coerced to strings to match the write
-// path. Any other key (e.g. `tags`, `sensitive`) is returned, unqualified, in
-// parsed_metadata::unknown_fields for the caller to record.
+// path. Any other non-null key (e.g. `tags`, `sensitive`) is reported in
+// parsed_metadata::unsupported as a `/metadata/<key>` pointer.
 ss::future<std::expected<parsed_metadata, parse_error>>
 parse_metadata(serde::json::parser& p) {
     using token = serde::json::token;
@@ -546,7 +598,14 @@ parse_metadata(serde::json::parser& p) {
               parse_error{.reason = "truncated JSON in schema metadata"});
         }
         if (key != "properties") {
-            result.unknown_fields.push_back(std::move(key));
+            // A null value means the sub-field is absent; anything else is an
+            // unsupported feature, surfaced as a `/metadata/<key>` pointer.
+            if (p.token() != token::value_null) {
+                result.unsupported.push_back(
+                  unsupported_feature{
+                    .json_pointer = ssx::sformat("/metadata/{}", key),
+                    .json_type = json_type_name(p.token())});
+            }
             co_await p.skip_value();
             continue;
         }
@@ -602,7 +661,7 @@ parse_metadata(serde::json::parser& p) {
 
 } // namespace
 
-ss::future<std::expected<parsed_schema, parse_error>>
+ss::future<std::expected<source_schema_read, parse_error>>
 parse_subject_version(iobuf body, qualified_subjects_enabled qualified) {
     using token = serde::json::token;
     // Firewall exceptions from the parser: malformed input is reported via the
@@ -623,7 +682,7 @@ parse_subject_version(iobuf body, qualified_subjects_enabled qualified) {
         schema_definition::references refs;
         is_deleted deleted{false};
         std::optional<schema_metadata> metadata;
-        chunked_vector<ss::sstring> unknown_fields;
+        chunked_vector<unsupported_feature> unsupported;
 
         while (co_await p.next()) {
             if (p.token() == token::end_object) {
@@ -637,8 +696,8 @@ parse_subject_version(iobuf body, qualified_subjects_enabled qualified) {
                 }
                 // Absent fields fall back to defaults/sentinels; completeness
                 // is a higher-layer concern. Unmodeled fields were recorded in
-                // unknown_fields above for the caller to act on.
-                co_return parsed_schema{
+                // `unsupported` above for the caller to act on.
+                co_return source_schema_read{
                   .schema = stored_schema{
                     .schema = subject_schema{
                       subject.value_or(invalid_subject),
@@ -651,7 +710,7 @@ parse_subject_version(iobuf body, qualified_subjects_enabled qualified) {
                     .version = version.value_or(invalid_schema_version),
                     .id = id.value_or(invalid_schema_id),
                     .deleted = deleted},
-                  .unknown_fields = std::move(unknown_fields)};
+                  .unsupported = std::move(unsupported)};
             }
             if (p.token() != token::key) {
                 co_return std::unexpected(
@@ -730,30 +789,35 @@ parse_subject_version(iobuf body, qualified_subjects_enabled qualified) {
                 refs = std::move(*r);
             } else if (key == "metadata") {
                 // Partially modeled: parse_metadata captures `properties` and
-                // returns any other sub-key (e.g. `tags`), which we qualify
-                // with a `metadata.` prefix into unknown_fields. A null
-                // metadata is treated as absent; any other non-object is
-                // unrepresentable.
+                // returns any other sub-key (e.g. `tags`) as a
+                // `/metadata/<key>` unsupported feature. A null metadata is
+                // treated as absent; any other non-object is unrepresentable.
                 if (p.token() == token::start_object) {
                     auto m = co_await parse_metadata(p);
                     if (!m) {
                         co_return std::unexpected(std::move(m.error()));
                     }
                     metadata = std::move(m->metadata);
-                    for (const auto& sub : m->unknown_fields) {
-                        unknown_fields.push_back(
-                          ssx::sformat("metadata.{}", sub));
+                    for (auto& f : m->unsupported) {
+                        unsupported.push_back(std::move(f));
                     }
                 } else if (p.token() != token::value_null) {
                     co_return std::unexpected(
                       parse_error{.reason = "metadata must be an object"});
                 }
             } else {
-                // Unknown / not-yet-modeled field (guid, ts, ruleSet,
-                // schemaTags, ...): skip its value, but record the top-level
-                // key so the caller can decide whether dropping it is
-                // acceptable.
-                unknown_fields.push_back(std::move(key));
+                // Unmodeled field. Server-assigned fields that carry no user
+                // content (`guid`, `ts`) are dropped silently; a null value
+                // means the field is absent; anything else is an unsupported
+                // feature, surfaced as a `/<key>` pointer for the migration
+                // policy to act on.
+                if (
+                  !is_ignorable_field(key) && p.token() != token::value_null) {
+                    unsupported.push_back(
+                      unsupported_feature{
+                        .json_pointer = ssx::sformat("/{}", key),
+                        .json_type = json_type_name(p.token())});
+                }
                 co_await p.skip_value();
             }
         }
