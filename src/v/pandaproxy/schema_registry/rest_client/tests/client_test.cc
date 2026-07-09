@@ -1592,6 +1592,42 @@ TEST(rest_client, get_schema_by_version_success) {
     EXPECT_EQ(s.id, pps::schema_id{100001});
 }
 
+TEST(rest_client, get_schema_by_version_opts_into_and_ignores_extended_fields) {
+    // The client sends Confluent-Accept-Unknown-Properties so the extended
+    // fields (guid, ts, deleted) are returned; guid/ts are on the ignorable
+    // list and deleted is modeled, so only a real feature (ruleSet) surfaces.
+    constexpr std::string_view body
+      = R"({"subject":"User","version":1,"id":2,"schema":"x",)"
+        R"("guid":"abc","ts":1715000000000,"deleted":false,)"
+        R"("ruleSet":{"domainRules":[{"name":"r"}]}})";
+    rc::client client{
+      make_http_client([body](mock_client& m) {
+          EXPECT_CALL(m, request_and_collect_response(_, _, _))
+            .WillOnce([body](
+                        bh::request_header<>&& r,
+                        std::optional<iobuf>,
+                        ss::lowres_clock::duration) {
+                EXPECT_EQ(r.at("Confluent-Accept-Unknown-Properties"), "true");
+                return ss::make_ready_future<http::downloaded_response>(
+                  http::downloaded_response{
+                    .status = bh::status::ok, .body = iobuf::from(body)});
+            });
+      }),
+      endpoint};
+
+    auto subject = pps::context_subject::unqualified("User");
+    ss::abort_source as;
+    retry_chain_node rtc(as, 5s, 100ms);
+    auto res = client
+                 .get_schema_by_version(subject, pps::schema_version{1}, rtc)
+                 .get();
+    client.shutdown().get();
+
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(res->unsupported.size(), size_t{1});
+    EXPECT_EQ(res->unsupported[0].json_pointer, "/ruleSet");
+}
+
 TEST(rest_client, get_schema_by_version_deleted_adds_query_param) {
     constexpr std::string_view body
       = R"({"subject":"User","version":3,"id":100001,"schemaType":"AVRO",)"

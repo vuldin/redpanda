@@ -47,9 +47,11 @@ std::optional<int32_t> checked_nonnegative_i32(int64_t v) {
 }
 
 // Server-assigned response fields Redpanda does not model but which carry no
-// user content. If a source returns them, this list drops them rather than
-// surfacing them to the unsupported-feature policy, so a source that returns
-// them does not spuriously trip it.
+// user content. The client opts into them via the
+// `Confluent-Accept-Unknown-Properties` header (see client.cc), so they arrive
+// on schema responses; this list drops them rather than surfacing them to the
+// unsupported-feature policy, so a source that returns them does not spuriously
+// trip it.
 //
 // A constexpr array scanned with ranges::contains is a deliberate choice at
 // this size: it keeps the list trivially extensible (just add a literal) rather
