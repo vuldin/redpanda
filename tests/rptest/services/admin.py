@@ -1410,7 +1410,14 @@ class Admin:
     ):
         def user_exists():
             for node in self.redpanda.started_nodes():
-                users = self.list_users(node=node)
+                try:
+                    users = self.list_users(node=node)
+                except RequestException as e:
+                    self.redpanda.logger.debug(
+                        f"await_user_exists: transient error listing users on "
+                        f"{node.account.hostname}, retrying: {e}"
+                    )
+                    return False
                 if username not in users:
                     return False
             return True
