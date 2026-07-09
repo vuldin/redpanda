@@ -31,6 +31,7 @@ from rptest.services.multi_cluster_services import SecondaryClusterArgs
 from rptest.services.redpanda import SchemaRegistryConfig
 from rptest.tests.cluster_linking_test_base import ShadowLinkTestBase
 from rptest.tests.schema_registry_test import SchemaRegistryRedpandaClient
+from rptest.util import firewall_blocked
 
 NS = "com.acme"
 LINK_NAME = "sr-sync"
@@ -892,51 +893,47 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
             self._record("Orders", [{"name": "v", "type": "string"}]),
         )
 
-        # Point the link at an endpoint the reader rejects (out-of-range port),
-        # so it parks immediately -- no connect retries -- without completing a
-        # sync, recording the failure in last_error_message.
-        self._create_sr_link(source_url="http://127.0.0.1:99999")
-
-        # The park records the failure in last_error_message and, having
-        # completed no sync, leaves last_full_sync unset.
-        def parked() -> bool:
-            sr = self._admin_sr_status()
-            return sr.last_error_message != "" and not sr.HasField("last_full_sync")
-
-        wait_until(
-            parked,
-            timeout_sec=60,
-            backoff_sec=1,
-            err_msg="link did not park on an unreachable source",
-        )
-
-        # Repoint the link at the real source. The config change forces a fresh
-        # full sync, which now reaches the source and replicates.
-        good_url = self.source_cluster_service.schema_reg(limit=1)
-        link = self.get_link(LINK_NAME)
-        link.configurations.schema_registry_sync_options.shadow_schema_registry_api.source_url = good_url
-        self.update_link(
-            shadow_link=link,
-            update_mask=google.protobuf.field_mask_pb2.FieldMask(
-                paths=["configurations.schema_registry_sync_options"]
-            ),
-        )
-
+        # Link creation preflight-probes the source for reachability, so the
+        # link must be created against the live source; let its first full sync
+        # land before the source is cut off.
+        self._create_sr_link()
         self._wait_synced(src, dest, [("orders-value", 1)])
 
-        def recovered() -> bool:
-            sr = self._admin_sr_status()
-            return (
-                sr.HasField("last_full_sync")
-                and sr.inventory.selected_source_subjects == 1
-                and sr.totals_since_task_start.subject_versions_changed >= 1
-            )
-
         wait_until(
-            recovered,
+            lambda: self._admin_sr_status().HasField("last_full_sync"),
             timeout_sec=60,
             backoff_sec=1,
-            err_msg="link did not recover after repointing at a reachable source",
+            err_msg="link did not complete its first full sync",
+        )
+
+        # Sever the destination cluster's egress to the source Schema Registry
+        # (which listens on 8081): the running sync's list_contexts fails with
+        # source_unavailable, so the task records last_error_message and leaves
+        # _last_full_sync unadvanced -- it keeps retrying on the normal cadence,
+        # so recovery needs no config change, just the source coming back.
+        with firewall_blocked(self.target_cluster_service.nodes, 8081):
+            wait_until(
+                lambda: self._admin_sr_status().last_error_message != "",
+                timeout_sec=90,
+                backoff_sec=1,
+                err_msg="link did not report an error while the source was unreachable",
+            )
+            # Frozen while unreachable (no full sync can complete), so a later
+            # finish_time proves a fresh sync ran once connectivity returned.
+            # last_error_message is sticky (never cleared on success), so it
+            # cannot serve as the recovery signal.
+            synced_before = (
+                self._admin_sr_status().last_full_sync.finish_time.ToNanoseconds()
+            )
+
+        # Connectivity restored: the next full sync reaches the source on the
+        # normal cadence and completes.
+        wait_until(
+            lambda: self._admin_sr_status().last_full_sync.finish_time.ToNanoseconds()
+            > synced_before,
+            timeout_sec=90,
+            backoff_sec=1,
+            err_msg="link did not recover after the source became reachable again",
         )
 
     @cluster(num_nodes=6)

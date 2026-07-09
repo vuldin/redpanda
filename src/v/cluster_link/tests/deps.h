@@ -22,6 +22,7 @@
 #include "kafka/client/test/cluster_mock.h"
 #include "kafka/data/rpc/deps.h"
 #include "kafka/data/rpc/test/deps.h"
+#include "schema/tests/fake_registry.h"
 #include "security/acl_entry_set.h"
 #include "security/role.h"
 #include "security/role_store.h"
@@ -35,6 +36,27 @@ using data_src_factory
 using data_sink_factory
   = cluster_link::replication::tests::accounting_sink_factory;
 namespace cluster_link::tests {
+
+/// Source Schema Registry prober test double. Reachable by default, or reports
+/// an error when one is set.
+class fake_source_sr_prober : public source_sr_prober {
+public:
+    ss::future<cl_result<void>> check_source_reachable(
+      const model::schema_registry_sync_config::shadow_schema_registry_api&,
+      ss::abort_source&) override {
+        ++call_count;
+        if (error.has_value()) {
+            return ss::make_ready_future<cl_result<void>>(error.value());
+        }
+        return ss::make_ready_future<cl_result<void>>(outcome::success());
+    }
+
+    std::optional<err_info> error;
+    // Number of times check_source_reachable was invoked; lets tests assert the
+    // source probe ran (or was skipped) rather than inferring it from the
+    // preflight result alone.
+    size_t call_count{0};
+};
 
 class test_link_factory : public link_factory {
 public:
@@ -793,6 +815,7 @@ private:
     test_partition_metadata_provider* _partition_metadata_provider{nullptr};
     test_kafka_rpc_client_service* _tkrcs{nullptr};
     fake_members_table_provider* _fmtp{nullptr};
+    schema::fake_registry _fake_schema_registry;
     ss::sharded<manager> _manager;
     config::mock_property<int16_t> _default_topic_replication{1};
 

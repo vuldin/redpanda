@@ -35,6 +35,7 @@
 #include "cluster_link/security_migrator.h"
 #include "cluster_link/shadow_linking_rpc_service.h"
 #include "cluster_link/source_topic_syncer.h"
+#include "cluster_link/sr_preflight_checker.h"
 #include "config/node_config.h"
 #include "kafka/client/direct_consumer/direct_consumer.h"
 #include "kafka/data/make_exact_offset_replicator.h"
@@ -1172,12 +1173,10 @@ service::delete_cluster_link(model::name_t name, bool force_delete_link) {
       });
 }
 
-ss::future<cl_result<void>>
-service::test_connection(model::name_t name, model::connection_config config) {
+ss::future<cl_result<void>> service::test_connection(model::metadata md) {
     auto h = _gate.hold();
-    return with_manager([name = std::move(name),
-                         config = std::move(config)](manager* mgr) mutable {
-        return mgr->test_connection(std::move(name), std::move(config));
+    return with_manager([md = std::move(md)](manager* mgr) mutable {
+        return mgr->test_connection(std::move(md));
     });
 }
 
@@ -1276,6 +1275,12 @@ ss::future<> service::maybe_start_manager() {
     if (_manager) {
         co_return;
     }
+    // The destination Schema Registry is owned by the service so it outlives
+    // the manager and its tasks. Construct it before the manager so it can be
+    // handed in for the Schema Registry preflight checks.
+    _schema_registry_dest = schema::registry::make_default(
+      _schema_registry_api);
+
     _manager = std::make_unique<manager>(
       _self,
       partition_leader_cache::make_default(_partition_leaders_table),
@@ -1299,6 +1304,8 @@ ss::future<> service::maybe_start_manager() {
         _hm_frontend),
       kafka_rpc_client_service::make_default(_kafka_data_rpc_client),
       members_table_provider::make_default(&_controller->get_members_table()),
+      sr_preflight_checker::make_default(
+        *_schema_registry_dest, source_sr_prober::make_default()),
       30s, // Temporary until we have a proper configuration for this
       config::shard_local_cfg().default_topic_replication.bind(),
       _scheduling_group);
@@ -1307,11 +1314,9 @@ ss::future<> service::maybe_start_manager() {
     co_await _manager->register_task_factory<security_migrator_factory>();
     co_await _manager->register_task_factory<roles_migrator_factory>();
 
-    // The destination Schema Registry and source reader factory are owned by
-    // the service so they outlive the tasks. Each link's mirroring task asks
-    // the factory for an HTTP-backed reader bound to its configured source.
-    _schema_registry_dest = schema::registry::make_default(
-      _schema_registry_api);
+    // The source reader factory is owned by the service so it outlives the
+    // tasks. Each link's mirroring task asks the factory for an HTTP-backed
+    // reader bound to its configured source.
     _source_reader_factory
       = std::make_unique<schema_registry_sync::http_source_reader_factory>();
     co_await _manager

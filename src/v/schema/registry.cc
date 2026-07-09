@@ -89,6 +89,16 @@ public:
         co_return co_await reader->list_subject_versions(
           std::move(filter), inc_del);
     }
+    ss::future<bool> has_subjects(
+      ppsr::context ctx, ppsr::include_deleted inc_del) const override {
+        auto [reader, _] = co_await service();
+        co_return co_await reader->has_subjects(std::move(ctx), inc_del);
+    }
+    ss::future<chunked_vector<ppsr::context_subject>>
+    get_subjects(ppsr::include_deleted inc_del) const override {
+        auto [reader, _] = co_await service();
+        co_return co_await reader->get_subjects(inc_del, std::nullopt);
+    }
 
     ss::future<ppsr::context_schema_id>
     create_schema(ppsr::subject_schema schema) override {
@@ -221,6 +231,16 @@ public:
     list_subject_versions(
       ss::noncopyable_function<bool(const ppsr::context_subject&)>,
       ppsr::include_deleted) const override {
+        throw std::logic_error(
+          "invalid attempted usage of a disabled schema registry");
+    }
+    ss::future<bool>
+    has_subjects(ppsr::context, ppsr::include_deleted) const override {
+        throw std::logic_error(
+          "invalid attempted usage of a disabled schema registry");
+    }
+    ss::future<chunked_vector<ppsr::context_subject>>
+    get_subjects(ppsr::include_deleted) const override {
         throw std::logic_error(
           "invalid attempted usage of a disabled schema registry");
     }

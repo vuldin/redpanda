@@ -89,6 +89,20 @@ public:
         bool(const pandaproxy::schema_registry::context_subject&)> filter,
       pandaproxy::schema_registry::include_deleted) const = 0;
 
+    /// Returns true if \p ctx contains any subject. With include_deleted::yes,
+    /// soft-deleted subjects count. Short-circuits at the first match rather
+    /// than materializing the context's versions.
+    virtual ss::future<bool> has_subjects(
+      pandaproxy::schema_registry::context,
+      pandaproxy::schema_registry::include_deleted) const = 0;
+
+    /// Lists all subjects across all contexts, one entry per subject (no
+    /// version fan-out). With include_deleted::yes, soft-deleted subjects are
+    /// included.
+    virtual ss::future<
+      chunked_vector<pandaproxy::schema_registry::context_subject>>
+      get_subjects(pandaproxy::schema_registry::include_deleted) const = 0;
+
     virtual ss::future<pandaproxy::schema_registry::context_schema_id>
       create_schema(pandaproxy::schema_registry::subject_schema) = 0;
 

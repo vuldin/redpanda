@@ -619,6 +619,18 @@ public:
         return _registry.list_subject_versions(std::move(filter), inc_del);
     }
 
+    ss::future<bool> has_subjects(
+      pandaproxy::schema_registry::context ctx,
+      pandaproxy::schema_registry::include_deleted inc_del) const override {
+        return _registry.has_subjects(std::move(ctx), inc_del);
+    }
+
+    ss::future<chunked_vector<pandaproxy::schema_registry::context_subject>>
+    get_subjects(
+      pandaproxy::schema_registry::include_deleted inc_del) const override {
+        return _registry.get_subjects(inc_del);
+    }
+
     ss::future<pandaproxy::schema_registry::context_schema_id> create_schema(
       pandaproxy::schema_registry::subject_schema unparsed) override {
         return _registry.create_schema(std::move(unparsed));
