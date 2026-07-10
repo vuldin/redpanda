@@ -192,8 +192,30 @@ private:
     /// override when it has one, deletes the destination override otherwise.
     ss::future<> sync_mode_and_config(
       const ppsr::context_subject& target,
+      model::schema_registry_sync_config::unsupported_feature_policy
+        feature_policy,
       ss::abort_source& as,
       std::optional<source_error>& unavailable);
+
+    /// Under FAIL, records unsupported config fields as a per-item error and
+    /// returns true so the caller skips the config write; a no-op (false)
+    /// otherwise. Config-path analogue of the reconciler's helper.
+    bool fail_if_contains_unsupported(
+      const ppsr::context_subject& target,
+      model::schema_registry_sync_config::unsupported_feature_policy
+        feature_policy,
+      const chunked_vector<ppsr::unsupported_feature>& unsupported);
+
+    /// Under REMOVE, logs the unsupported config fields and counts them in
+    /// `unsupported_features_removed`; a no-op otherwise. Called once per
+    /// completed config sync -- a static source config re-counts every full
+    /// sync, mirroring FAIL's per-sync errors -- but not after a failed write,
+    /// which is counted as an error instead.
+    void count_if_contains_unsupported_removed(
+      const ppsr::context_subject& target,
+      model::schema_registry_sync_config::unsupported_feature_policy
+        feature_policy,
+      const chunked_vector<ppsr::unsupported_feature>& unsupported);
 
     // Requires a sync in progress (`current_sync` engaged).
     void record_error(std::string_view what);

@@ -559,6 +559,33 @@ private:
     chunked_hash_map<ppsr::subject_version, ppsr::error_info> _failures;
 };
 
+// Wraps a destination registry so a test can make write_config fail for a
+// subject, exercising the REMOVE "no count on a failed config write" path the
+// plain fake (which never rejects a config write) cannot.
+class failing_config_registry final : public delegating_registry {
+public:
+    using delegating_registry::delegating_registry;
+
+    void fail_config(
+      const ppsr::context_subject& sub,
+      ppsr::error_code code,
+      ss::sstring message) {
+        _failures.emplace(sub, ppsr::error_info{code, std::move(message)});
+    }
+
+    ss::future<bool> write_config(
+      ppsr::context_subject sub, ppsr::compatibility_level c) override {
+        if (auto it = _failures.find(sub); it != _failures.end()) {
+            return ss::make_exception_future<bool>(
+              ppsr::as_exception(it->second));
+        }
+        return _inner->write_config(std::move(sub), c);
+    }
+
+private:
+    chunked_hash_map<ppsr::context_subject, ppsr::error_info> _failures;
+};
+
 // Wraps a destination registry, modeling the real Schema Registry's refusal to
 // permanently delete a version still referenced by a live one (the in-memory
 // fake never rejects a delete). Lets a test drive the hard-delete retry loop: a

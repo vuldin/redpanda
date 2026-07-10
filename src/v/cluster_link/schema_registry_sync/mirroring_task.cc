@@ -28,6 +28,8 @@
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/util/defer.hh>
 
+#include <fmt/ranges.h>
+
 #include <utility>
 
 namespace cluster_link::schema_registry_sync {
@@ -337,8 +339,54 @@ ss::future<uint64_t> mirroring_task::purge_destination_only_versions(
     co_return purged;
 }
 
+bool mirroring_task::fail_if_contains_unsupported(
+  const ppsr::context_subject& target,
+  model::schema_registry_sync_config::unsupported_feature_policy feature_policy,
+  const chunked_vector<ppsr::unsupported_feature>& unsupported) {
+    using policy_t
+      = model::schema_registry_sync_config::unsupported_feature_policy;
+    if (feature_policy != policy_t::fail || unsupported.empty()) {
+        return false;
+    }
+    // Per-item failure (as on the schema-body path): count it, log the
+    // offending fields, and let the caller skip this subject's config sync
+    // while the rest of the work continues.
+    record_error(
+      fmt::format(
+        "{} config carries {} unsupported feature(s) the destination cannot "
+        "store; failing it under the FAIL policy: {}",
+        target,
+        unsupported.size(),
+        fmt::join(unsupported, ", ")));
+    return true;
+}
+
+void mirroring_task::count_if_contains_unsupported_removed(
+  const ppsr::context_subject& target,
+  model::schema_registry_sync_config::unsupported_feature_policy feature_policy,
+  const chunked_vector<ppsr::unsupported_feature>& unsupported) {
+    using policy_t
+      = model::schema_registry_sync_config::unsupported_feature_policy;
+    if (feature_policy != policy_t::remove || unsupported.empty()) {
+        return;
+    }
+    // Only compatibilityLevel is synced, so the unsupported config fields are
+    // already dropped; log and count them.
+    vlog(
+      logger().info,
+      "Removed {} unsupported config feature(s) from {}: {}",
+      unsupported.size(),
+      target,
+      fmt::join(unsupported, ", "));
+    _status.current_sync->summary.unsupported_features_removed
+      += unsupported.size();
+    _status.totals_since_task_start.unsupported_features_removed
+      += unsupported.size();
+}
+
 ss::future<> mirroring_task::sync_mode_and_config(
   const ppsr::context_subject& target,
+  model::schema_registry_sync_config::unsupported_feature_policy feature_policy,
   ss::abort_source& as,
   std::optional<source_error>& unavailable) {
     // A peer fiber already hit source_unavailable; skip the remaining work.
@@ -402,10 +450,16 @@ ss::future<> mirroring_task::sync_mode_and_config(
         co_return;
     }
 
+    auto& cfg = config.value();
+    // FAIL rejects before the write; REMOVE accounting runs after it lands.
+    // Policy diagnostics name the source subject, write errors the destination.
+    if (fail_if_contains_unsupported(target, feature_policy, cfg.unsupported)) {
+        co_return;
+    }
+
     auto write = co_await ss::coroutine::as_future(
-      config.value().compatibility.has_value()
-        ? _destination->write_config(
-            dest_target, *config.value().compatibility)
+      cfg.compatibility.has_value()
+        ? _destination->write_config(dest_target, *cfg.compatibility)
         : _destination->delete_config(dest_target));
     if (write.failed()) {
         auto ex = write.get_exception();
@@ -420,6 +474,12 @@ ss::future<> mirroring_task::sync_mode_and_config(
         ++_status.current_sync->summary.compatibility_configs_changed;
         ++_status.totals_since_task_start.compatibility_configs_changed;
     }
+    // Counted per completed sync, even when the write was a no-op: the drop
+    // recurs on every re-read, and a governance-only config (a no-op delete)
+    // must not be silently ignored. Mirrors FAIL's per-sync errors; the schema
+    // path counts once because its projection lands durably.
+    count_if_contains_unsupported_removed(
+      target, feature_policy, cfg.unsupported);
 }
 
 void mirroring_task::record_error(std::string_view what) {
@@ -705,7 +765,8 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
       mode_config_targets,
       std::max<size_t>(1, limits.parallelism),
       [&](const ppsr::context_subject& target) {
-          return sync_mode_and_config(target, as, mc_unavailable);
+          return sync_mode_and_config(
+            target, feature_policy, as, mc_unavailable);
       });
     if (mc_unavailable.has_value()) {
         co_return make_unavailable(mc_unavailable->message);

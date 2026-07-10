@@ -308,6 +308,154 @@ TEST_F(mirroring_task_test, fail_policy_counts_unsupported_and_syncs_rest) {
     EXPECT_GE(index_of(_registry.get_all(), "b"), 0);
 }
 
+TEST_F(mirroring_task_test, remove_policy_counts_unsupported_config) {
+    // The config path applies the same policy as the schema path. Under REMOVE,
+    // an unsupported config field (e.g. defaultRuleSet) is counted and logged;
+    // only the supported projection (compatibilityLevel) is synced.
+    auto a = ppsr::context_subject::unqualified("a");
+    _source_state.add(a, 1);
+    _source_state.configs.emplace(a, ppsr::compatibility_level::full);
+    _source_state.set_config_unsupported(
+      a, {{.json_pointer = "/defaultRuleSet"}});
+
+    auto metadata = get_default_metadata();
+    metadata.configuration.schema_registry_sync_cfg.api_mode()->feature_policy
+      = model::schema_registry_sync_config::unsupported_feature_policy::remove;
+
+    lead_schema_registry();
+    fixture()->upsert_link(std::move(metadata)).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->last_full_sync->unsupported_features_removed, 1);
+    EXPECT_EQ(status->totals_since_task_start.unsupported_features_removed, 1);
+    // The compatibility level is still synced under REMOVE.
+    EXPECT_EQ(status->last_full_sync->compatibility_configs_changed, 1);
+    ASSERT_TRUE(_registry.configs().contains(a));
+    EXPECT_EQ(_registry.configs().at(a), ppsr::compatibility_level::full);
+    EXPECT_EQ(status->last_full_sync->errors, 0);
+
+    // A second full sync re-reads and re-drops the same fields: the count is
+    // per completed sync (mirroring FAIL's per-sync errors), so the total
+    // advances even though the config write itself is a no-op.
+    const auto first_start = status->last_full_sync->start_time;
+    auto metadata2 = get_default_metadata();
+    metadata2.configuration.schema_registry_sync_cfg.api_mode()->feature_policy
+      = model::schema_registry_sync_config::unsupported_feature_policy::remove;
+    fixture()->upsert_link(std::move(metadata2)).get();
+    auto second = wait_for_sync_status([&](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && s.last_full_sync->start_time != first_start
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->totals_since_task_start.unsupported_features_removed, 2);
+    EXPECT_EQ(second->last_full_sync->unsupported_features_removed, 1);
+    EXPECT_EQ(second->totals_since_task_start.errors, 0);
+}
+
+TEST_F(mirroring_task_test, remove_policy_counts_unsupported_config_no_level) {
+    // A governance-only source config (unsupported fields, no compatibility
+    // override): the destination write is a no-op delete, but the dropped
+    // fields are still counted -- REMOVE must not ignore them silently.
+    auto a = ppsr::context_subject::unqualified("a");
+    _source_state.add(a, 1);
+    _source_state.set_config_unsupported(
+      a, {{.json_pointer = "/compatibilityGroup"}});
+
+    auto metadata = get_default_metadata();
+    metadata.configuration.schema_registry_sync_cfg.api_mode()->feature_policy
+      = model::schema_registry_sync_config::unsupported_feature_policy::remove;
+
+    lead_schema_registry();
+    fixture()->upsert_link(std::move(metadata)).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->last_full_sync->unsupported_features_removed, 1);
+    EXPECT_EQ(status->last_full_sync->errors, 0);
+    // No compatibility override lands on the destination.
+    EXPECT_FALSE(_registry.configs().contains(a));
+}
+
+TEST_F(mirroring_task_test, fail_policy_skips_unsupported_config) {
+    // Under FAIL, an unsupported config field is a counted per-item error and
+    // the subject's config is not synced; the rest of the sync proceeds and the
+    // task stays active (the clean schema still imports).
+    auto a = ppsr::context_subject::unqualified("a");
+    _source_state.add(a, 1);
+    _source_state.configs.emplace(a, ppsr::compatibility_level::full);
+    _source_state.set_config_unsupported(
+      a, {{.json_pointer = "/defaultRuleSet"}});
+
+    auto metadata = get_default_metadata();
+    metadata.configuration.schema_registry_sync_cfg.api_mode()->feature_policy
+      = model::schema_registry_sync_config::unsupported_feature_policy::fail;
+
+    lead_schema_registry();
+    fixture()->upsert_link(std::move(metadata)).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->last_full_sync->errors, 1);
+    EXPECT_EQ(status->last_full_sync->unsupported_features_removed, 0);
+    // The config write is skipped: no compatibility change, no destination
+    // config.
+    EXPECT_EQ(status->last_full_sync->compatibility_configs_changed, 0);
+    EXPECT_FALSE(_registry.configs().contains(a));
+    // The clean schema itself still imports.
+    EXPECT_GE(index_of(_registry.get_all(), "a"), 0);
+}
+
+// Fixture whose destination wraps `_registry` so a test can make write_config
+// fail, exercising the REMOVE no-count-on-failed-write path the plain fake
+// cannot.
+class mirroring_task_config_write_failure_test : public mirroring_task_test {
+protected:
+    schema::registry* dest() override { return &_failing_config; }
+    failing_config_registry _failing_config{&_registry};
+};
+
+TEST_F(
+  mirroring_task_config_write_failure_test,
+  remove_policy_does_not_count_unsupported_config_on_write_failure) {
+    // REMOVE counts a removed config feature only after the config write lands;
+    // a write that fails is a per-item error and must not report the feature as
+    // removed (mirrors the schema-body path's no-count-on-failed-import).
+    auto a = ppsr::context_subject::unqualified("a");
+    _source_state.add(a, 1);
+    _source_state.configs.emplace(a, ppsr::compatibility_level::full);
+    _source_state.set_config_unsupported(
+      a, {{.json_pointer = "/defaultRuleSet"}});
+    _failing_config.fail_config(
+      a, ppsr::error_code::schema_invalid, "config write rejected");
+
+    auto metadata = get_default_metadata();
+    metadata.configuration.schema_registry_sync_cfg.api_mode()->feature_policy
+      = model::schema_registry_sync_config::unsupported_feature_policy::remove;
+
+    lead_schema_registry();
+    fixture()->upsert_link(std::move(metadata)).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+    // The failed write is counted as an error, not as a removed feature.
+    EXPECT_EQ(status->last_full_sync->errors, 1);
+    EXPECT_EQ(status->last_full_sync->unsupported_features_removed, 0);
+}
+
 TEST_F(mirroring_task_test, source_unavailable_then_recovers) {
     _source_state.add(ppsr::context_subject::unqualified("orders-value"), 1);
     _source_state.list_subjects_error = srs::source_error{
