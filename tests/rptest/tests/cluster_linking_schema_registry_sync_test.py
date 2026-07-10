@@ -133,10 +133,18 @@ class SchemaRegistrySyncMixin:
         subject: str,
         schema: dict,
         references: list[dict] | None = None,
+        metadata: dict | None = None,
+        rule_set: dict | None = None,
     ) -> int:
         payload: dict[str, Any] = {"schema": json.dumps(schema)}
         if references:
             payload["references"] = references
+        # Confluent-only Data Contract fields Redpanda does not model. A source
+        # that carries them lets a test drive the unsupported-feature policy.
+        if metadata is not None:
+            payload["metadata"] = metadata
+        if rule_set is not None:
+            payload["ruleSet"] = rule_set
         resp = client.post_subjects_subject_versions(
             subject=subject, data=json.dumps(payload)
         )
@@ -212,6 +220,8 @@ class SchemaRegistrySyncMixin:
         source_filter_subjects: list[str] | None = None,
         source_filter_contexts: list[str] | None = None,
         exact_context_map: dict[str, str] | None = None,
+        feature_policy: shadow_link_pb2.UnsupportedSchemaFeaturePolicy.ValueType
+        | None = None,
     ) -> str:
         # Create a shadow link that syncs only the Schema Registry, in API mode,
         # pointing at the source cluster's SR endpoint (or an explicit URL, e.g.
@@ -233,6 +243,8 @@ class SchemaRegistrySyncMixin:
                 seconds=full_sync_interval_sec
             ),
         )
+        if feature_policy is not None:
+            api.unsupported_schema_feature_policy = feature_policy
         if source_filter_subjects is not None:
             api.source_filter.subjects.extend(source_filter_subjects)
         if source_filter_contexts is not None:
@@ -340,10 +352,12 @@ class SchemaRegistrySyncMixin:
     # --- status-counter checks ---------------------------------------------
 
     # Counters expected to stay zero in the override-free DAG tests: those DAGs
-    # register no mode or compatibility overrides, so mode/config replication is
-    # a no-op, and unsupported-feature handling is unimplemented. A test that
-    # sets overrides (test_schema_registry_api_sync_compatibility) asserts the
-    # compatibility counter advances.
+    # register no mode or compatibility overrides and carry no unsupported
+    # fields, so mode/config replication and unsupported-feature handling are
+    # no-ops there. Tests that do exercise them
+    # (test_schema_registry_api_sync_compatibility, the
+    # test_schema_registry_api_sync_unsupported_* suite) assert their counters
+    # advance.
     EXPECTED_ZERO_COUNTERS = (
         "compatibility_configs_changed",
         "modes_changed",
@@ -415,7 +429,7 @@ class SchemaRegistrySyncMixin:
         assert lfs.HasField("start_time") and lfs.HasField("finish_time"), lfs
         assert lfs.finish_time.ToNanoseconds() >= lfs.start_time.ToNanoseconds(), lfs
 
-        # Mapped-but-unimplemented counters must be zero (flagged above).
+        # Counters this suite does not exercise must stay zero (flagged above).
         totals = sr.totals_since_task_start
         # The cumulative summary carries the task start time (stamped once on the
         # task's first run) and, being open-ended, has no finish time.
@@ -1122,6 +1136,135 @@ class SchemaRegistrySyncMixin:
             err_msg="reused instance did not reset state on regaining leadership",
         )
 
+    # --- unsupported-feature policy ----------------------------------------
+    # Confluent-only: only a Confluent source accepts the unsupported fields
+    # (schema metadata.tags, config compatibilityGroup) on registration, so a
+    # Redpanda source cannot seed them. The destination models neither, so the
+    # sync surfaces them and applies the configured policy.
+
+    def _schema_tags(self, i: int) -> dict:
+        # A metadata.tags block: Redpanda models only metadata.properties, so
+        # this surfaces "/metadata/tags" as an unsupported schema feature.
+        return {"tags": {f"{NS}.Leaf{i}": ["PII"]}}
+
+    def _set_source_config(
+        self, client: SchemaRegistryRedpandaClient, subject: str, body: dict
+    ) -> None:
+        resp = client.set_config_subject(subject, json.dumps(body))
+        assert resp.status_code == 200, f"set config {subject} failed: {resp.text}"
+
+    def _wait_totals(self, predicate: Any, err_msg: str, timeout_sec: int = 90):
+        # Waits until the cumulative counters satisfy `predicate`, then returns
+        # the status for logging and further assertions.
+        def ready() -> bool:
+            return predicate(self._admin_sr_status().totals_since_task_start)
+
+        wait_until(ready, timeout_sec=timeout_sec, backoff_sec=1, err_msg=err_msg)
+        return self._admin_sr_status()
+
+    def _test_schema_registry_api_sync_unsupported_schema_remove(self):
+        src = self._make_source_client()
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+        # A clean subject and one carrying an unsupported metadata.tags block.
+        self._register(src, "clean-value", self._leaf_schema(1))
+        self._register(
+            src, "tagged-value", self._leaf_schema(2), metadata=self._schema_tags(2)
+        )
+        self._create_sr_link(
+            feature_policy=shadow_link_pb2.UNSUPPORTED_SCHEMA_FEATURE_POLICY_REMOVE
+        )
+        # Both import (the tagged one as its supported projection); the removed
+        # feature is counted and no error is raised.
+        self._wait_synced(src, dest, [("clean-value", 1), ("tagged-value", 1)])
+        sr = self._wait_totals(
+            lambda t: t.unsupported_features_removed >= 1 and t.errors == 0,
+            "REMOVE did not count an unsupported schema feature",
+        )
+        self._log_counters("admin API", sr)
+
+    def _test_schema_registry_api_sync_unsupported_schema_fail(self):
+        src = self._make_source_client()
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+        self._register(src, "clean-value", self._leaf_schema(1))
+        self._register(
+            src, "tagged-value", self._leaf_schema(2), metadata=self._schema_tags(2)
+        )
+        self._create_sr_link(
+            feature_policy=shadow_link_pb2.UNSUPPORTED_SCHEMA_FEATURE_POLICY_FAIL
+        )
+        # The clean subject syncs; the tagged one is a per-item error, skipped.
+        self._wait_synced(src, dest, [("clean-value", 1)])
+        sr = self._wait_totals(
+            lambda t: t.errors >= 1 and t.unsupported_features_removed == 0,
+            "FAIL did not count the unsupported schema as an error",
+        )
+        self._log_counters("admin API", sr)
+        assert self._schema_view(dest, "tagged-value", 1) is None, (
+            "FAIL must not import a schema carrying unsupported features"
+        )
+
+    def _test_schema_registry_api_sync_unsupported_config_remove(self):
+        src = self._make_source_client()
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+        self._register(src, "cfg-value", self._leaf_schema(1))
+        # Subject config with an unsupported governance field
+        # (compatibilityGroup) alongside the supported compatibilityLevel.
+        self._set_source_config(
+            src,
+            "cfg-value",
+            {"compatibility": "FULL", "compatibilityGroup": "app.major.version"},
+        )
+        # A governance-only subject config (no compatibility level set at all):
+        # the sync must treat it as "no override" plus policy input rather than
+        # fail the config read, so the whole run stays error-free.
+        self._register(src, "gov-value", self._leaf_schema(2))
+        self._set_source_config(
+            src, "gov-value", {"compatibilityGroup": "app.major.version"}
+        )
+        self._create_sr_link(
+            feature_policy=shadow_link_pb2.UNSUPPORTED_SCHEMA_FEATURE_POLICY_REMOVE
+        )
+        self._wait_synced(src, dest, [("cfg-value", 1), ("gov-value", 1)])
+        # Each full sync re-reads both configs and re-counts their dropped
+        # field (+2 per sync), even once the writes are no-ops; >= 3 therefore
+        # proves a second sync counted, pinning the per-sync semantics.
+        sr = self._wait_totals(
+            lambda t: t.unsupported_features_removed >= 3 and t.errors == 0,
+            "REMOVE did not keep counting unsupported config features",
+        )
+        self._log_counters("admin API", sr)
+        # The supported compatibilityLevel is still synced to the destination.
+        resp = dest.get_config_subject("cfg-value")
+        assert (
+            resp.status_code == 200 and resp.json()["compatibilityLevel"] == "FULL"
+        ), f"REMOVE must still sync the compat level: {resp.status_code} {resp.text}"
+
+    def _test_schema_registry_api_sync_unsupported_config_fail(self):
+        src = self._make_source_client()
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+        self._register(src, "cfg-value", self._leaf_schema(1))
+        self._set_source_config(
+            src,
+            "cfg-value",
+            {"compatibility": "FULL", "compatibilityGroup": "app.major.version"},
+        )
+        self._create_sr_link(
+            feature_policy=shadow_link_pb2.UNSUPPORTED_SCHEMA_FEATURE_POLICY_FAIL
+        )
+        # The clean schema still imports; the config carrying the unsupported
+        # field is a per-item error and its write is skipped.
+        self._wait_synced(src, dest, [("cfg-value", 1)])
+        sr = self._wait_totals(
+            lambda t: t.errors >= 1 and t.unsupported_features_removed == 0,
+            "FAIL did not count the unsupported config as an error",
+        )
+        self._log_counters("admin API", sr)
+        # The subject config write is skipped: no FULL override lands.
+        resp = dest.get_config_subject("cfg-value")
+        assert (
+            resp.status_code != 200 or resp.json().get("compatibilityLevel") != "FULL"
+        ), f"FAIL must not sync the unsupported config: {resp.status_code} {resp.text}"
+
 
 class SchemaRegistrySyncE2ETest(ShadowLinkTestBase, SchemaRegistrySyncMixin):
     """Redpanda source: a secondary Redpanda cluster provides the source Schema
@@ -1287,3 +1430,19 @@ class ConfluentSchemaRegistrySyncE2ETest(ShadowLinkTestBase, SchemaRegistrySyncM
     @cluster(num_nodes=5)
     def test_schema_registry_api_sync_context_remap(self):
         self._test_schema_registry_api_sync_context_remap()
+
+    @cluster(num_nodes=5)
+    def test_schema_registry_api_sync_unsupported_schema_remove(self):
+        self._test_schema_registry_api_sync_unsupported_schema_remove()
+
+    @cluster(num_nodes=5)
+    def test_schema_registry_api_sync_unsupported_schema_fail(self):
+        self._test_schema_registry_api_sync_unsupported_schema_fail()
+
+    @cluster(num_nodes=5)
+    def test_schema_registry_api_sync_unsupported_config_remove(self):
+        self._test_schema_registry_api_sync_unsupported_config_remove()
+
+    @cluster(num_nodes=5)
+    def test_schema_registry_api_sync_unsupported_config_fail(self):
+        self._test_schema_registry_api_sync_unsupported_config_fail()
