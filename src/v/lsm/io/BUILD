@@ -80,6 +80,7 @@ redpanda_cc_library(
         "//src/v/cloud_io:io_result",
         "//src/v/container:chunked_vector",
         "//src/v/lsm/core:exceptions",
+        "//src/v/ssx:future_util",
         "@fmt",
     ],
     deps = [

@@ -15,6 +15,7 @@
 #include "container/chunked_vector.h"
 #include "lsm/core/exceptions.h"
 #include "lsm/io/file_io.h"
+#include "ssx/future-util.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/loop.hh>
@@ -34,8 +35,11 @@ namespace {
 // Rethrows an exception from a chunk operation as an lsm io error, mirroring
 // disk_file_reader::read: pass an existing lsm io error through, preserve the
 // error code of a system_error, and wrap anything else.
-[[noreturn]] void rethrow_as_io_error(
+[[noreturn]] void rethrow_as_lsm_error(
   std::exception_ptr eptr, const chunked_remote_file_reader& self) {
+    if (ssx::is_shutdown_exception(eptr)) {
+        throw abort_requested_exception("io error reading {}: {}", self, eptr);
+    }
     try {
         std::rethrow_exception(eptr);
     } catch (const std::system_error& err) {
@@ -120,7 +124,7 @@ chunked_remote_file_reader::open(
       reader->ensure_chunk_cached(tail_chunk, rtc));
     if (probe.failed()) {
         co_await reader->close();
-        rethrow_as_io_error(probe.get_exception(), *reader);
+        rethrow_as_lsm_error(probe.get_exception(), *reader);
     }
     auto handle = std::move(probe).get();
     if (!handle) {
@@ -336,7 +340,7 @@ ss::future<ioarray> chunked_remote_file_reader::read(size_t offset, size_t n) {
             slices[i] = std::move(piece).get();
         }));
     if (read_chunks.failed()) {
-        rethrow_as_io_error(read_chunks.get_exception(), *this);
+        rethrow_as_lsm_error(read_chunks.get_exception(), *this);
     }
     ioarray result;
     for (auto& slice : slices) {
