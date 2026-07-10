@@ -33,7 +33,7 @@ from rptest.services.multi_cluster_services import (
     SecondaryClusterSpec,
     ServiceType,
 )
-from rptest.services.redpanda import SchemaRegistryConfig
+from rptest.services.redpanda import MetricsEndpoint, SchemaRegistryConfig
 from rptest.tests.cluster_linking_test_base import ShadowLinkTestBase
 from rptest.tests.schema_registry_test import SchemaRegistryRedpandaClient
 from rptest.util import firewall_blocked
@@ -351,6 +351,62 @@ class SchemaRegistrySyncMixin:
 
     # --- status-counter checks ---------------------------------------------
 
+    SR_SYNC_METRIC_COUNTERS = (
+        "subject_versions_changed",
+        "compatibility_configs_changed",
+        "modes_changed",
+        "unsupported_features_removed",
+        "errors",
+    )
+
+    def _sr_sync_metric_totals(
+        self, metrics_endpoint: MetricsEndpoint
+    ) -> dict[str, float] | None:
+        """Cluster-wide sums of the shadow-link Schema Registry counters for
+        LINK_NAME from the given metrics endpoint, keyed by counter name, or
+        None while any counter has no series (e.g. no leader yet)."""
+        patterns = {
+            counter: f"shadow_link_schema_registry_{counter}"
+            for counter in self.SR_SYNC_METRIC_COUNTERS
+        }
+        samples = self.target_cluster_service.metrics_samples(
+            sample_patterns=list(patterns.values()), metrics_endpoint=metrics_endpoint
+        )
+        totals: dict[str, float] = {}
+        for counter, pattern in patterns.items():
+            if pattern not in samples:
+                return None
+            values = [
+                s.value
+                for s in samples[pattern].samples
+                if s.labels["shadow_link_name"] == LINK_NAME
+            ]
+            if not values:
+                return None
+            totals[counter] = sum(values)
+        return totals
+
+    def _versions_changed_metric(self, metrics_endpoint: MetricsEndpoint) -> float:
+        """The cluster-wide subject_versions_changed counter, or -1 while the
+        series is absent (distinguishable from a real 0 so wait_until
+        predicates can wait for either state)."""
+        totals = self._sr_sync_metric_totals(metrics_endpoint)
+        return totals["subject_versions_changed"] if totals is not None else -1.0
+
+    def _verify_prometheus_counters(self, expected_versions: int):
+        # Both metrics endpoints must agree with the admin API's
+        # totals_since_task_start. The counters read the task's live status at
+        # scrape time, so once the admin totals have converged no extra wait is
+        # needed.
+        for endpoint in (MetricsEndpoint.METRICS, MetricsEndpoint.PUBLIC_METRICS):
+            totals = self._sr_sync_metric_totals(endpoint)
+            assert totals is not None, f"no SR sync series on {endpoint}"
+            self.logger.info(f"[{endpoint}] SR sync counters: {totals}")
+            assert totals["subject_versions_changed"] == expected_versions, totals
+            assert totals["errors"] == 0, totals
+            for name in self.EXPECTED_ZERO_COUNTERS:
+                assert totals[name] == 0, totals
+
     # Counters expected to stay zero in the override-free DAG tests: those DAGs
     # register no mode or compatibility overrides and carry no unsupported
     # fields, so mode/config replication and unsupported-feature handling are
@@ -441,7 +497,9 @@ class SchemaRegistrySyncMixin:
                 f"unexpected {name}={getattr(totals, name)}"
             )
 
-        # Cross-check the rpk `shadow status` rendering against the admin API.
+        # Cross-check the prometheus counters and the rpk `shadow status`
+        # rendering against the admin API.
+        self._verify_prometheus_counters(expected_versions)
         self._verify_rpk_status(expected_subjects, expected_versions)
 
     def _log_counters(self, source: str, sr):
@@ -900,6 +958,14 @@ class SchemaRegistrySyncMixin:
             err_msg="out-of-scope reference did not surface as a counted error",
         )
 
+        # The counted error is also exported through the errors counter on
+        # both prometheus endpoints (the value tests above only ever see it at
+        # zero).
+        for endpoint in (MetricsEndpoint.METRICS, MetricsEndpoint.PUBLIC_METRICS):
+            totals = self._sr_sync_metric_totals(endpoint)
+            assert totals is not None, f"no SR sync series on {endpoint}"
+            assert totals["errors"] >= 1, totals
+
         # The referrer never imported; the in-scope independent subject did.
         dest_subjects = set(dest.get_subjects().json())
         assert "ok-value" in dest_subjects, dest_subjects
@@ -1023,6 +1089,16 @@ class SchemaRegistrySyncMixin:
         before_start = (
             self._admin_sr_status().totals_since_task_start.start_time.ToNanoseconds()
         )
+        # The first instance exports its totals as prometheus counters from the
+        # leader broker (summed cluster-wide; only the leader has the series).
+        before_changed = (
+            self._admin_sr_status().totals_since_task_start.subject_versions_changed
+        )
+        assert before_changed >= expected_versions
+        assert (
+            self._versions_changed_metric(MetricsEndpoint.PUBLIC_METRICS)
+            == before_changed
+        )
 
         # Move _schemas/0 leadership to another destination broker. The sync
         # task follows leadership, so a fresh instance takes over there.
@@ -1071,6 +1147,17 @@ class SchemaRegistrySyncMixin:
             timeout_sec=90,
             backoff_sec=1,
             err_msg="new leader did not re-derive counters after the bounce",
+        )
+
+        # The cluster-wide metric drops to the new instance's 0: the old
+        # leader unregistered its series on stop (a lingering stale series
+        # would keep the sum at the pre-bounce value), and the new leader
+        # exports the reset totals. -1 (no series anywhere) must not pass.
+        wait_until(
+            lambda: self._versions_changed_metric(MetricsEndpoint.PUBLIC_METRICS) == 0,
+            timeout_sec=30,
+            backoff_sec=1,
+            err_msg="prometheus counter did not follow leadership to the new broker",
         )
 
         # The new leader keeps syncing: a subject added now is imported by it,
@@ -1134,6 +1221,15 @@ class SchemaRegistrySyncMixin:
             timeout_sec=90,
             backoff_sec=1,
             err_msg="reused instance did not reset state on regaining leadership",
+        )
+
+        # Same series check for the return leg: B unregistered on stop and the
+        # reused instance on A re-registered with its reset totals.
+        wait_until(
+            lambda: self._versions_changed_metric(MetricsEndpoint.PUBLIC_METRICS) == 0,
+            timeout_sec=30,
+            backoff_sec=1,
+            err_msg="prometheus counter did not follow leadership back to the original broker",
         )
 
     # --- unsupported-feature policy ----------------------------------------
@@ -1283,6 +1379,14 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase, SchemaRegistrySyncMixin):
             ),
             # Destination (primary) cluster Schema Registry.
             schema_registry_config=SchemaRegistryConfig(),
+            # The sync task runs on whichever destination broker leads
+            # _schemas/0, and totals_since_task_start (admin counters and the
+            # prometheus series) resets whenever leadership moves. With the
+            # destination fully synced a fresh instance imports nothing, so a
+            # balancer-initiated move would strand every exact-value counter
+            # wait/assert at 0. Leadership movement is exercised explicitly by
+            # test_schema_registry_api_sync_survives_leadership_change.
+            extra_rp_conf={"enable_leader_balancer": False},
             *args,
             **kwargs,
         )
@@ -1361,6 +1465,9 @@ class ConfluentSchemaRegistrySyncE2ETest(ShadowLinkTestBase, SchemaRegistrySyncM
             # + 1 kafka + 1 SR). A one-broker source is fine here -- the SR's
             # _schemas topic is RF=1.
             secondary_cluster_args=SecondaryClusterArgs(num_brokers=1),
+            # Keep _schemas/0 leadership stable for the exact-value counter
+            # asserts; same rationale as SchemaRegistrySyncE2ETest.
+            extra_rp_conf={"enable_leader_balancer": False},
             *args,
             **kwargs,
         )
