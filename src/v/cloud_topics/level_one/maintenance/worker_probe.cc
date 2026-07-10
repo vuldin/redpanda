@@ -125,7 +125,9 @@ void compaction_worker_probe::setup_metrics() {
             "Total size in bytes of new L1 objects uploaded by leveling jobs "
             "whose commit did not succeed (uploaded but not "
             "committed) across all cloud topic partitions on this shard")),
-      });
+      },
+      {},
+      {sm::shard_label});
 }
 
 } // namespace cloud_topics::l1
