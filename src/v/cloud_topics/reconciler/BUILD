@@ -72,6 +72,7 @@ redpanda_cc_library(
         "//src/v/cloud_topics/level_zero/stm:ctp_stm_api",
         "//src/v/cluster:fwd",
         "//src/v/config",
+        "//src/v/features",
         "//src/v/kafka/utils:txn_reader",
         "//src/v/metrics",
         "//src/v/utils:retry_chain_node",

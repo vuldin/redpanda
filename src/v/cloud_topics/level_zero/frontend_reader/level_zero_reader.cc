@@ -45,6 +45,12 @@ level_zero_log_reader_impl::level_zero_log_reader_impl(
       _config.max_bytes, _ct_api->materialize_max_bytes());
 }
 
+level_zero_log_reader_impl::~level_zero_log_reader_impl() {
+    if (_config.max_placeholder_offset) {
+        _config.max_placeholder_offset->set_value(_max_placeholder_offset);
+    }
+}
+
 ss::future<model::record_batch_reader::storage_t>
 level_zero_log_reader_impl::do_load_slice(
   model::timeout_clock::time_point deadline) {
@@ -293,6 +299,7 @@ level_zero_log_reader_impl::fetch_metadata(
     // Convert L0 meta batches to extent_meta structures.
     struct metadata_consumer {
         chunked_circular_buffer<local_log_batch> ret;
+        kafka::offset* max_placeholder_offset;
 
         ss::future<ss::stop_iteration> operator()(model::record_batch batch) {
             auto header = batch.header();
@@ -309,6 +316,8 @@ level_zero_log_reader_impl::fetch_metadata(
               .base_offset = model::offset_cast(batch.base_offset()),
               .last_offset = model::offset_cast(batch.last_offset()),
             };
+            *max_placeholder_offset = std::max(
+              *max_placeholder_offset, e.last_offset);
             auto placeholder = parse_placeholder_batch(std::move(batch));
             e.id = placeholder.id;
             e.first_byte_offset = placeholder.offset;
@@ -322,7 +331,9 @@ level_zero_log_reader_impl::fetch_metadata(
         }
     };
 
-    co_return co_await std::move(reader).consume(metadata_consumer{}, deadline);
+    co_return co_await std::move(reader).consume(
+      metadata_consumer{.max_placeholder_offset = &_max_placeholder_offset},
+      deadline);
 }
 
 ss::future<std::expected<chunked_circular_buffer<model::record_batch>, errc>>

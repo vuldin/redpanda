@@ -282,6 +282,7 @@ redpanda_cc_library(
         "//src/v/cloud_io:admission_control_types",
         "//src/v/model",
         "//src/v/utils:to_string",
+        "@seastar",
     ],
 )
 
