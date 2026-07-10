@@ -27,7 +27,12 @@ from rptest.clients.admin.proto.redpanda.core.admin.v2 import shadow_link_pb2
 from rptest.clients.rpk import RpkTool
 from rptest.services.admin import Admin
 from rptest.services.cluster import TestContext, cluster
-from rptest.services.multi_cluster_services import SecondaryClusterArgs
+from rptest.services.confluent_schema_registry import ConfluentSchemaRegistryService
+from rptest.services.multi_cluster_services import (
+    SecondaryClusterArgs,
+    SecondaryClusterSpec,
+    ServiceType,
+)
 from rptest.services.redpanda import SchemaRegistryConfig
 from rptest.tests.cluster_linking_test_base import ShadowLinkTestBase
 from rptest.tests.schema_registry_test import SchemaRegistryRedpandaClient
@@ -39,9 +44,22 @@ LINK_NAME = "sr-sync"
 Pair = tuple[str, int]
 
 
-class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
-    """Source cluster SR -> destination cluster SR over the shadow-link HTTP
-    source reader, at scale and with concurrent / post-sync additions."""
+class SchemaRegistrySyncMixin:
+    """Shared shadow-link Schema Registry "API mode" sync suite: source cluster
+    SR -> destination cluster SR over the HTTP source reader, at scale and with
+    concurrent / post-sync additions.
+
+    Not a Test: mixed into a ShadowLinkTestBase leaf per source vendor (see
+    SchemaRegistrySyncE2ETest / ConfluentSchemaRegistrySyncE2ETest below). Each
+    leaf supplies the source registry via _make_source_client and declares its
+    own node budget; ducktape collects the leaves, never this class."""
+
+    # Members supplied by ShadowLinkTestBase once mixed into a leaf.
+    logger: Any
+    target_cluster_service: Any
+    create_default_link_request: Any
+    create_link_with_request: Any
+    get_link: Any
 
     # A layered diamond DAG (top -> mid -> leaf), like the reconciler
     # concurrent_stress unit test but larger: adjacent referrers share referents,
@@ -55,20 +73,17 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
     EXTRA_LEAVES = 10
     EXTRA_MIDS = 10
 
-    def __init__(self, test_context: TestContext, *args: Any, **kwargs: Any):
-        source_sr_config = SchemaRegistryConfig()
-        source_sr_config.mode_mutability = True
-        super().__init__(
-            test_context,
-            # Source (secondary) cluster runs a Schema Registry too.
-            secondary_cluster_args=SecondaryClusterArgs(
-                schema_registry_config=source_sr_config
-            ),
-            # Destination (primary) cluster Schema Registry.
-            schema_registry_config=SchemaRegistryConfig(),
-            *args,
-            **kwargs,
-        )
+    # --- source Schema Registry hook ---------------------------------------
+    # Each leaf points this at its vendor's Schema Registry; the destination
+    # side stays Redpanda throughout.
+
+    def _make_source_client(self) -> SchemaRegistryRedpandaClient:
+        raise NotImplementedError
+
+    def _source_sr_url(self) -> str:
+        # Derive from the seeding client so the link source_url and the client
+        # can never point at different registries.
+        return self._make_source_client().base_uri()
 
     # --- schema builders ---------------------------------------------------
 
@@ -204,7 +219,7 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         # subsequent full syncs land quickly. An optional exact-subject filter
         # scopes replication. Returns the source URL used.
         if source_url is None:
-            source_url = self.source_cluster_service.schema_reg(limit=1)
+            source_url = self._source_sr_url()
         req = self.create_default_link_request(
             link_name=LINK_NAME,
             mirror_all_topics=False,
@@ -452,9 +467,8 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         for name in self.EXPECTED_ZERO_COUNTERS:
             assert totals[name] == 0, status
 
-    @cluster(num_nodes=6)
-    def test_schema_registry_api_sync_e2e(self):
-        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+    def _test_schema_registry_api_sync_e2e(self):
+        src = self._make_source_client()
         dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
 
         # The destination `_schemas` topic is NOT warmed up here on purpose:
@@ -529,9 +543,8 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         #    rendering of it.
         self._verify_counters(all_pairs)
 
-    @cluster(num_nodes=6)
-    def test_schema_registry_api_sync_soft_delete(self):
-        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+    def _test_schema_registry_api_sync_soft_delete(self):
+        src = self._make_source_client()
         dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
 
         # seeded-value: mixed active/deleted before the first sync.
@@ -571,14 +584,13 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         assert src.delete_subject(whole).status_code == 200
         self._wait_delete_synced(src, dest, subjects)
 
-    @cluster(num_nodes=6)
-    def test_schema_registry_api_sync_compatibility(self):
+    def _test_schema_registry_api_sync_compatibility(self):
         # A subject-level compatibility override round-tripping through the
         # destination's write API -- a path the reconciler unit fakes cannot
         # cover -- then un-setting it so the destination reverts to the
         # inherited default. Mode replication is covered e2e by
         # test_schema_registry_api_sync_context_remap.
-        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+        src = self._make_source_client()
         dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
 
         keep = "keep-value"
@@ -647,12 +659,11 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
             err_msg="compatibility_configs_changed counter did not advance for the delete",
         )
 
-    @cluster(num_nodes=6)
-    def test_schema_registry_api_sync_hard_delete(self):
+    def _test_schema_registry_api_sync_hard_delete(self):
         # A source hard-delete (which requires a soft-delete first on the
         # destination) being propagated as a purge -- a path the reconciler unit
         # fakes cannot cover.
-        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+        src = self._make_source_client()
         dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
 
         keep, gone = "keep-value", "gone-value"
@@ -683,9 +694,8 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         # The in-source subject is untouched by the purge.
         assert self._schema_view(dest, keep, 1) is not None
 
-    @cluster(num_nodes=6)
-    def test_schema_registry_api_sync_context_remap(self):
-        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+    def _test_schema_registry_api_sync_context_remap(self):
+        src = self._make_source_client()
         dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
 
         def qualified(ctx: str, name: str) -> str:
@@ -840,9 +850,8 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
             err_msg="mode/compatibility counters did not advance under remap",
         )
 
-    @cluster(num_nodes=6)
-    def test_schema_registry_api_sync_out_of_scope_reference(self):
-        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+    def _test_schema_registry_api_sync_out_of_scope_reference(self):
+        src = self._make_source_client()
         dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
 
         # leaf-0 is a referent; mid-0 references it; ok-value is independent.
@@ -882,9 +891,8 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         assert "ok-value" in dest_subjects, dest_subjects
         assert "mid-0-value" not in dest_subjects, dest_subjects
 
-    @cluster(num_nodes=6)
-    def test_schema_registry_api_sync_recovers_after_source_unavailable(self):
-        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+    def _test_schema_registry_api_sync_recovers_after_source_unavailable(self):
+        src = self._make_source_client()
         dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
 
         self._register(
@@ -936,9 +944,8 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
             err_msg="link did not recover after the source became reachable again",
         )
 
-    @cluster(num_nodes=6)
-    def test_schema_registry_api_sync_memory_backpressure(self):
-        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+    def _test_schema_registry_api_sync_memory_backpressure(self):
+        src = self._make_source_client()
         dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
 
         # Shrink the reconcile memory budget to its 1 MiB floor and raise
@@ -966,9 +973,8 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
         self._create_sr_link()
         self._wait_synced(src, dest, pairs)
 
-    @cluster(num_nodes=6)
-    def test_schema_registry_api_sync_survives_leadership_change(self):
-        src = SchemaRegistryRedpandaClient(self.source_cluster_service)
+    def _test_schema_registry_api_sync_survives_leadership_change(self):
+        src = self._make_source_client()
         dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
         admin = Admin(self.target_cluster_service)
 
@@ -1115,3 +1121,169 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase):
             backoff_sec=1,
             err_msg="reused instance did not reset state on regaining leadership",
         )
+
+
+class SchemaRegistrySyncE2ETest(ShadowLinkTestBase, SchemaRegistrySyncMixin):
+    """Redpanda source: a secondary Redpanda cluster provides the source Schema
+    Registry (co-located on its brokers).
+
+    Node budget: 3 (destination Redpanda) + 3 (source Redpanda) = 6."""
+
+    def __init__(self, test_context: TestContext, *args: Any, **kwargs: Any):
+        source_sr_config = SchemaRegistryConfig()
+        source_sr_config.mode_mutability = True
+        super().__init__(
+            test_context,
+            # Source (secondary) cluster runs a Schema Registry too.
+            secondary_cluster_args=SecondaryClusterArgs(
+                schema_registry_config=source_sr_config
+            ),
+            # Destination (primary) cluster Schema Registry.
+            schema_registry_config=SchemaRegistryConfig(),
+            *args,
+            **kwargs,
+        )
+
+    def _make_source_client(self) -> SchemaRegistryRedpandaClient:
+        return SchemaRegistryRedpandaClient(self.source_cluster_service)
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_e2e(self):
+        self._test_schema_registry_api_sync_e2e()
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_soft_delete(self):
+        self._test_schema_registry_api_sync_soft_delete()
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_compatibility(self):
+        self._test_schema_registry_api_sync_compatibility()
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_hard_delete(self):
+        self._test_schema_registry_api_sync_hard_delete()
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_context_remap(self):
+        self._test_schema_registry_api_sync_context_remap()
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_out_of_scope_reference(self):
+        self._test_schema_registry_api_sync_out_of_scope_reference()
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_recovers_after_source_unavailable(self):
+        self._test_schema_registry_api_sync_recovers_after_source_unavailable()
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_memory_backpressure(self):
+        self._test_schema_registry_api_sync_memory_backpressure()
+
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_survives_leadership_change(self):
+        self._test_schema_registry_api_sync_survives_leadership_change()
+
+
+class ConfluentSchemaRegistrySyncE2ETest(ShadowLinkTestBase, SchemaRegistrySyncMixin):
+    """Confluent Platform Schema Registry (backed by an Apache Kafka source
+    cluster) as the shadow-link source; the destination stays Redpanda.
+    See CORE-16776 / CORE-16357.
+
+    Node budget: 3 (destination Redpanda) + 1 (Apache Kafka source) + 1
+    (Confluent SR) = 5. The Confluent SR is a separate service that needs its
+    own node (a Redpanda source's SR is co-located on its brokers), so the Kafka
+    source is held to a single broker -- see the SecondaryClusterArgs below.
+
+    Runs the full suite. Against a Confluent source, global compat/mode
+    replication has a known cross-vendor gap -- see EXPECTED_ZERO_COUNTERS."""
+
+    # Full-sync compat/mode replication reads the registry-wide global config
+    # via Redpanda's ":.__GLOBAL:" pseudo-subject. A Confluent source 404s it
+    # (it exposes the global config at GET /config, with no subject), so the
+    # sync reads "no override" and deletes the destination's global config,
+    # landing compatibility_configs_changed at 1 instead of 0. Known cross-vendor
+    # gap in global compat replication, orthogonal to what this suite exercises,
+    # so drop that one counter from the zero-check here. (modes_changed stays 0
+    # on the pinned Confluent version.)
+    EXPECTED_ZERO_COUNTERS = ("modes_changed", "unsupported_features_removed")
+
+    def __init__(self, test_context: TestContext, *args: Any, **kwargs: Any):
+        super().__init__(
+            test_context,
+            # Destination (primary) cluster Schema Registry; the source SR is
+            # the separate Confluent service started in setUp.
+            schema_registry_config=SchemaRegistryConfig(),
+            # Single-broker Kafka source: the Confluent SR takes a node of its
+            # own, so a one-broker source keeps the topology at 5 nodes (3 dest
+            # + 1 kafka + 1 SR). A one-broker source is fine here -- the SR's
+            # _schemas topic is RF=1.
+            secondary_cluster_args=SecondaryClusterArgs(num_brokers=1),
+            *args,
+            **kwargs,
+        )
+        self._confluent_sr: ConfluentSchemaRegistryService | None = None
+
+    def get_source_cluster_spec(self) -> SecondaryClusterSpec:
+        # Source cluster is Apache Kafka (KRaft); the Confluent SR is attached to
+        # it in setUp. Mirrors the Kafka-source topology used by
+        # cluster_linking_e2e_test.
+        return SecondaryClusterSpec(
+            ServiceType.KAFKA, kafka_version="3.8.0", kafka_quorum="COMBINED_KRAFT"
+        )
+
+    def setUp(self):
+        # Starts the Apache Kafka source + Redpanda destination clusters.
+        super().setUp()
+        # Attach a Confluent Schema Registry to the Kafka source and start it.
+        self._confluent_sr = ConfluentSchemaRegistryService(
+            self.test_context, bootstrap_provider=self.source_cluster_service
+        )
+        self._confluent_sr.start()
+
+    def _confluent(self) -> ConfluentSchemaRegistryService:
+        assert self._confluent_sr is not None, "Confluent SR not started"
+        return self._confluent_sr
+
+    def _make_source_client(self) -> SchemaRegistryRedpandaClient:
+        sr = self._confluent()
+        # The base client hardcodes port 8081 and only needs
+        # .nodes[*].account.hostname + .logger, so the ducktape service
+        # duck-types cleanly; the Confluent SR must use the default port.
+        assert sr.port == 8081, "Confluent SR must listen on 8081 for the SR client"
+        return SchemaRegistryRedpandaClient(sr)  # type: ignore[arg-type]
+
+    @cluster(num_nodes=5)
+    def test_schema_registry_api_sync_e2e(self):
+        self._test_schema_registry_api_sync_e2e()
+
+    @cluster(num_nodes=5)
+    def test_schema_registry_api_sync_soft_delete(self):
+        self._test_schema_registry_api_sync_soft_delete()
+
+    @cluster(num_nodes=5)
+    def test_schema_registry_api_sync_out_of_scope_reference(self):
+        self._test_schema_registry_api_sync_out_of_scope_reference()
+
+    @cluster(num_nodes=5)
+    def test_schema_registry_api_sync_recovers_after_source_unavailable(self):
+        self._test_schema_registry_api_sync_recovers_after_source_unavailable()
+
+    @cluster(num_nodes=5)
+    def test_schema_registry_api_sync_memory_backpressure(self):
+        self._test_schema_registry_api_sync_memory_backpressure()
+
+    @cluster(num_nodes=5)
+    def test_schema_registry_api_sync_survives_leadership_change(self):
+        self._test_schema_registry_api_sync_survives_leadership_change()
+
+    @cluster(num_nodes=5)
+    def test_schema_registry_api_sync_compatibility(self):
+        self._test_schema_registry_api_sync_compatibility()
+
+    @cluster(num_nodes=5)
+    def test_schema_registry_api_sync_hard_delete(self):
+        self._test_schema_registry_api_sync_hard_delete()
+
+    @cluster(num_nodes=5)
+    def test_schema_registry_api_sync_context_remap(self):
+        self._test_schema_registry_api_sync_context_remap()

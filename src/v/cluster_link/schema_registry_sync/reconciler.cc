@@ -136,6 +136,7 @@ ss::future<source_result<void>> reconciler::reconcile(
   reconcile_stats& stats,
   ss::abort_source& as) {
     _replicated = std::move(seed_replicated);
+    _soft_deleted = std::move(work.soft_deleted);
     _nodes.clear();
     _discover_q.clear();
     _import_q.clear();
@@ -438,6 +439,12 @@ ss::future<bool> reconciler::import_body(
     if (fail_if_contains_unsupported(n, read.unsupported)) {
         co_return false;
     }
+    // Deleted-state is authoritative from the caller's active-vs-deleted
+    // listing partition, not the per-version source body: a standard source
+    // (e.g. Confluent) omits the `deleted` flag from that body by default, so
+    // the fetched flag cannot be trusted to propagate a soft-delete.
+    read.schema.deleted = _soft_deleted.contains(n) ? ppsr::is_deleted::yes
+                                                    : ppsr::is_deleted::no;
     data(n).state = node_state::importing;
     // The graph key `n` stays in the source namespace; only the schema written
     // to the destination is remapped.

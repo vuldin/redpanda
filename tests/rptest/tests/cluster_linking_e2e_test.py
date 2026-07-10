@@ -157,7 +157,6 @@ class MultiClusterRedpandaTest(MultiClusterTestBase):
             self.logger,
             self.redpanda,
             secondary_spec=SecondaryClusterSpec(ServiceType.REDPANDA),
-            num_brokers=3,
         ) as services:
             assert services.secondary.is_redpanda, (
                 f"Expected Redpanda service, got {services.secondary}"
@@ -188,7 +187,6 @@ class MultiClusterKafkaTest(MultiClusterTestBase):
             secondary_spec=SecondaryClusterSpec(
                 ServiceType.KAFKA, kafka_version="3.8.0", kafka_quorum="COMBINED_KRAFT"
             ),
-            num_brokers=3,
         ) as services:
             assert services.secondary.is_kafka, (
                 f"Expected Kafka service, got {services.secondary}"
