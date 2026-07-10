@@ -100,13 +100,13 @@ class EndToEndCloudTopicsBase(EndToEndTest):
         storage_mode = (self.test_context.injected_args or {}).get(
             "storage_mode", TopicSpec.STORAGE_MODE_CLOUD
         )
-        if storage_mode == TopicSpec.STORAGE_MODE_TIERED_CLOUD:
+        if storage_mode == TopicSpec.STORAGE_MODE_IMPL_TIERED_V2:
             self.redpanda.set_feature_active(
                 "tiered_cloud_topics", True, timeout_sec=30
             )
         for topic in self.topics:
             config = {
-                TopicSpec.PROPERTY_STORAGE_MODE: storage_mode,
+                **TopicSpec.storage_mode_config(storage_mode),
                 "cleanup.policy": topic.cleanup_policy,
             }
             if topic.min_cleanable_dirty_ratio is not None:
@@ -383,7 +383,7 @@ class EndToEndCloudTopicsTest(EndToEndCloudTopicsBase):
     @matrix(
         storage_mode=[
             TopicSpec.STORAGE_MODE_CLOUD,
-            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
         ],
     )
     def test_write(self, storage_mode: str):
@@ -400,7 +400,7 @@ class EndToEndCloudTopicsTest(EndToEndCloudTopicsBase):
     @matrix(
         storage_mode=[
             TopicSpec.STORAGE_MODE_CLOUD,
-            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
         ],
     )
     def test_delete_records(self, storage_mode: str):
@@ -430,7 +430,7 @@ class EndToEndCloudTopicsTest(EndToEndCloudTopicsBase):
     @matrix(
         storage_mode=[
             TopicSpec.STORAGE_MODE_CLOUD,
-            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
         ],
     )
     def test_get_size(self, storage_mode: str):
@@ -472,9 +472,10 @@ class EndToEndCloudTopicsTest(EndToEndCloudTopicsBase):
 
 
 class EndToEndCloudTopicsStorageModeToggleTest(EndToEndCloudTopicsBase):
-    """Exercise toggling a topic between 'cloud' and 'tiered_cloud' storage
-    modes while a rate-limited producer is running, then validate the
-    resulting log with a sequential consumer."""
+    """Exercise toggling a topic between 'cloud' and 'tiered' storage modes
+    (the latter resolves to tiered_v2 via the cluster default) while a
+    rate-limited producer is running, then validate the resulting log with a
+    sequential consumer."""
 
     topics = (
         TopicSpec(
@@ -522,6 +523,13 @@ class EndToEndCloudTopicsStorageModeToggleTest(EndToEndCloudTopicsBase):
             loop=False,
             producer=producer,
         )
+        # The toggle flips through the 'tiered' alias; point it at the
+        # cloud-architecture variant (the default is tiered_v1, under which
+        # cloud -> tiered is a forbidden transition).
+        self.rpk.cluster_config_set(
+            "default_redpanda_storage_mode_tiered_impl", "tiered_v2"
+        )
+
         try:
             producer.start()
 
@@ -530,7 +538,7 @@ class EndToEndCloudTopicsStorageModeToggleTest(EndToEndCloudTopicsBase):
             while time.time() - start < self.toggle_duration_sec:
                 time.sleep(self.toggle_interval_sec)
                 mode = (
-                    TopicSpec.STORAGE_MODE_TIERED_CLOUD
+                    TopicSpec.STORAGE_MODE_TIERED
                     if mode == TopicSpec.STORAGE_MODE_CLOUD
                     else TopicSpec.STORAGE_MODE_CLOUD
                 )
@@ -624,7 +632,7 @@ class EndToEndCloudTopicsTxTest(EndToEndCloudTopicsBase):
     @matrix(
         storage_mode=[
             TopicSpec.STORAGE_MODE_CLOUD,
-            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
         ],
     )
     def test_write(self, storage_mode: str):

@@ -70,6 +70,7 @@ inline auto default_synced_topic_properties = std::to_array<std::string_view>({
   kafka::topic_property_min_compaction_lag_ms,
   kafka::topic_property_max_compaction_lag_ms,
   kafka::topic_property_redpanda_storage_mode,
+  kafka::topic_property_redpanda_storage_mode_impl,
 });
 
 /// List of topic properties that are not permitted to be synced

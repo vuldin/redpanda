@@ -19,6 +19,7 @@
 #include "cluster_link/utils.h"
 #include "config/mock_property.h"
 #include "container/chunked_vector.h"
+#include "features/feature_table.h"
 #include "kafka/client/test/cluster_mock.h"
 #include "kafka/data/rpc/deps.h"
 #include "kafka/data/rpc/test/deps.h"
@@ -817,6 +818,7 @@ private:
     fake_members_table_provider* _fmtp{nullptr};
     schema::fake_registry _fake_schema_registry;
     ss::sharded<manager> _manager;
+    ss::sharded<features::feature_table> _feature_table;
     config::mock_property<int16_t> _default_topic_replication{1};
 
     ::model::node_id _self;

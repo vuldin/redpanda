@@ -1461,8 +1461,9 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
         # (batch_mirror_topic_status additionally needs a second cluster).
 
     def _exercise_tiered_cloud_topics(self):
-        """tiered_cloud_topics gate: creating a topic with storage mode
-        `tiered_cloud` is refused until the feature is active. Drive that
+        """tiered_cloud_topics gate: creating a topic with the tiered_v2
+        (cloud-architecture) storage mode is refused until the feature is
+        active. Drive that
         validator path while unfinalized and confirm the feature is unavailable
         and the create is rejected. The topic is never created, so exercising
         the gate cannot leave state that would block a downgrade."""
@@ -1473,9 +1474,9 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
             RpkTool(self.redpanda).create_topic(
                 "perturb-tiered-cloud",
                 partitions=1,
-                config={
-                    TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_TIERED_CLOUD
-                },
+                config=TopicSpec.storage_mode_config(
+                    TopicSpec.STORAGE_MODE_IMPL_TIERED_V2
+                ),
             )
         except RpkException as e:
             # Confirm the create failed via the storage-mode gate, not an
@@ -1550,23 +1551,15 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
 
     def _verify_tiered_cloud_topics_working(self):
         """After finalize the active version has advanced past the feature's
-        require_version, so the gate opens: the feature moves from unavailable to
-        available (it is explicit_only, so it does not auto-activate) and can
-        then be enabled to active -- the simple signal that it now works.
+        require_version, so the gate opens: the feature auto-activates (it is
+        available_policy::always) -- the simple signal that it now works.
         (Creating an actual tiered_cloud topic additionally needs cloud storage,
         which this test does not configure.)"""
-        wait_until(
-            lambda: self._feature_state("tiered_cloud_topics") == "available",
-            timeout_sec=30,
-            backoff_sec=1,
-            err_msg="tiered_cloud_topics did not become available after finalize",
-        )
-        self.admin.put_feature("tiered_cloud_topics", {"state": "active"})
         wait_until(
             lambda: self._feature_state("tiered_cloud_topics") == "active",
             timeout_sec=30,
             backoff_sec=1,
-            err_msg="tiered_cloud_topics did not activate after being enabled",
+            err_msg="tiered_cloud_topics did not auto-activate after finalize",
         )
 
     def _verify_shadow_link_role_sync_working(self):

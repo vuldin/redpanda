@@ -86,6 +86,7 @@ DEFAULT_SYNCED_TOPIC_PROPERTIES = [
     "max.compaction.lag.ms",
     "min.compaction.lag.ms",
     "redpanda.storage.mode",
+    "redpanda.storage.mode.impl",
 ]
 
 DISALLOWED_SYNCED_TOPIC_PROPERTIES = [
@@ -104,9 +105,9 @@ CONTROLLER_LOCKED_TASKS = [
 
 ALL_STORAGE_MODES = [
     TopicSpec.STORAGE_MODE_LOCAL,
-    TopicSpec.STORAGE_MODE_TIERED,
+    TopicSpec.STORAGE_MODE_IMPL_TIERED_V1,
     TopicSpec.STORAGE_MODE_CLOUD,
-    TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+    TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
 ]
 
 # Log messages that are expected when running shadow link tests with
@@ -601,12 +602,13 @@ class ShadowLinkTestBase(PreallocNodesTest):
         storage_mode = (test_context.injected_args or {}).get("storage_mode")
         needs_si = storage_mode in (
             TopicSpec.STORAGE_MODE_TIERED,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V1,
             TopicSpec.STORAGE_MODE_CLOUD,
-            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
         )
         needs_cloud_topics = storage_mode in (
             TopicSpec.STORAGE_MODE_CLOUD,
-            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
         )
 
         if needs_si and "si_settings" not in kwargs:
@@ -1028,7 +1030,7 @@ class ShadowLinkTestBase(PreallocNodesTest):
             self.source_default_client().create_topic(topic)
             return
 
-        if storage_mode == TopicSpec.STORAGE_MODE_TIERED_CLOUD:
+        if storage_mode == TopicSpec.STORAGE_MODE_IMPL_TIERED_V2:
             self.source_cluster_service.set_feature_active(
                 "tiered_cloud_topics", True, timeout_sec=30
             )
@@ -1037,7 +1039,7 @@ class ShadowLinkTestBase(PreallocNodesTest):
             )
 
         config = self._topic_config_from_spec(topic)
-        config[TopicSpec.PROPERTY_STORAGE_MODE] = storage_mode
+        config.update(TopicSpec.storage_mode_config(storage_mode))
 
         source_rpk = RpkTool(self.source_cluster.service)
 

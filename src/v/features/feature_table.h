@@ -561,7 +561,7 @@ inline constexpr std::array feature_schema{
     release_version::v26_2_1,
     "tiered_cloud_topics",
     feature::tiered_cloud_topics,
-    feature_spec::available_policy::explicit_only,
+    feature_spec::available_policy::always,
     feature_spec::prepare_policy::always},
   feature_spec{
     release_version::v26_2_1,

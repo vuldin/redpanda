@@ -585,7 +585,134 @@ redpanda_storage_mode_from_string(std::string_view s) {
         model::redpanda_storage_mode_to_string(
           model::redpanda_storage_mode::unset),
         model::redpanda_storage_mode::unset)
+      .match(
+        model::redpanda_storage_mode_tiered_impl_to_string(
+          model::redpanda_storage_mode_tiered_impl::tiered_v1),
+        model::redpanda_storage_mode::tiered)
+      .match(
+        model::redpanda_storage_mode_tiered_impl_to_string(
+          model::redpanda_storage_mode_tiered_impl::tiered_v2),
+        model::redpanda_storage_mode::tiered_cloud)
       .default_match(std::nullopt);
+}
+
+fmt::iterator
+format_to(redpanda_storage_mode_tiered_impl mode, fmt::iterator out) {
+    return fmt::format_to(
+      out, "{}", redpanda_storage_mode_tiered_impl_to_string(mode));
+}
+
+std::istream&
+operator>>(std::istream& i, redpanda_storage_mode_tiered_impl& mode) {
+    ss::sstring s;
+    i >> s;
+    auto value = redpanda_storage_mode_tiered_impl_from_string(s);
+    if (!value) {
+        i.setstate(std::ios::failbit);
+        return i;
+    }
+    mode = *value;
+    return i;
+}
+
+std::optional<redpanda_storage_mode_tiered_impl>
+redpanda_storage_mode_tiered_impl_from_string(std::string_view s) {
+    return string_switch<std::optional<redpanda_storage_mode_tiered_impl>>(s)
+      .match(
+        redpanda_storage_mode_tiered_impl_to_string(
+          redpanda_storage_mode_tiered_impl::tiered_v1),
+        redpanda_storage_mode_tiered_impl::tiered_v1)
+      .match(
+        redpanda_storage_mode_tiered_impl_to_string(
+          redpanda_storage_mode_tiered_impl::tiered_v2),
+        redpanda_storage_mode_tiered_impl::tiered_v2)
+      .default_match(std::nullopt);
+}
+
+std::optional<redpanda_storage_mode> redpanda_storage_mode_from_user_string(
+  std::string_view s, redpanda_storage_mode_tiered_impl default_mode) {
+    if (s == redpanda_storage_mode_to_string(redpanda_storage_mode::tiered)) {
+        return storage_mode_with_tiered_impl(default_mode);
+    }
+    return string_switch<std::optional<redpanda_storage_mode>>(s)
+      .match(
+        redpanda_storage_mode_to_string(redpanda_storage_mode::local),
+        redpanda_storage_mode::local)
+      .match(
+        redpanda_storage_mode_to_string(redpanda_storage_mode::cloud),
+        redpanda_storage_mode::cloud)
+      .match(
+        redpanda_storage_mode_to_string(redpanda_storage_mode::unset),
+        redpanda_storage_mode::unset)
+      // The variant names and the internal 'tiered_cloud' spelling are not
+      // valid mode values: variants are selected with the separate
+      // redpanda.storage.mode.impl property.
+      .default_match(std::nullopt);
+}
+
+const char* redpanda_storage_mode_user_name(redpanda_storage_mode mode) {
+    switch (mode) {
+    case redpanda_storage_mode::tiered:
+    case redpanda_storage_mode::tiered_cloud:
+        return redpanda_storage_mode_to_string(redpanda_storage_mode::tiered);
+    case redpanda_storage_mode::local:
+    case redpanda_storage_mode::cloud:
+    case redpanda_storage_mode::unset:
+        return redpanda_storage_mode_to_string(mode);
+    }
+    throw std::invalid_argument("unknown redpanda_storage_mode");
+}
+
+const char* redpanda_storage_mode_impl_name(redpanda_storage_mode mode) {
+    switch (mode) {
+    case redpanda_storage_mode::tiered:
+        return redpanda_storage_mode_tiered_impl_to_string(
+          redpanda_storage_mode_tiered_impl::tiered_v1);
+    case redpanda_storage_mode::tiered_cloud:
+        return redpanda_storage_mode_tiered_impl_to_string(
+          redpanda_storage_mode_tiered_impl::tiered_v2);
+    case redpanda_storage_mode::local:
+    case redpanda_storage_mode::cloud:
+    case redpanda_storage_mode::unset:
+        return redpanda_storage_mode_to_string(mode);
+    }
+    throw std::invalid_argument("unknown redpanda_storage_mode");
+}
+
+std::optional<redpanda_storage_mode>
+redpanda_storage_mode_from_impl_string(std::string_view s) {
+    return string_switch<std::optional<redpanda_storage_mode>>(s)
+      .match(
+        redpanda_storage_mode_impl_name(redpanda_storage_mode::local),
+        redpanda_storage_mode::local)
+      .match(
+        redpanda_storage_mode_impl_name(redpanda_storage_mode::tiered),
+        redpanda_storage_mode::tiered)
+      .match(
+        redpanda_storage_mode_impl_name(redpanda_storage_mode::tiered_cloud),
+        redpanda_storage_mode::tiered_cloud)
+      .match(
+        redpanda_storage_mode_impl_name(redpanda_storage_mode::cloud),
+        redpanda_storage_mode::cloud)
+      .match(
+        redpanda_storage_mode_impl_name(redpanda_storage_mode::unset),
+        redpanda_storage_mode::unset)
+      .default_match(std::nullopt);
+}
+
+std::optional<redpanda_storage_mode_tiered_impl>
+storage_mode_tiered_impl(redpanda_storage_mode mode) {
+    switch (mode) {
+    case redpanda_storage_mode::tiered:
+        return redpanda_storage_mode_tiered_impl::tiered_v1;
+    case redpanda_storage_mode::tiered_cloud:
+        return redpanda_storage_mode_tiered_impl::tiered_v2;
+    case redpanda_storage_mode::local:
+    case redpanda_storage_mode::cloud:
+    case redpanda_storage_mode::unset:
+        return std::nullopt;
+    }
+    throw std::invalid_argument("unknown redpanda_storage_mode");
 }
 
 fmt::iterator format_to(recovery_validation_mode vm, fmt::iterator out) {

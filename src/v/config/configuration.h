@@ -383,6 +383,8 @@ struct configuration final : public config_store {
     property<bool> cloud_storage_enable_remote_read;
     property<bool> cloud_storage_enable_remote_write;
     enum_property<model::redpanda_storage_mode> default_redpanda_storage_mode;
+    enum_property<model::redpanda_storage_mode_tiered_impl>
+      default_redpanda_storage_mode_tiered_impl;
     property<bool> cloud_storage_disable_archiver_manager;
     property<std::optional<ss::sstring>> cloud_storage_access_key;
     property<std::optional<ss::sstring>> cloud_storage_secret_key;

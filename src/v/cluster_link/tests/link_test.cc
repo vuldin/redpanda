@@ -219,6 +219,7 @@ public:
           std::make_unique<fake_members_table_provider>(),
           sr_preflight_checker::make_default(
             _fake_schema_registry, std::move(sr_prober)),
+          nullptr,
           task_reconciler_interval,
           _default_topic_replication.bind(),
           ss::default_scheduling_group());
@@ -468,6 +469,7 @@ public:
           std::make_unique<fake_members_table_provider>(),
           sr_preflight_checker::make_default(
             _fake_schema_registry, std::make_unique<fake_source_sr_prober>()),
+          nullptr,
           task_reconciler_interval,
           _default_topic_replication.bind(),
           ss::default_scheduling_group());

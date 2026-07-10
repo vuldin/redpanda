@@ -119,7 +119,7 @@ class TieredCloudLocalRetentionTest(EndToEndCloudTopicsBase):
     ):
         rpk = RpkTool(self.redpanda)
         config = {
-            TopicSpec.PROPERTY_STORAGE_MODE: storage_mode,
+            **TopicSpec.storage_mode_config(storage_mode),
             "cleanup.policy": cleanup_policy,
             "retention.bytes": str(self.retention_bytes),
             "retention.local.target.bytes": str(self.local_target_bytes),
@@ -264,7 +264,7 @@ class TieredCloudLocalRetentionTest(EndToEndCloudTopicsBase):
         Replication factor is 3, so the cluster-wide sum of partition_size is
         roughly 3 * per-replica retention.
         """
-        self._create_topic(storage_mode=TopicSpec.STORAGE_MODE_TIERED_CLOUD)
+        self._create_topic(storage_mode=TopicSpec.STORAGE_MODE_IMPL_TIERED_V2)
         self._wait_for_partition_info()
 
         self._produce(self.bytes_to_produce)
@@ -338,7 +338,7 @@ class TieredCloudLocalRetentionTest(EndToEndCloudTopicsBase):
             partitions=1,
             replicas=3,
             config={
-                TopicSpec.PROPERTY_STORAGE_MODE: (TopicSpec.STORAGE_MODE_TIERED_CLOUD),
+                **TopicSpec.storage_mode_config(TopicSpec.STORAGE_MODE_IMPL_TIERED_V2),
                 "cleanup.policy": TopicSpec.CLEANUP_DELETE,
                 "retention.bytes": str(self.retention_bytes),
                 "segment.bytes": str(self.segment_size),
@@ -399,7 +399,7 @@ class TieredCloudLocalRetentionTest(EndToEndCloudTopicsBase):
             partitions=1,
             replicas=3,
             config={
-                TopicSpec.PROPERTY_STORAGE_MODE: (TopicSpec.STORAGE_MODE_TIERED_CLOUD),
+                **TopicSpec.storage_mode_config(TopicSpec.STORAGE_MODE_IMPL_TIERED_V2),
                 "cleanup.policy": TopicSpec.CLEANUP_DELETE,
                 "retention.bytes": str(self.retention_bytes),
                 "segment.bytes": str(self.segment_size),
@@ -453,7 +453,7 @@ class TieredCloudLocalRetentionTest(EndToEndCloudTopicsBase):
         # times, and L1 compaction can reduce the log meaningfully.
         key_set_cardinality = 64
         self._create_topic(
-            storage_mode=TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+            storage_mode=TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
             cleanup_policy=TopicSpec.CLEANUP_COMPACT,
         )
         self._wait_for_partition_info()
@@ -511,7 +511,7 @@ class TieredCloudLocalRetentionTest(EndToEndCloudTopicsBase):
         """
         key_set_cardinality = 64
         self._create_topic(
-            storage_mode=TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+            storage_mode=TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
             cleanup_policy=TopicSpec.CLEANUP_COMPACT,
         )
         self._wait_for_partition_info()
@@ -615,7 +615,7 @@ class TieredCloudLocalRetentionTest(EndToEndCloudTopicsBase):
         of the trimmed prefix would hit the empty local log and the consumer
         would fail to read the full range.
         """
-        self._create_topic(storage_mode=TopicSpec.STORAGE_MODE_TIERED_CLOUD)
+        self._create_topic(storage_mode=TopicSpec.STORAGE_MODE_IMPL_TIERED_V2)
         self._wait_for_partition_info()
 
         assert self.redpanda is not None
