@@ -403,8 +403,9 @@ ss::future<> mirroring_task::sync_mode_and_config(
     }
 
     auto write = co_await ss::coroutine::as_future(
-      config.value().has_value()
-        ? _destination->write_config(dest_target, *config.value())
+      config.value().compatibility.has_value()
+        ? _destination->write_config(
+            dest_target, *config.value().compatibility)
         : _destination->delete_config(dest_target));
     if (write.failed()) {
         auto ex = write.get_exception();

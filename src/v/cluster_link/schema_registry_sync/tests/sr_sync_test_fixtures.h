@@ -132,6 +132,19 @@ struct fake_source_state {
     chunked_hash_map<ppsr::context_subject, srs::source_error>
       read_config_errors;
 
+    // Unsupported config fields to attach to a target's read_config, letting a
+    // test drive the config-path unsupported-feature policy.
+    chunked_hash_map<
+      ppsr::context_subject,
+      chunked_vector<ppsr::unsupported_feature>>
+      config_unsupported;
+
+    void set_config_unsupported(
+      const ppsr::context_subject& sub,
+      chunked_vector<ppsr::unsupported_feature> features) {
+        config_unsupported[sub] = std::move(features);
+    }
+
     void fail_read(
       const ppsr::context_subject& sub,
       int32_t version,
@@ -303,17 +316,23 @@ public:
         co_return std::optional<ppsr::mode>{std::nullopt};
     }
 
-    ss::future<srs::source_result<std::optional<ppsr::compatibility_level>>>
+    ss::future<srs::source_result<srs::source_config_read>>
     read_config(ppsr::context_subject sub, ss::abort_source&) override {
         if (
           auto it = _state->read_config_errors.find(sub);
           it != _state->read_config_errors.end()) {
             co_return std::unexpected(it->second);
         }
+        srs::source_config_read out;
         if (auto it = _state->configs.find(sub); it != _state->configs.end()) {
-            co_return std::optional<ppsr::compatibility_level>{it->second};
+            out.compatibility = it->second;
         }
-        co_return std::optional<ppsr::compatibility_level>{std::nullopt};
+        if (
+          auto it = _state->config_unsupported.find(sub);
+          it != _state->config_unsupported.end()) {
+            out.unsupported = it->second.copy();
+        }
+        co_return out;
     }
 
 private:
