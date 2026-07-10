@@ -170,9 +170,20 @@ TEST(http_source_reader, read_subject_version_returns_schema) {
                  .get();
     reader.stop().get();
 
-    ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(res->id, pps::schema_id{100001});
-    EXPECT_EQ(res->version, pps::schema_version{3});
+    EXPECT_THAT(
+      res,
+      Optional(AllOf(
+        Field(
+          "schema",
+          &pps::source_schema_read::schema,
+          AllOf(
+            Field("id", &pps::stored_schema::id, pps::schema_id{100001}),
+            Field(
+              "version",
+              &pps::stored_schema::version,
+              pps::schema_version{3}))),
+        Field(
+          "unsupported", &pps::source_schema_read::unsupported, IsEmpty()))));
 }
 
 // Discovery and body fetch must request deleted entries so the reconcile can

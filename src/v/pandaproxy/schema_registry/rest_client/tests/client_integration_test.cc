@@ -294,7 +294,7 @@ FIXTURE_TEST(sr_rest_client_integration, pandaproxy_test_fixture) {
           = sut.get_schema_by_version(multi, pps::schema_version{2}, rtc).get();
         BOOST_REQUIRE(res.has_value());
         // Redpanda's SR emits only fields we model, so nothing is dropped.
-        BOOST_REQUIRE(res->unknown_fields.empty());
+        BOOST_REQUIRE(res->unsupported.empty());
         const auto& s = res->schema;
         BOOST_REQUIRE_EQUAL(s.schema.sub(), multi);
         BOOST_REQUIRE_EQUAL(s.version, pps::schema_version{2});
@@ -310,8 +310,8 @@ FIXTURE_TEST(sr_rest_client_integration, pandaproxy_test_fixture) {
               .get();
         BOOST_REQUIRE(res.has_value());
         // metadata.properties is modeled, so it parses back in full and nothing
-        // is reported as unknown.
-        BOOST_REQUIRE(res->unknown_fields.empty());
+        // is reported as unsupported.
+        BOOST_REQUIRE(res->unsupported.empty());
         const auto& def = res->schema.schema.def();
         BOOST_REQUIRE(def.meta().has_value());
         BOOST_REQUIRE(def.meta()->properties.has_value());

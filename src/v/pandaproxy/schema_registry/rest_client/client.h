@@ -191,11 +191,11 @@ public:
     /// be fetched. A missing subject yields subject_not_found; a missing
     /// version (of an existing subject) yields version_not_found.
     ///
-    /// The result wraps the schema together with the names of any response
-    /// fields the client did not model (parsed_schema::unknown_fields); a
+    /// The result wraps the schema together with any unsupported response
+    /// fields the client could not store (source_schema_read::unsupported); a
     /// caller that needs fidelity can inspect them and apply its own strictness
     /// policy.
-    ss::future<std::expected<parsed_schema, domain_error>>
+    ss::future<std::expected<source_schema_read, domain_error>>
     get_schema_by_version(
       const context_subject& subject,
       schema_version version,

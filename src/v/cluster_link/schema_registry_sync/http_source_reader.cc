@@ -266,7 +266,7 @@ http_source_reader::list_subject_versions(
     co_return std::move(res.value());
 }
 
-ss::future<source_result<ppsr::stored_schema>>
+ss::future<source_result<ppsr::source_schema_read>>
 http_source_reader::read_subject_version(
   ppsr::context_subject sub,
   ppsr::schema_version version,
@@ -285,9 +285,11 @@ http_source_reader::read_subject_version(
     if (!res.has_value()) {
         co_return std::unexpected(to_source_error(std::move(res.error())));
     }
-    // Unmodeled response fields (parsed_schema::unknown_fields) are ignored;
-    // honoring the unsupported-feature policy is future work.
-    co_return std::move(res.value().schema);
+    // Carry the read through unchanged: the schema plus any unsupported fields
+    // the source served but Redpanda cannot store. The reconciler applies the
+    // configured unsupported-feature policy to
+    // `source_schema_read::unsupported`.
+    co_return std::move(res.value());
 }
 
 ss::future<source_result<std::optional<ppsr::mode>>>

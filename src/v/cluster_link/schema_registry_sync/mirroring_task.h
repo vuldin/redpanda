@@ -123,6 +123,8 @@ private:
     ss::future<state_transition> full_source_sync(
       ss::abort_source&,
       const chunked_hash_set<ppsr::context>& contexts,
+      model::schema_registry_sync_config::unsupported_feature_policy
+        feature_policy,
       const ss::noncopyable_function<bool(const ppsr::context_subject&)>&
         in_scope);
 

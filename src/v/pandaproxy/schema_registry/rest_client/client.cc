@@ -35,6 +35,14 @@ namespace {
 
 constexpr std::string_view accept_json = "application/json";
 
+// Confluent returns extended schema fields (guid, ts, deleted) on a schema
+// response only when this request header is present. The migration client opts
+// in so the tolerant parser sees the full response and the ignorable-field list
+// explicitly drops the server-assigned ones (guid, ts) rather than relying on
+// the server to omit them.
+constexpr std::string_view accept_unknown_properties_header
+  = "Confluent-Accept-Unknown-Properties";
+
 // Schema Registry error_codes for the not-found conditions.
 constexpr int32_t error_code_subject_not_found = 40401;
 constexpr int32_t error_code_version_not_found = 40402;
@@ -564,7 +572,7 @@ client::list_subject_versions(
     co_return std::move(parsed.value());
 }
 
-ss::future<std::expected<parsed_schema, domain_error>>
+ss::future<std::expected<source_schema_read, domain_error>>
 client::get_schema_by_version(
   const context_subject& subject,
   schema_version version,
@@ -580,7 +588,8 @@ client::get_schema_by_version(
           .path(
             fmt::format(
               "/subjects/{}/versions/{}", encode_subject(subject), version()))
-          .header("accept", accept_json);
+          .header("accept", accept_json)
+          .header(accept_unknown_properties_header, "true");
     add_deleted_param(request, deleted);
     maybe_add_basic_auth(request);
 

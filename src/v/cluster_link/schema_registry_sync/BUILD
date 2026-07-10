@@ -76,6 +76,7 @@ redpanda_cc_library(
         "//src/v/ssx:future_util",
         "//src/v/ssx:sformat",
         "@abseil-cpp//absl/container:flat_hash_set",
+        "@fmt",
     ],
     visibility = ["//visibility:public"],
     deps = [

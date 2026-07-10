@@ -251,6 +251,63 @@ TEST_F(mirroring_task_test, full_sync_imports_and_reports) {
     EXPECT_LT(index_of(all, "a"), index_of(all, "b"));
 }
 
+TEST_F(mirroring_task_test, remove_policy_strips_and_counts_unsupported) {
+    auto a = ppsr::context_subject::unqualified("a");
+    _source_state.add(a, 1);
+    _source_state.set_unsupported(a, 1, {{.json_pointer = "/ruleSet"}});
+
+    auto metadata = get_default_metadata();
+    metadata.configuration.schema_registry_sync_cfg.api_mode()->feature_policy
+      = model::schema_registry_sync_config::unsupported_feature_policy::remove;
+
+    lead_schema_registry();
+    fixture()->upsert_link(std::move(metadata)).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+    // The supported projection is imported and the removed feature is counted.
+    EXPECT_EQ(status->last_full_sync->subject_versions_changed, 1);
+    EXPECT_EQ(status->last_full_sync->unsupported_features_removed, 1);
+    EXPECT_EQ(status->totals_since_task_start.unsupported_features_removed, 1);
+    EXPECT_GE(index_of(_registry.get_all(), "a"), 0);
+}
+
+TEST_F(mirroring_task_test, fail_policy_counts_unsupported_and_syncs_rest) {
+    // Under FAIL an unsupported feature is a counted per-item error, not a
+    // whole-sync abort: the offending subject is skipped while the rest sync,
+    // and the task stays active. Fail-fast is reserved for global errors like
+    // source unavailability.
+    auto a = ppsr::context_subject::unqualified("a"); // unsupported -> skipped
+    auto b = ppsr::context_subject::unqualified("b"); // clean -> imported
+    _source_state.add(a, 1);
+    _source_state.add(b, 1);
+    _source_state.set_unsupported(a, 1, {{.json_pointer = "/ruleSet"}});
+
+    auto metadata = get_default_metadata();
+    metadata.configuration.schema_registry_sync_cfg.api_mode()->feature_policy
+      = model::schema_registry_sync_config::unsupported_feature_policy::fail;
+
+    lead_schema_registry();
+    fixture()->upsert_link(std::move(metadata)).get();
+
+    // The full sync completes (the task does not fault): the unsupported
+    // subject is counted as an error and skipped, and the clean subject is
+    // imported.
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->last_full_sync->errors, 1);
+    EXPECT_EQ(status->last_full_sync->subject_versions_changed, 1);
+    EXPECT_EQ(status->last_full_sync->unsupported_features_removed, 0);
+    EXPECT_EQ(index_of(_registry.get_all(), "a"), -1);
+    EXPECT_GE(index_of(_registry.get_all(), "b"), 0);
+}
+
 TEST_F(mirroring_task_test, source_unavailable_then_recovers) {
     _source_state.add(ppsr::context_subject::unqualified("orders-value"), 1);
     _source_state.list_subjects_error = srs::source_error{

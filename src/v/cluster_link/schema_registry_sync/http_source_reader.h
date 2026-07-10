@@ -77,7 +77,7 @@ public:
     list_subject_versions(
       ppsr::context_subject, ppsr::include_deleted, ss::abort_source&) override;
 
-    ss::future<source_result<ppsr::stored_schema>> read_subject_version(
+    ss::future<source_result<ppsr::source_schema_read>> read_subject_version(
       ppsr::context_subject, ppsr::schema_version, ss::abort_source&) override;
 
     ss::future<source_result<std::optional<ppsr::mode>>>

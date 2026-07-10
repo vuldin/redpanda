@@ -215,9 +215,13 @@ model::task_status_report mirroring_task::get_status_report() const {
             status.current_sync->summary.subject_versions_changed
               += _reconcile_stats.versions_changed;
             status.current_sync->summary.errors += _reconcile_stats.errors;
+            status.current_sync->summary.unsupported_features_removed
+              += _reconcile_stats.unsupported_features_removed;
             status.totals_since_task_start.subject_versions_changed
               += _reconcile_stats.versions_changed;
             status.totals_since_task_start.errors += _reconcile_stats.errors;
+            status.totals_since_task_start.unsupported_features_removed
+              += _reconcile_stats.unsupported_features_removed;
         }
         report.detail = model::task_detail{
           .schema_registry_sync_status = std::move(status)};
@@ -499,6 +503,7 @@ ss::future<> mirroring_task::list_one_subject(
 ss::future<task::state_transition> mirroring_task::full_source_sync(
   ss::abort_source& as,
   const chunked_hash_set<ppsr::context>& contexts,
+  model::schema_registry_sync_config::unsupported_feature_policy feature_policy,
   const ss::noncopyable_function<bool(const ppsr::context_subject&)>&
     in_scope) {
     // Cluster-global, so safe to read mid-sync (unlike the per-link config a
@@ -624,7 +629,8 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
       _destination,
       [&in_scope](const ppsr::context_subject& cs) { return in_scope(cs); },
       _mapper,
-      limits};
+      limits,
+      feature_policy};
 
     // The reconciler increments _reconcile_stats live (reflected mid-sync by
     // get_status_report); the fold below moves them into persistent state.
@@ -655,9 +661,13 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
     _status.current_sync->summary.subject_versions_changed
       += stats.versions_changed;
     _status.current_sync->summary.errors += stats.errors;
+    _status.current_sync->summary.unsupported_features_removed
+      += stats.unsupported_features_removed;
     _status.totals_since_task_start.subject_versions_changed
       += stats.versions_changed;
     _status.totals_since_task_start.errors += stats.errors;
+    _status.totals_since_task_start.unsupported_features_removed
+      += stats.unsupported_features_removed;
 
     const auto purged = co_await purge_destination_only_versions(
       std::move(to_purge), as);
@@ -826,9 +836,13 @@ mirroring_task::run_impl(ss::abort_source& as) {
     // phase shares one mapping without re-reading _config (which a concurrent
     // update_config could swap mid-run).
     _mapper = context_mapper::make(_config);
+    // Snapshot the per-link policy while `api` is known non-null. A concurrent
+    // update_config can swap `_config` across the co_awaits below (and inside
+    // full_source_sync), so it must not re-read api_mode() after suspending.
+    const auto feature_policy = api->feature_policy;
 
     co_await refresh_destination_inventory(in_scope, as);
-    co_return co_await full_source_sync(as, contexts, in_scope);
+    co_return co_await full_source_sync(as, contexts, feature_policy, in_scope);
 }
 
 task::state_transition

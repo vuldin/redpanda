@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "cluster_link/model/types.h"
 #include "cluster_link/schema_registry_sync/scope.h"
 #include "cluster_link/schema_registry_sync/source_reader.h"
 #include "container/chunked_hash_map.h"
@@ -37,9 +38,13 @@ struct reconcile_stats {
     /// Source versions imported into the destination this run.
     uint64_t versions_changed{0};
     /// Per-item failures (unresolvable references, import conflicts, unparsable
-    /// schemas). These do not abort the run; the reconciler counts them and
-    /// continues.
+    /// schemas, and -- under the FAIL policy -- source schemas carrying
+    /// unsupported fields). These do not abort the run; the reconciler counts
+    /// them and continues so the rest of the subjects still replicate.
     uint64_t errors{0};
+    /// Unsupported fields removed from imported schemas this run under the
+    /// REMOVE policy.
+    uint64_t unsupported_features_removed{0};
 };
 
 /// The set of changes a reconcile applies: each upsert is a (context, subject,
@@ -97,7 +102,9 @@ public:
       schema::registry* destination,
       ss::noncopyable_function<bool(const ppsr::context_subject&)> in_scope,
       const context_mapper& mapper,
-      limits lim);
+      limits lim,
+      model::schema_registry_sync_config::unsupported_feature_policy
+        feature_policy);
 
     /// Imports `work_set.upserts` referent-first.
     ///
@@ -160,10 +167,35 @@ private:
     ss::future<source_result<void>>
     do_import(const ppsr::subject_version& n, ss::abort_source& as);
 
-    /// Imports a fetched body, classifying conflicts as per-item failures.
-    /// Returns true on a successful import.
+    /// Imports a fetched read, classifying conflicts as per-item failures.
+    /// Returns true on a successful import. Carries the whole
+    /// source_schema_read (not just the schema) so the unsupported-feature
+    /// policy can act on `read.unsupported` at the authoritative per-node
+    /// import point (FAIL rejection and REMOVE accounting both happen here).
     ss::future<bool>
-    import_body(const ppsr::subject_version& n, ppsr::stored_schema schema);
+    import_body(const ppsr::subject_version& n, ppsr::source_schema_read read);
+
+    /// Under the FAIL policy, treats a schema carrying `unsupported` fields as
+    /// a per-item failure: logs the offending fields, marks the node (and its
+    /// dependents) failed via fail(n), and returns true so the caller skips the
+    /// import. The rest of the sync proceeds -- fail-fast is reserved for
+    /// global errors like source unavailability. Returns false (a no-op) under
+    /// REMOVE or when the list is empty.
+    ///
+    /// Called by `import_body` (authoritative gate) and by `discover` before
+    /// queuing a node's references.
+    bool fail_if_contains_unsupported(
+      const ppsr::subject_version& n,
+      const chunked_vector<ppsr::unsupported_feature>& unsupported);
+
+    /// Under the REMOVE policy, accounts for the `unsupported` fields the
+    /// parser already dropped from a schema: logs them and adds them to
+    /// `unsupported_features_removed`. A no-op under FAIL or when the list is
+    /// empty. Call only after the import succeeds, so a failed import does not
+    /// report features as removed.
+    void count_if_contains_unsupported_removed(
+      const ppsr::subject_version& n,
+      const chunked_vector<ppsr::unsupported_feature>& unsupported);
 
     /// Marks a node replicated and releases dependents whose in-degree hits 0.
     void wake(const ppsr::subject_version& n);
@@ -186,6 +218,8 @@ private:
     ss::noncopyable_function<bool(const ppsr::context_subject&)> _in_scope;
     const context_mapper* _mapper;
     limits _limits;
+    model::schema_registry_sync_config::unsupported_feature_policy
+      _feature_policy;
 
     chunked_hash_set<ppsr::subject_version> _replicated;
     chunked_hash_map<ppsr::subject_version, node_data> _nodes;
