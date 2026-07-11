@@ -112,7 +112,7 @@ level_one_log_reader_impl::open_reader_at(
     if (stream_fut.failed()) {
         auto ex = stream_fut.get_exception();
         auto log_level = ssx::is_shutdown_exception(ex) ? ss::log_level::debug
-                                                        : ss::log_level::error;
+                                                        : ss::log_level::warn;
         vlogl(
           _log,
           log_level,
@@ -170,7 +170,7 @@ level_one_log_reader_impl::read_some(
                 auto ex = read_fut.get_exception();
                 auto log_level = ssx::is_shutdown_exception(ex)
                                    ? ss::log_level::debug
-                                   : ss::log_level::error;
+                                   : ss::log_level::warn;
                 vlogl(
                   _log,
                   log_level,
@@ -341,7 +341,7 @@ ss::future<l1::footer> level_one_log_reader_impl::read_footer(
     if (read_fut.failed()) {
         auto ex = read_fut.get_exception();
         auto log_level = ssx::is_shutdown_exception(ex) ? ss::log_level::debug
-                                                        : ss::log_level::error;
+                                                        : ss::log_level::warn;
         vlogl(
           _log,
           log_level,
@@ -505,7 +505,7 @@ level_one_log_reader_impl::materialize_batches_from_object_offset(
     if (read_fut.failed()) {
         auto ex = read_fut.get_exception();
         auto log_level = ssx::is_shutdown_exception(ex) ? ss::log_level::debug
-                                                        : ss::log_level::error;
+                                                        : ss::log_level::warn;
         vlogl(
           _log,
           log_level,
