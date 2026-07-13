@@ -1320,7 +1320,7 @@ class EndToEndCloudTopicsReconciliationToggleTest(EndToEndCloudTopicsBase):
     @matrix(
         storage_mode=[
             TopicSpec.STORAGE_MODE_CLOUD,
-            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
         ],
     )
     def test_toggle_reconciliation(self, storage_mode: str):
