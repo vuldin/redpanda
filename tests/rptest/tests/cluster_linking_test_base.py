@@ -473,6 +473,20 @@ class ClusterLinkingProgressVerifier:
         self.target_consumer.stop()
         self.producer.stop()
 
+    def _raise_if_worker_crashed(self):
+        """Fail fast if any kgo-verifier worker's status thread has errored.
+
+        A worker whose process dies (e.g. a client-library crash such as the
+        franz-go produce-path panic) stops answering status polls and can never
+        recover. Its StatusThread records the failure -- naming the worker that
+        exited -- and raise_on_error() re-raises it here, so validate_progress
+        surfaces that descriptive error immediately instead of waiting out
+        progress_timeout and reporting an opaque "Workload stalled".
+        """
+        for svc in (self.producer, self.source_consumer, self.target_consumer):
+            if svc._status_thread is not None:
+                svc._status_thread.raise_on_error()
+
     def validate_progress(self, progress_timeout=60, backoff_delay=5):
         workload_last_progress = time.time()
         source_consumer_last_reads = 0
@@ -484,6 +498,11 @@ class ClusterLinkingProgressVerifier:
             producer_acked = self.producer.produce_status.acked
             source_reads = self.source_consumer.consumer_status.validator.total_reads
             target_reads = self.target_consumer.consumer_status.validator.total_reads
+
+            # A crashed kgo-verifier worker can never make progress, so fail
+            # fast with the descriptive error its status thread recorded rather
+            # than blaming a "Workload stalled" after progress_timeout elapses.
+            self._raise_if_worker_crashed()
 
             # track workload progress
             if (
