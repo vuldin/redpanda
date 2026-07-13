@@ -41,8 +41,9 @@ iobuf fragmented_iobuf(std::string_view s, size_t chunk_size) {
     return buf;
 }
 
-// Linearize the raw schema text out of a parsed stored_schema for comparison.
-ss::sstring schema_text(const stored_schema& s) {
+// Linearize the raw schema text out of a parsed source_schema_read for
+// comparison.
+ss::sstring schema_text(const source_schema_read& s) {
     return s.schema.def().raw()().linearize_to_string();
 }
 
@@ -941,13 +942,15 @@ TEST_CORO(parse_subject_version_test, minimal_avro_defaults) {
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(res.has_value());
     ASSERT_TRUE_CORO(res.value().unsupported.empty());
-    const auto& s = res.value().schema;
+    const auto& s = res.value();
     ASSERT_EQ_CORO(
       s.schema.sub(), (context_subject{default_context, subject{"User"}}));
     ASSERT_EQ_CORO(s.version, schema_version{1});
     ASSERT_EQ_CORO(s.id, schema_id{100001});
     ASSERT_EQ_CORO(s.schema.type(), schema_type::avro); // default
-    ASSERT_EQ_CORO(s.deleted, is_deleted::no);          // default
+    // Absent `deleted`: nullopt, so the caller can tell it apart from an
+    // explicit false.
+    ASSERT_FALSE_CORO(s.deleted.has_value());
     ASSERT_TRUE_CORO(s.schema.def().refs().empty());
     ASSERT_EQ_CORO(schema_text(s), R"({"type":"string"})");
 }
@@ -959,7 +962,7 @@ TEST_CORO(parse_subject_version_test, schema_types) {
         R"("schema":"{\"type\":\"object\"}"})"),
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(json.has_value());
-    ASSERT_EQ_CORO(json.value().schema.schema.type(), schema_type::json);
+    ASSERT_EQ_CORO(json.value().schema.type(), schema_type::json);
 
     // PROTOBUF: the .proto text (quotes and newlines) is preserved verbatim.
     auto proto = co_await parse_subject_version(
@@ -968,7 +971,7 @@ TEST_CORO(parse_subject_version_test, schema_types) {
         R"("schema":"syntax = \"proto3\";\nmessage M {}\n"})"),
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(proto.has_value());
-    const auto& p = proto.value().schema;
+    const auto& p = proto.value();
     ASSERT_EQ_CORO(p.schema.type(), schema_type::protobuf);
     ASSERT_EQ_CORO(schema_text(p), "syntax = \"proto3\";\nmessage M {}\n");
 }
@@ -983,7 +986,7 @@ TEST_CORO(parse_subject_version_test, full_object_maps_all_fields) {
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(res.has_value());
     ASSERT_TRUE_CORO(res.value().unsupported.empty());
-    const auto& s = res.value().schema;
+    const auto& s = res.value();
     ASSERT_EQ_CORO(
       s.schema.sub(), (context_subject{context{".ctx"}, subject{"MyRecord"}}));
     ASSERT_EQ_CORO(s.version, schema_version{2});
@@ -1000,6 +1003,32 @@ TEST_CORO(parse_subject_version_test, full_object_maps_all_fields) {
     ASSERT_EQ_CORO(refs[0].version, schema_version{1});
 }
 
+TEST_CORO(parse_subject_version_test, reports_deleted_presence) {
+    constexpr std::string_view base
+      = R"("subject":"User","version":1,"id":1,"schema":"\"string\"")";
+
+    // Present and true: `deleted` mirrors the flag.
+    auto present_true = co_await parse_subject_version(
+      iobuf::from(fmt::format("{{{},\"deleted\":true}}", base)),
+      qualified_subjects_enabled::yes);
+    ASSERT_TRUE_CORO(present_true.has_value());
+    ASSERT_EQ_CORO(present_true.value().deleted, is_deleted::yes);
+
+    // Present and false: distinct from absent -- an explicit `no`, not nullopt.
+    auto present_false = co_await parse_subject_version(
+      iobuf::from(fmt::format("{{{},\"deleted\":false}}", base)),
+      qualified_subjects_enabled::yes);
+    ASSERT_TRUE_CORO(present_false.has_value());
+    ASSERT_EQ_CORO(present_false.value().deleted, is_deleted::no);
+
+    // Absent: nullopt, so a caller can tell it apart from an explicit false.
+    auto absent = co_await parse_subject_version(
+      iobuf::from(fmt::format("{{{}}}", base)),
+      qualified_subjects_enabled::yes);
+    ASSERT_TRUE_CORO(absent.has_value());
+    ASSERT_FALSE_CORO(absent.value().deleted.has_value());
+}
+
 TEST_CORO(parse_subject_version_test, reference_subject_honors_policy) {
     constexpr std::string_view body
       = R"({"subject":"r","version":1,"id":2,"schema":"x",)"
@@ -1008,7 +1037,7 @@ TEST_CORO(parse_subject_version_test, reference_subject_honors_policy) {
     auto on = co_await parse_subject_version(
       iobuf::from(body), qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(on.has_value());
-    const auto& on_ref = on.value().schema.schema.def().refs()[0];
+    const auto& on_ref = on.value().schema.def().refs()[0];
     ASSERT_EQ_CORO(on_ref.sub.qualified, is_qualified::yes);
     ASSERT_EQ_CORO(
       on_ref.sub.sub, (context_subject{context{".ctx"}, subject{"Sub"}}));
@@ -1016,7 +1045,7 @@ TEST_CORO(parse_subject_version_test, reference_subject_honors_policy) {
     auto off = co_await parse_subject_version(
       iobuf::from(body), qualified_subjects_enabled::no);
     ASSERT_TRUE_CORO(off.has_value());
-    const auto& off_ref = off.value().schema.schema.def().refs()[0];
+    const auto& off_ref = off.value().schema.def().refs()[0];
     ASSERT_EQ_CORO(off_ref.sub.qualified, is_qualified::no);
     ASSERT_EQ_CORO(
       off_ref.sub.sub,
@@ -1040,7 +1069,7 @@ TEST_CORO(parse_subject_version_test, surfaces_unsupported_fields) {
         R"("schemaTags":[{"tags":["PII"]}],"futureField":[1,2,3]})"),
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(res.has_value());
-    const auto& s = res.value().schema;
+    const auto& s = res.value();
     ASSERT_EQ_CORO(
       s.schema.sub(), (context_subject{default_context, subject{"User"}}));
     ASSERT_EQ_CORO(s.version, schema_version{1});
@@ -1090,7 +1119,7 @@ TEST_CORO(parse_subject_version_test, metadata_properties_coercion) {
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(res.has_value());
     ASSERT_TRUE_CORO(res.value().unsupported.empty());
-    const auto& meta = res.value().schema.schema.def().meta();
+    const auto& meta = res.value().schema.def().meta();
     ASSERT_TRUE_CORO(meta.has_value());
     ASSERT_TRUE_CORO(meta->properties.has_value());
     const auto& props = *meta->properties;
@@ -1111,7 +1140,7 @@ TEST_CORO(parse_subject_version_test, metadata_present_without_properties) {
         R"({"tags":{"f":["PII"]},"sensitive":["ssn"]}})"),
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(res.has_value());
-    const auto& meta = res.value().schema.schema.def().meta();
+    const auto& meta = res.value().schema.def().meta();
     ASSERT_TRUE_CORO(meta.has_value());
     ASSERT_FALSE_CORO(meta->properties.has_value());
     const auto& unsupported = res.value().unsupported;
@@ -1129,14 +1158,14 @@ TEST_CORO(parse_subject_version_test, metadata_empty_and_null) {
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(empty_obj.has_value());
     ASSERT_TRUE_CORO(empty_obj.value().unsupported.empty());
-    ASSERT_TRUE_CORO(empty_obj.value().schema.schema.def().meta().has_value());
+    ASSERT_TRUE_CORO(empty_obj.value().schema.def().meta().has_value());
 
     auto null_meta = co_await parse_subject_version(
       iobuf::from(R"({"subject":"r","version":1,"id":2,"metadata":null})"),
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(null_meta.has_value());
     ASSERT_TRUE_CORO(null_meta.value().unsupported.empty());
-    ASSERT_FALSE_CORO(null_meta.value().schema.schema.def().meta().has_value());
+    ASSERT_FALSE_CORO(null_meta.value().schema.def().meta().has_value());
 
     // metadata.properties: null leaves properties absent (metadata present).
     auto null_props = co_await parse_subject_version(
@@ -1144,7 +1173,7 @@ TEST_CORO(parse_subject_version_test, metadata_empty_and_null) {
         R"({"subject":"r","version":1,"metadata":{"properties":null}})"),
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(null_props.has_value());
-    const auto& meta = null_props.value().schema.schema.def().meta();
+    const auto& meta = null_props.value().schema.def().meta();
     ASSERT_TRUE_CORO(meta.has_value());
     ASSERT_FALSE_CORO(meta->properties.has_value());
 }
@@ -1154,18 +1183,18 @@ TEST_CORO(parse_subject_version_test, absent_fields_use_sentinels_not_error) {
     auto empty = co_await parse_subject_version(
       iobuf::from("{}"), qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(empty.has_value());
-    const auto& e = empty.value().schema;
+    const auto& e = empty.value();
     ASSERT_EQ_CORO(e.version, invalid_schema_version);
     ASSERT_EQ_CORO(e.id, invalid_schema_id);
     ASSERT_EQ_CORO(e.schema.sub(), invalid_subject);
     ASSERT_EQ_CORO(e.schema.type(), schema_type::avro);
-    ASSERT_EQ_CORO(e.deleted, is_deleted::no);
+    ASSERT_FALSE_CORO(e.deleted.has_value());
 
     auto no_schema = co_await parse_subject_version(
       iobuf::from(R"({"subject":"r","version":1,"id":2})"),
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(no_schema.has_value());
-    ASSERT_EQ_CORO(no_schema.value().schema.version, schema_version{1});
+    ASSERT_EQ_CORO(no_schema.value().version, schema_version{1});
 }
 
 TEST_CORO(parse_subject_version_test, id_zero_is_valid) {
@@ -1175,7 +1204,7 @@ TEST_CORO(parse_subject_version_test, id_zero_is_valid) {
       iobuf::from(R"({"subject":"r","version":1,"id":0,"schema":"x"})"),
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(res.has_value());
-    ASSERT_EQ_CORO(res.value().schema.id, schema_id{0});
+    ASSERT_EQ_CORO(res.value().id, schema_id{0});
 }
 
 TEST_CORO(parse_subject_version_test, rejects_unrepresentable) {
@@ -1223,7 +1252,7 @@ TEST_CORO(parse_subject_version_test, fragmented_input) {
     auto res = co_await parse_subject_version(
       fragmented_iobuf(body, 1), qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(res.has_value());
-    const auto& s = res.value().schema;
+    const auto& s = res.value();
     ASSERT_EQ_CORO(
       s.schema.sub(), (context_subject{context{".ctx"}, subject{"User"}}));
     ASSERT_EQ_CORO(s.version, schema_version{12});
@@ -1297,7 +1326,7 @@ TEST_CORO(parse_subject_version_test, reference_unknown_keys_skipped) {
       qualified_subjects_enabled::yes);
     ASSERT_TRUE_CORO(res.has_value());
     ASSERT_TRUE_CORO(res->unsupported.empty());
-    const auto& refs = res->schema.schema.def().refs();
+    const auto& refs = res->schema.def().refs();
     ASSERT_EQ_CORO(refs.size(), size_t{1});
     ASSERT_EQ_CORO(refs[0].name, "n");
     ASSERT_EQ_CORO(refs[0].version, schema_version{2});

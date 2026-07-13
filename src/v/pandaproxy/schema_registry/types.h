@@ -24,6 +24,7 @@
 #include <seastar/util/bool_class.hh>
 
 #include <iosfwd>
+#include <optional>
 #include <type_traits>
 
 namespace avro {
@@ -772,8 +773,24 @@ struct unsupported_feature {
 /// schema projected into Redpanda's supported model, plus any unsupported
 /// fields that were seen but not stored.
 struct source_schema_read {
-    stored_schema schema;
+    subject_schema schema;
+    schema_version version{invalid_schema_version};
+    schema_id id{invalid_schema_id};
+    /// The soft-delete state the source explicitly reported for this version,
+    /// or nullopt when the source omitted `deleted` from the body.
+    std::optional<is_deleted> deleted;
     chunked_vector<unsupported_feature> unsupported;
+
+    /// Materializes the read into a stored_schema, resolving \ref deleted to
+    /// the source-reported flag when present, or \p fallback when the source
+    /// omitted it (\ref deleted is nullopt). Consumes the read.
+    stored_schema into_stored(is_deleted fallback = is_deleted::no) && {
+        return {
+          .schema = std::move(schema),
+          .version = version,
+          .id = id,
+          .deleted = deleted.value_or(fallback)};
+    }
 };
 
 ///\brief A mapping of version and schema id for a subject.
