@@ -7,7 +7,7 @@ require (
 	buf.build/gen/go/redpandadata/cloud/connectrpc/go v1.19.1-20260409133226-cd0bdc42a0f9.2
 	buf.build/gen/go/redpandadata/cloud/protocolbuffers/go v1.36.11-20260409133226-cd0bdc42a0f9.1
 	buf.build/gen/go/redpandadata/common/protocolbuffers/go v1.36.11-20260323171043-6e06f84ad823.1
-	buf.build/gen/go/redpandadata/core/protocolbuffers/go v1.36.11-20260623153049-288047c1b16f.1
+	buf.build/gen/go/redpandadata/core/protocolbuffers/go v1.36.11-20260706172830-ee867ae38d23.1
 	buf.build/gen/go/redpandadata/dataplane/connectrpc/go v1.19.1-20260409091301-5e03d1b04513.2
 	buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go v1.36.11-20260409091301-5e03d1b04513.1
 	buf.build/gen/go/redpandadata/gatekeeper/connectrpc/go v1.19.1-20251022210437-a5dd600d04b6.2
