@@ -222,6 +222,7 @@ struct configuration final : public config_store {
     enum_property<model::compression> log_compression_type;
     property<size_t> fetch_max_bytes;
     property<bool> use_fetch_scheduler_group;
+    property<bool> kafka_fetch_read_coalescing_enabled;
     property<bool> use_produce_scheduler_group;
     property<bool> use_kafka_handler_scheduler_group;
     property<bool> kafka_handler_latency_all;

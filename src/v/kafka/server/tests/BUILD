@@ -245,6 +245,24 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
+    name = "fetch_read_coalescer_test",
+    timeout = "short",
+    srcs = [
+        "fetch_read_coalescer_test.cc",
+    ],
+    cpu = 2,
+    deps = [
+        "//src/v/bytes:iobuf",
+        "//src/v/config",
+        "//src/v/kafka/server",
+        "//src/v/model",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
     name = "consumer_group_recovery_test",
     timeout = "short",
     srcs = [
