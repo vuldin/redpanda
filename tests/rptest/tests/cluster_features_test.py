@@ -1218,8 +1218,24 @@ PERTURB_EXERCISED_FEATURES = frozenset(
 )
 PERTURB_ACKNOWLEDGED_FEATURES = frozenset(
     {
-        # Cluster-linking features, out of scope for this single-cluster test.
+        # Cluster-linking features: exercising either needs a second (source)
+        # cluster, which this single-cluster test does not have.
+        #
+        # shadow_link_sr_api_sync gates configuring Schema Registry API-mode
+        # sync on the target. Covered end to end -- gated while unfinalized,
+        # working after finalize -- by ShadowLinkUnfinalizedUpgradeTest.
         "shadow_link_sr_api_sync",
+        # batch_mirror_topic_status gates only the batched controller command
+        # for mirror-topic failover, reachable solely via a failover on an
+        # active shadow link. Downgrade-safe by inspection: while unfinalized
+        # the feature is inactive, so failover falls back to the legacy
+        # per-topic path, which writes only controller-log records (command
+        # types and status-enum values) the prior release already decodes. The
+        # one new-in-26.2 record -- the batched failover command -- is not
+        # written until the feature activates post-finalize (and a HEAD-side
+        # backstop in frontend::batch_update_mirror_topic_status refuses to
+        # replicate it while inactive), so the window persists nothing that
+        # could break a downgrade.
         "batch_mirror_topic_status",
         # Iceberg extended-mode topic-config gate; exercising it needs Iceberg
         # topic setup orthogonal to the finalization behavior under test.
@@ -1456,10 +1472,12 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
         self._exercise_tiered_cloud_topics()
         self._exercise_shadow_link_role_sync()
         self._exercise_fetch_controller_snapshot_rpc()
-        # The other two v26.2-gated features are not exercised by this
-        # single-cluster perturbation: shadow_link_sr_api_sync and
-        # batch_mirror_topic_status are both cluster-linking features
-        # (batch_mirror_topic_status additionally needs a second cluster).
+        # The other two v26.2-gated features are cluster-linking features that
+        # need a second (source) cluster, so they are acknowledged rather than
+        # exercised here; see PERTURB_ACKNOWLEDGED_FEATURES for why each stays
+        # downgrade-safe (shadow_link_sr_api_sync is covered by
+        # ShadowLinkUnfinalizedUpgradeTest; batch_mirror_topic_status is safe by
+        # inspection).
 
     def _exercise_tiered_cloud_topics(self):
         """tiered_cloud_topics gate: creating a topic with the tiered_v2
