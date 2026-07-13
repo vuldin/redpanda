@@ -88,6 +88,7 @@
         "rptest/tests/cluster_linking_e2e_test.py",
         "rptest/tests/cluster_linking_schema_registry_sync_test.py",
         "rptest/tests/cluster_linking_topic_syncing_test.py",
+        "rptest/tests/cluster_linking_unfinalized_upgrade_test.py",
         "rptest/tests/cluster_recovery_test.py",
         "rptest/tests/compacted_term_rolled_recovery_test.py",
         "rptest/tests/compaction_recovery_test.py",
