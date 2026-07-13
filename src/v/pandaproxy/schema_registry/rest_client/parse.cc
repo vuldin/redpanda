@@ -682,7 +682,7 @@ parse_subject_version(iobuf body, qualified_subjects_enabled qualified) {
         std::optional<iobuf> schema;
         schema_type type{schema_type::avro};
         schema_definition::references refs;
-        is_deleted deleted{false};
+        std::optional<is_deleted> deleted;
         std::optional<schema_metadata> metadata;
         chunked_vector<unsupported_feature> unsupported;
 
@@ -698,20 +698,22 @@ parse_subject_version(iobuf body, qualified_subjects_enabled qualified) {
                 }
                 // Absent fields fall back to defaults/sentinels; completeness
                 // is a higher-layer concern. Unmodeled fields were recorded in
-                // `unsupported` above for the caller to act on.
+                // `unsupported` above for the caller to act on. `deleted` stays
+                // nullopt when the body omitted the flag, so a caller can tell
+                // an absent flag from an explicit false; into_stored() resolves
+                // it to a concrete value with the caller's fallback.
                 co_return source_schema_read{
-                  .schema = stored_schema{
-                    .schema = subject_schema{
-                      subject.value_or(invalid_subject),
-                      schema_definition{
-                        schema_definition::raw_string{
-                          std::move(schema).value_or(iobuf{})},
-                        type,
-                        std::move(refs),
-                        std::move(metadata)}},
-                    .version = version.value_or(invalid_schema_version),
-                    .id = id.value_or(invalid_schema_id),
-                    .deleted = deleted},
+                  .schema = subject_schema{
+                    subject.value_or(invalid_subject),
+                    schema_definition{
+                      schema_definition::raw_string{
+                        std::move(schema).value_or(iobuf{})},
+                      type,
+                      std::move(refs),
+                      std::move(metadata)}},
+                  .version = version.value_or(invalid_schema_version),
+                  .id = id.value_or(invalid_schema_id),
+                  .deleted = deleted,
                   .unsupported = std::move(unsupported)};
             }
             if (p.token() != token::key) {

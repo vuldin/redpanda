@@ -285,10 +285,11 @@ http_source_reader::read_subject_version(
     if (!res.has_value()) {
         co_return std::unexpected(to_source_error(std::move(res.error())));
     }
-    // Carry the read through unchanged: the schema plus any unsupported fields
-    // the source served but Redpanda cannot store. The reconciler applies the
-    // configured unsupported-feature policy to
-    // `source_schema_read::unsupported`.
+    // Carry the read through unchanged: the schema, any unsupported fields the
+    // source served but Redpanda cannot store, and whether the source reported
+    // the `deleted` flag. The reconciler applies the configured
+    // unsupported-feature policy to `source_schema_read::unsupported` and
+    // prefers the reported `deleted` over its listing-derived fallback.
     co_return std::move(res.value());
 }
 
