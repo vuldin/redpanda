@@ -602,10 +602,9 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
                                     node);
         if (!dest_deleted) {
             work.upserts.push_back(node);
-            // Authoritative deleted-state from the listing partition: the
-            // reconciler imports these soft-deleted regardless of the
-            // per-version source body, which a standard source (e.g. Confluent)
-            // does not populate with a `deleted` flag by default.
+            // Listing-derived soft-delete, recorded as the fallback signal: the
+            // reconciler prefers the version body's own `deleted` flag and
+            // consults this set only when the source omits it from the body.
             work.soft_deleted.insert(node);
         }
     }

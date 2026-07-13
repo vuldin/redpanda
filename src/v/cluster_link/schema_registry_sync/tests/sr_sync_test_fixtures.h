@@ -107,6 +107,12 @@ key(const ppsr::context_subject& sub, int32_t version) {
 struct fake_source_state {
     chunked_vector<ppsr::context> contexts{ppsr::default_context};
     chunked_vector<ppsr::stored_schema> schemas;
+    // Whether the source echoes the `deleted` flag in per-version bodies. True
+    // (Redpanda, and Confluent queried with the extended-fields header) makes
+    // read_subject_version report source_schema_read::deleted; false models a
+    // source that omits it entirely, so deleted is nullopt and the caller must
+    // fall back to the listing-derived soft-delete set.
+    bool reports_deleted_flag = true;
     std::optional<srs::source_error> list_contexts_error;
     std::optional<srs::source_error> list_subjects_error;
     // Forces list_subject_versions to fail for specific subjects, letting a
@@ -280,8 +286,18 @@ public:
                   it != _state->unsupported_features.end()) {
                     unsupported = it->second.copy();
                 }
+                // A source that reports the flag echoes its state; one that
+                // omits it yields nullopt, and the reconciler's fallback (via
+                // into_stored) supplies the deleted state instead.
+                auto shared = s.share();
                 co_return ppsr::source_schema_read{
-                  .schema = s.share(), .unsupported = std::move(unsupported)};
+                  .schema = std::move(shared.schema),
+                  .version = shared.version,
+                  .id = shared.id,
+                  .deleted = _state->reports_deleted_flag
+                               ? std::optional<ppsr::is_deleted>{s.deleted}
+                               : std::nullopt,
+                  .unsupported = std::move(unsupported)};
             }
         }
         co_return std::unexpected(
