@@ -277,35 +277,55 @@ class ShadowLinkUnfinalizedUpgradeTest(ShadowLinkTestBase, UnfinalizedUpgradeMix
             ),
         )
 
+    def _update_link_sr_topic(self):
+        """Fetch the link and enable topic-mode Schema Registry sync (shadow the
+        source _schemas topic byte-for-byte). Unlike API-mode, topic-mode
+        predates v26.2 and is not behind the shadow_link_sr_api_sync gate, so it
+        is accepted even while the upgrade is unfinalized."""
+        link = self.get_link(LINK_NAME)
+        link.configurations.schema_registry_sync_options.shadow_schema_registry_topic.CopyFrom(
+            shadow_link_pb2.SchemaRegistrySyncOptions.ShadowSchemaRegistryTopic()
+        )
+        return self.update_link(
+            shadow_link=link,
+            update_mask=field_mask_pb2.FieldMask(
+                paths=["configurations.schema_registry_sync_options"]
+            ),
+        )
+
+    def _assert_sr_sync_mode(self, expected, label):
+        """Read the link back through the controller and assert its persisted
+        Schema Registry sync mode is `expected` (a oneof field name, e.g.
+        "shadow_schema_registry_topic")."""
+        opts = self.get_link(LINK_NAME).configurations.schema_registry_sync_options
+        got = opts.WhichOneof("schema_registry_shadowing_mode")
+        assert got == expected, f"expected SR sync mode {expected} ({label}), got {got}"
+
     # ---- lifecycle phases --------------------------------------------------
+
+    def _assert_gated(self, action, gate_msg, what):
+        """Assert `action` -- an update engaging a v26.2-gated sync surface -- is
+        refused with FAILED_PRECONDITION carrying the feature-specific gate
+        message. This is what keeps a downgrade safe: no gated state reaches the
+        controller log while the upgrade is unfinalized."""
+        try:
+            action()
+        except ConnectError as e:
+            assert e.code == ConnectErrorCode.FAILED_PRECONDITION, (
+                f"{what} should be gated by a precondition, got {e}"
+            )
+            assert gate_msg in str(e), (
+                f"{what} rejected, but not via the feature gate: {e}"
+            )
+        else:
+            raise AssertionError(f"{what} should be gated while unfinalized")
 
     def _assert_v26_2_sync_gated(self):
         """While unfinalized, both v26.2 sync surfaces must be refused on the
         target with FAILED_PRECONDITION and the feature-specific message -- this
         is what keeps a downgrade safe (no role/SR-API state can be written)."""
-        try:
-            self._update_link_role_sync()
-        except ConnectError as e:
-            assert e.code == ConnectErrorCode.FAILED_PRECONDITION, (
-                f"role sync should be gated by a precondition, got {e}"
-            )
-            assert ROLE_SYNC_GATE in str(e), (
-                f"role sync rejected, but not via the feature gate: {e}"
-            )
-        else:
-            raise AssertionError("role sync should be gated while unfinalized")
-
-        try:
-            self._update_link_sr_api()
-        except ConnectError as e:
-            assert e.code == ConnectErrorCode.FAILED_PRECONDITION, (
-                f"SR API-mode sync should be gated by a precondition, got {e}"
-            )
-            assert SR_API_GATE in str(e), (
-                f"SR API-mode sync rejected, but not via the feature gate: {e}"
-            )
-        else:
-            raise AssertionError("SR API-mode sync should be gated while unfinalized")
+        self._assert_gated(self._update_link_role_sync, ROLE_SYNC_GATE, "role sync")
+        self._assert_gated(self._update_link_sr_api, SR_API_GATE, "SR API-mode sync")
 
     def _verify_role_sync_works(self):
         """Post-finalize: configuring role sync is accepted and the migrator
@@ -418,3 +438,73 @@ class ShadowLinkUnfinalizedUpgradeTest(ShadowLinkTestBase, UnfinalizedUpgradeMix
         # Both gates are open now: the features must actually sync real data.
         self._verify_role_sync_works()
         self._verify_sr_api_sync_works()
+
+    @cluster(num_nodes=6, log_allow_list=RESTART_LOG_ALLOW_LIST)
+    def test_topic_mode_sr_sync_survives_downgrade(self):
+        """Topic-mode Schema Registry sync -- shadowing the source _schemas topic
+        byte-for-byte -- is the pre-v26.2 mechanism and is NOT behind the
+        shadow_link_sr_api_sync gate. An operator can therefore enable it during
+        the (potentially weeks-long) unfinalized window, so the *populated*
+        schema_registry_sync_config it persists must survive a rollback to the
+        prior release.
+
+        test_full_lifecycle only ever persists an empty schema_registry_sync_cfg
+        across the downgrade (its link mirrors a data topic, and API-mode is
+        gated). This drives a populated one through a real downgrade/replay --
+        the integration counterpart to the serde unit test
+        schema_registry_sync_config_legacy_reads_v1_topic_mode, where a v0
+        (prior-release) reader must recover field 0 (topic mode) from the v1
+        record the upgraded binary wrote.
+
+        Lifecycle:
+          1. Unfinalized on HEAD: API-mode is refused (gated) while topic-mode is
+             accepted (ungated) -- the gate distinguishes the two modes. The
+             accepted config is read back through the controller.
+          2. Roll back to the prior release without finalizing: the cluster
+             returns healthy (the populated v1 record replayed on the old binary)
+             and the link's data plane keeps mirroring.
+          3. Roll forward again: the topic-mode config is still intact, proving it
+             made the v1 -> v0 -> v1 round trip uncorrupted.
+
+        Note: topic-mode has no source-side preflight (sr_preflight_checker only
+        probes API-mode), and no source schema is registered here, so enabling it
+        persists the config without actually shadowing _schemas. Functional
+        _schemas shadowing is covered by the dedicated SR sync suites; this test
+        is about the persisted config surviving the version boundary.
+        """
+        RpkTool(self.source_cluster_service).create_topic(MIRROR_TOPIC, partitions=1)
+
+        # Opt out of auto-finalization on the old binary, then roll the target
+        # forward to HEAD with the active (downgrade-floor) version held back.
+        self._disable_auto_finalization()
+        self._restart_at_new(self.redpanda.nodes)
+        self._wait_for_status_state(features_pb2.FINALIZATION_STATE_READY_TO_FINALIZE)
+        assert self.admin.get_features()["cluster_version"] == self.old_logical
+
+        # shadow_linking is v25.3, so the link machinery is live while
+        # unfinalized: create a topic-mirroring link and confirm the data plane.
+        self._create_link_mirroring_topic(MIRROR_TOPIC)
+        self._produce_source(MIRROR_TOPIC, MIRROR_RECORDS_PRE)
+        self._wait_mirrored(MIRROR_TOPIC, MIRROR_RECORDS_PRE, "unfinalized")
+
+        # The gate distinguishes the SR sync modes: API-mode is refused...
+        self._assert_gated(self._update_link_sr_api, SR_API_GATE, "SR API-mode sync")
+        # ...but topic-mode (pre-v26.2, ungated) is accepted and persisted as a
+        # populated schema_registry_sync_config in the controller log.
+        self._update_link_sr_topic()
+        self._assert_sr_sync_mode("shadow_schema_registry_topic", "unfinalized")
+
+        # Roll back to the prior release WITHOUT finalizing. The populated v1
+        # link_configuration must replay on the old binary: healthy cluster,
+        # unchanged active version, and the data plane still mirroring.
+        self._downgrade_all_to(self.old_release)
+        assert self.admin.get_features()["cluster_version"] == self.old_logical
+        self._produce_source(MIRROR_TOPIC, MIRROR_RECORDS_POST)
+        self._wait_mirrored(
+            MIRROR_TOPIC, MIRROR_RECORDS_PRE + MIRROR_RECORDS_POST, "downgraded"
+        )
+
+        # Roll forward again: the topic-mode config survived the round trip.
+        self._restart_at_new(self.redpanda.nodes)
+        self._wait_for_status_state(features_pb2.FINALIZATION_STATE_READY_TO_FINALIZE)
+        self._assert_sr_sync_mode("shadow_schema_registry_topic", "re-upgraded")
