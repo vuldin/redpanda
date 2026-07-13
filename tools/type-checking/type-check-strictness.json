@@ -442,6 +442,7 @@
         "rptest/tests/tls_metrics_test.py",
         "rptest/tests/topic_creation_test.py",
         "rptest/tests/topic_delete_test.py",
+        "rptest/tests/unfinalized_upgrade_mixin.py",
         "rptest/tests/upgrade_test.py",
         "rptest/tests/usage_test.py",
         "rptest/tests/workload_upgrade_runner_test.py",
