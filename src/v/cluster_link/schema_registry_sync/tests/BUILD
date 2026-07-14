@@ -78,6 +78,7 @@ redpanda_cc_gtest(
         "//src/v/http",
         "//src/v/pandaproxy/schema_registry:types",
         "//src/v/pandaproxy/schema_registry/rest_client:client",
+        "//src/v/test_utils:async",
         "//src/v/test_utils:gtest",
         "@googletest//:gtest",
         "@seastar",

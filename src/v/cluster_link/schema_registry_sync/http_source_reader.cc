@@ -20,6 +20,7 @@
 #include "net/tls_certificate_probe.h"
 #include "net/transport.h"
 #include "pandaproxy/schema_registry/rest_client/error.h"
+#include "pandaproxy/schema_registry/rest_client/pooled_client.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/coroutine.hh>
@@ -42,6 +43,12 @@ namespace {
 // retries_exhausted, which the reader maps to source_unavailable.
 constexpr auto request_timeout = 30s;
 constexpr auto request_backoff = 100ms;
+
+// Upper bound on pooled connections to the source registry. The pool is sized
+// to schema_registry_sync_parallelism (the reconciler's fan-out), capped here
+// so a large parallelism setting does not hold as many sockets open against
+// the source.
+constexpr size_t max_source_connections = 8;
 
 // Map a rest_client failure onto a source_error. A source that is unreachable
 // or rejecting every request is source_unavailable and parks the link; a 404 is
@@ -169,7 +176,11 @@ http_source_reader::http_source_reader(std::unique_ptr<rc::client> client)
   : _client(std::move(client)) {}
 
 ss::future<source_result<rc::client*>>
-http_source_reader::ensure_client(ss::abort_source&) {
+http_source_reader::ensure_client(ss::abort_source& as) {
+    if (_client) {
+        co_return _client.get();
+    }
+    auto build = co_await ss::get_units(_build, 1, as);
     if (_client) {
         co_return _client.get();
     }
@@ -193,8 +204,18 @@ http_source_reader::ensure_client(ss::abort_source&) {
                 cfg.tls_sni_hostname = _conn->address.host();
             }
         }
+        // Enough connections for the reconciler's fan-out; each http::client
+        // connects lazily on first use, so idle pool slots cost no sockets.
+        auto pool_size = std::min(
+          config::shard_local_cfg().schema_registry_sync_parallelism(),
+          max_source_connections);
+        std::vector<std::unique_ptr<http::abstract_client>> transports;
+        transports.reserve(pool_size);
+        for (size_t i = 0; i < pool_size; ++i) {
+            transports.push_back(std::make_unique<http::client>(cfg));
+        }
         _client = std::make_unique<rc::client>(
-          std::make_unique<http::client>(cfg),
+          std::make_unique<rc::pooled_client>(std::move(transports)),
           _conn->endpoint,
           _conn->auth,
           ppsr::qualified_subjects_enabled::yes);
@@ -211,7 +232,6 @@ http_source_reader::ensure_client(ss::abort_source&) {
 
 ss::future<source_result<chunked_vector<ppsr::context>>>
 http_source_reader::list_contexts(ss::abort_source& as) {
-    auto units = co_await ss::get_units(_inflight, 1, as);
     auto client = co_await ensure_client(as);
     if (!client.has_value()) {
         co_return std::unexpected(std::move(client.error()));
@@ -228,7 +248,6 @@ http_source_reader::list_contexts(ss::abort_source& as) {
 
 ss::future<source_result<chunked_vector<ppsr::context_subject>>>
 http_source_reader::list_subjects(ppsr::context ctx, ss::abort_source& as) {
-    auto units = co_await ss::get_units(_inflight, 1, as);
     auto client = co_await ensure_client(as);
     if (!client.has_value()) {
         co_return std::unexpected(std::move(client.error()));
@@ -252,7 +271,6 @@ http_source_reader::list_subject_versions(
   ppsr::context_subject sub,
   ppsr::include_deleted include_deleted,
   ss::abort_source& as) {
-    auto units = co_await ss::get_units(_inflight, 1, as);
     auto client = co_await ensure_client(as);
     if (!client.has_value()) {
         co_return std::unexpected(std::move(client.error()));
@@ -271,7 +289,6 @@ http_source_reader::read_subject_version(
   ppsr::context_subject sub,
   ppsr::schema_version version,
   ss::abort_source& as) {
-    auto units = co_await ss::get_units(_inflight, 1, as);
     auto client = co_await ensure_client(as);
     if (!client.has_value()) {
         co_return std::unexpected(std::move(client.error()));
@@ -295,7 +312,6 @@ http_source_reader::read_subject_version(
 
 ss::future<source_result<std::optional<ppsr::mode>>>
 http_source_reader::read_mode(ppsr::context_subject sub, ss::abort_source& as) {
-    auto units = co_await ss::get_units(_inflight, 1, as);
     auto client = co_await ensure_client(as);
     if (!client.has_value()) {
         co_return std::unexpected(std::move(client.error()));
@@ -329,7 +345,6 @@ http_source_reader::read_mode(ppsr::context_subject sub, ss::abort_source& as) {
 ss::future<source_result<std::optional<ppsr::compatibility_level>>>
 http_source_reader::read_config(
   ppsr::context_subject sub, ss::abort_source& as) {
-    auto units = co_await ss::get_units(_inflight, 1, as);
     auto client = co_await ensure_client(as);
     if (!client.has_value()) {
         co_return std::unexpected(std::move(client.error()));
