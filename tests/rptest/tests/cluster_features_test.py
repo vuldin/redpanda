@@ -1209,7 +1209,13 @@ PERTURB_RECORD_SIZE = 128
 # exercise or an explicit acknowledgement. Add a feature's name here when you
 # cover it or knowingly skip it; entries for features no longer gated by the
 # current upgrade are harmless extras, so no per-major pruning is needed.
-PERTURB_EXERCISED_FEATURES = frozenset({"tiered_cloud_topics", "shadow_link_role_sync"})
+PERTURB_EXERCISED_FEATURES = frozenset(
+    {
+        "tiered_cloud_topics",
+        "shadow_link_role_sync",
+        "fetch_controller_snapshot_rpc",
+    }
+)
 PERTURB_ACKNOWLEDGED_FEATURES = frozenset(
     {
         # Cluster-linking features, out of scope for this single-cluster test.
@@ -1218,12 +1224,6 @@ PERTURB_ACKNOWLEDGED_FEATURES = frozenset(
         # Iceberg extended-mode topic-config gate; exercising it needs Iceberg
         # topic setup orthogonal to the finalization behavior under test.
         "iceberg_extended_mode_config",
-        # Bootstrap-time internal RPC: while gated, a restarting node simply
-        # skips the controller-snapshot fetch and falls back to its local
-        # config cache (indistinguishable from prior behavior, with no
-        # distinctive signal to assert here). Its active-state
-        # behavior is covered by ClusterConfigMultiNodeBootstrapTest.
-        "fetch_controller_snapshot_rpc",
     }
 )
 
@@ -1455,6 +1455,7 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
             return
         self._exercise_tiered_cloud_topics()
         self._exercise_shadow_link_role_sync()
+        self._exercise_fetch_controller_snapshot_rpc()
         # The other two v26.2-gated features are not exercised by this
         # single-cluster perturbation: shadow_link_sr_api_sync and
         # batch_mirror_topic_status are both cluster-linking features
@@ -1549,6 +1550,147 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
                 "configuring role sync should be gated while unfinalized"
             )
 
+    def _exercise_fetch_controller_snapshot_rpc(self):
+        """Sanity-check that the fetch_controller_snapshot_rpc gate keeps an
+        unfinalized upgrade downgrade-safe.
+
+        This feature is safe because its only new behavior -- a restarting
+        broker fetching a fresh controller snapshot at bootstrap (from the "great
+        config bootstrap fix") -- sits behind a single client-side is_active()
+        check in application::bootstrap_controller_view. While the upgrade is
+        unfinalized the active version is held below the feature's
+        require_version (v26_2_1), so that gate is provably closed: the feature
+        never even becomes available, let alone active. With the gate closed
+        bootstrap_controller_view returns immediately -- it issues no RPC and,
+        crucially, writes no new state (no config-cache write, no feature-table
+        snapshot applied, no wait-for-offset). The broker boots exactly as the
+        pre-upgrade binary did, from its local config cache, so rolling back to
+        the old binary finds nothing on disk it cannot read. Finalization is the
+        one-way door that opens the gate; until it is crossed the new path stays
+        inert and leaves no trace, which is precisely what makes the downgrade
+        safe.
+
+        This test is a sanity check on that safety property -- not a proof of the
+        C++ gate logic, but a check that the *observable* behavior matches it. It
+        simulates the case the feature actually targets, not just any restart:
+        bring one broker down, change a restart-requiring, non-feature-gated
+        property it will miss, then restart only that broker with the other two
+        (and therefore the controller leader) still up. Keeping the leader
+        reachable is what makes this a gate test rather than a
+        leader-reachability test: were the gate wrongly open -- e.g. a future
+        change activating the feature before finalization, or moving the fetch
+        ahead of the is_active() check -- the broker would fetch the missed value
+        before starting services and come back needing no restart (as it does
+        once finalized -- see
+        ClusterConfigMultiNodeBootstrapTest.test_node_delayed_restart). Gated, it
+        must instead boot on the stale value and still report restart-required,
+        having attempted no fetch.
+
+        NOTE: the whole-cluster in-place restart in _perturb_common does not
+        exercise this. Restarting every broker at once leaves no controller
+        leader to fetch from and changes no config, so it cannot tell the gated
+        path from the active one."""
+        assert self._feature_state("fetch_controller_snapshot_rpc") == "unavailable", (
+            "fetch_controller_snapshot_rpc should be unavailable while unfinalized"
+        )
+
+        PROPERTY = "kafka_qdc_idle_depth"  # restart-requiring, not feature-gated
+        node = self.redpanda.nodes[-1]
+        node_id = self.redpanda.node_id(node)
+
+        # Pick a value different from the current one so the change the broker
+        # misses is always real. A fixed constant is not safe across the
+        # upgrade/downgrade cycles: an earlier value can already be promoted into
+        # the broker's on-disk config cache (e.g. the pre-fix old binary promotes
+        # it at start during a downgrade), and if that happened to match, the
+        # "missed change" would be a no-op and the broker would boot with nothing
+        # pending. node[-1] is converged before we stop it, so its boot value is
+        # the current cluster value read here; current + 1 is guaranteed to
+        # differ.
+        current_value = int(
+            self.admin.get_cluster_config(include_defaults=True)[PROPERTY]
+        )
+        new_value = current_value + 1
+
+        # Down one broker, then change the property while it is down so it misses
+        # the change. Quorum (2/3) survives, so the change commits and a
+        # controller leader stays up.
+        self.redpanda.stop_node(node)
+        try:
+            # new_version is the version the restarted broker must replay up to
+            # before its restart-required verdict is meaningful.
+            new_version = self.admin.patch_cluster_config(upsert={PROPERTY: new_value})[
+                "config_version"
+            ]
+
+            # Restart the broker on the same (HEAD) binary and let it rejoin.
+            self.redpanda.start_node(node)
+            self._wait_for_cluster_settled()
+
+            # Query node[-1] about itself. A broker's view of its OWN config
+            # status is authoritative and fresh; a peer's view is eventually
+            # consistent and can briefly report node[-1] at a stale version /
+            # restart=False right after its restart. Admin() otherwise dispatches
+            # to a random broker, which is exactly what raced in CI: caught_up
+            # read node[-1]'s own (fresh) view, then the restart read landed on a
+            # peer whose view of node[-1] had not yet caught up.
+            def restarted_node_status():
+                try:
+                    statuses = self.admin.get_cluster_config_status(node=node)
+                except Exception:
+                    return None
+                for s in statuses:
+                    if s["node_id"] == node_id:
+                        return s
+                return None
+
+            # Wait until the broker has replayed the controller log up to the
+            # missed change, so its restart-required verdict is meaningful.
+            def caught_up():
+                st = restarted_node_status()
+                return st is not None and st["config_version"] >= new_version
+
+            wait_until(
+                caught_up,
+                timeout_sec=60,
+                backoff_sec=1,
+                err_msg="restarted broker did not catch up to the new config version",
+            )
+
+            # Gated: no bootstrap fetch was attempted. This info-level line is
+            # logged only past the feature gate; every pre-finalize boot in this
+            # test is gated, so any match on this node is a real regression.
+            assert not self.redpanda.search_log_node(
+                node, "Fetching controller snapshot from"
+            ), "a gated broker must not attempt the bootstrap controller-snapshot fetch"
+
+            # Gated: the broker bootstrapped on its stale local cache, learned of
+            # the change only via post-bootstrap log replay, and -- since pending
+            # needs_restart values are not promoted at start -- reports
+            # restart-required. A wrongly-open gate would instead have fetched the
+            # fresh value at bootstrap and come back needing no restart. Poll to
+            # absorb any lag between node[-1] replaying the change and its own
+            # status reflecting it.
+            def reports_restart_required():
+                st = restarted_node_status()
+                return st is not None and st["restart"] is True
+
+            wait_until(
+                reports_restart_required,
+                timeout_sec=30,
+                backoff_sec=1,
+                err_msg=(
+                    "gated broker did not report restart-required for the missed "
+                    "change; it may have fetched fresh config at bootstrap"
+                ),
+            )
+        finally:
+            # Leave no config override behind for later phases or the downgrade.
+            try:
+                self.admin.patch_cluster_config(remove=[PROPERTY])
+            except Exception as e:
+                self.logger.warning(f"cleanup: failed to reset {PROPERTY}: {e}")
+
     def _verify_tiered_cloud_topics_working(self):
         """After finalize the active version has advanced past the feature's
         require_version, so the gate opens: the feature auto-activates (it is
@@ -1586,11 +1728,27 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
                 f"role-sync config still gated after finalize: {e}"
             )
 
+    def _verify_fetch_controller_snapshot_rpc_working(self):
+        """After finalize the active version advances past the feature's
+        require_version and it auto-activates (available_policy::always), opening
+        the bootstrap-fetch gate. Confirm the state transition; the active-state
+        fetch mechanics (a delayed-restart broker picking up fresh config before
+        starting services, the inverse of the gated outcome asserted in
+        _exercise_fetch_controller_snapshot_rpc) are covered end to end by
+        ClusterConfigMultiNodeBootstrapTest.test_node_delayed_restart."""
+        wait_until(
+            lambda: self._feature_state("fetch_controller_snapshot_rpc") == "active",
+            timeout_sec=30,
+            backoff_sec=1,
+            err_msg="fetch_controller_snapshot_rpc did not activate after finalize",
+        )
+
     def _verify_v26_2_features_working(self):
         """After the upgrade is finalized, confirm each v26.2 feature's gate has
         opened and the feature actually works (simple per-feature predicates)."""
         self._verify_tiered_cloud_topics_working()
         self._verify_shadow_link_role_sync_working()
+        self._verify_fetch_controller_snapshot_rpc_working()
 
     def _feature_state(self, name):
         for f in self.admin.get_features()["features"]:
