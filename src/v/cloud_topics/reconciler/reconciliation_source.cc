@@ -63,6 +63,13 @@ public:
       , _fe(ss::make_lw_shared<frontend>(partition, dp_api))
       , _partition(std::move(partition)) {}
 
+    l0_source(const l0_source&) = delete;
+    l0_source& operator=(const l0_source&) = delete;
+    l0_source(l0_source&&) = delete;
+    l0_source& operator=(l0_source&&) = delete;
+
+    ~l0_source() override { discard_placeholder_observation(); }
+
     bool has_pending_data() override {
         auto lro = last_reconciled_offset();
         auto lso = _fe->last_stable_offset();
