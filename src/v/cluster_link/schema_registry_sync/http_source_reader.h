@@ -56,12 +56,13 @@ std::optional<net::unresolved_address> parse_source_address(std::string_view);
 /// Enumerates every source context (via GET /contexts); basic auth and TLS
 /// are honored from the link config. The reconcile engine drives discovery
 /// (list contexts/subjects/versions) and schema-body fetches through this
-/// reader.
+/// reader, concurrently over a small pool of connections sized from
+/// schema_registry_sync_parallelism.
 class http_source_reader final : public source_reader {
 public:
-    /// Production: the HTTP transport (and its TLS credentials) is built lazily
-    /// from `conn` on the first request, since credential building is async but
-    /// the factory that creates the reader is not.
+    /// Production: the HTTP transports (and their TLS credentials) are built
+    /// lazily from `conn` on the first request, since credential building is
+    /// async but the factory that creates the reader is not.
     explicit http_source_reader(http_source_connection conn);
     /// Test seam: takes a ready rest_client, bypassing the lazy transport
     /// build.
@@ -90,19 +91,19 @@ public:
 
 private:
     /// Returns the rest_client, building it (and its TLS credentials) on first
-    /// call. Always invoked while holding `_inflight`, so at most one build
-    /// runs; a build failure surfaces as source_unavailable so the link parks
-    /// and retries. Returns a borrowed pointer owned by `_client`.
+    /// call. The build is serialized on `_build` so at most one runs; a build
+    /// failure surfaces as source_unavailable so the link parks and retries.
+    /// Returns a borrowed pointer owned by `_client`.
     ss::future<source_result<rc::client*>> ensure_client(ss::abort_source&);
 
     // Connection inputs for the lazy build; nullopt once a client is injected.
     std::optional<http_source_connection> _conn;
     std::unique_ptr<rc::client> _client;
-    // The reconcile engine drives this reader from several fibers, but the
-    // underlying http::client owns a single connection and cannot service
-    // concurrent requests (overlapping I/O double-completes the socket's
-    // pollable_fd), so _inflight serializes every request onto one slot.
-    ssx::semaphore _inflight{1, "cluster_link/sr_source/inflight"};
+    // Serializes the lazy client build only. Requests run concurrently: the
+    // reconcile engine drives this reader from several fibers, and the
+    // rest_client's pooled transport bounds them to one in-flight request per
+    // pooled connection.
+    ssx::semaphore _build{1, "cluster_link/sr_source/build"};
 };
 
 class http_source_reader_factory final : public source_reader_factory {

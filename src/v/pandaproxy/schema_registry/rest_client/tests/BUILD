@@ -72,6 +72,25 @@ redpanda_cc_gtest(
     ],
 )
 
+redpanda_cc_gtest(
+    name = "pooled_client_test",
+    timeout = "short",
+    srcs = [
+        "pooled_client_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/bytes:iobuf",
+        "//src/v/http",
+        "//src/v/pandaproxy/schema_registry/rest_client:pooled_client",
+        "//src/v/test_utils:async",
+        "//src/v/test_utils:gtest",
+        "@fmt",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
 redpanda_cc_btest(
     name = "client_integration_test",
     timeout = "short",

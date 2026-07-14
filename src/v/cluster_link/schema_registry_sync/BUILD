@@ -34,6 +34,7 @@ redpanda_cc_library(
         "//src/v/http",
         "//src/v/net",
         "//src/v/pandaproxy/schema_registry/rest_client:error",
+        "//src/v/pandaproxy/schema_registry/rest_client:pooled_client",
         "//src/v/utils:retry_chain_node",
         "@ada",
     ],

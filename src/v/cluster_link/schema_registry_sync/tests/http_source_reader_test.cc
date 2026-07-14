@@ -15,12 +15,15 @@
 #include "http/client.h"
 #include "pandaproxy/schema_registry/rest_client/client.h"
 #include "pandaproxy/schema_registry/types.h"
+#include "test_utils/async.h"
 
 #include <seastar/core/abort_source.hh>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <deque>
 #include <memory>
 #include <optional>
 
@@ -134,6 +137,43 @@ TEST(http_source_reader, stop_is_idempotent) {
     reader.stop().get();
 
     EXPECT_EQ(shutdowns, 1);
+}
+
+// The reader does not serialize requests: the reconcile engine's fibers drive
+// it concurrently, and in-flight requests are bounded by the pooled transport
+// underneath (here a single injected mock, so two requests overlapping on it
+// proves the reader itself imposes no serialization).
+TEST(http_source_reader, requests_run_concurrently) {
+    int inflight = 0;
+    int max_inflight = 0;
+    std::deque<ss::promise<http::downloaded_response>> parked;
+    auto reader = reader_over([&](mock_client& m) {
+        EXPECT_CALL(m, request_and_collect_response(_, _, _))
+          .WillRepeatedly([&](
+                            bh::request_header<>&&,
+                            std::optional<iobuf>,
+                            ss::lowres_clock::duration) {
+              ++inflight;
+              max_inflight = std::max(max_inflight, inflight);
+              parked.emplace_back();
+              return parked.back().get_future().finally(
+                [&inflight] { --inflight; });
+          });
+    });
+    ss::abort_source as;
+    auto first = reader.list_contexts(as);
+    auto second = reader.list_contexts(as);
+    RPTEST_REQUIRE_EVENTUALLY(5s, [&] { return parked.size() == 2; });
+    EXPECT_EQ(max_inflight, 2);
+
+    for (auto& request : parked) {
+        request.set_value(
+          http::downloaded_response{
+            .status = bh::status::ok, .body = iobuf::from(R"(["."])")});
+    }
+    ASSERT_TRUE(first.get().has_value());
+    ASSERT_TRUE(second.get().has_value());
+    reader.stop().get();
 }
 
 // The rest_client scopes GET /subjects to the requested context (a mock that
