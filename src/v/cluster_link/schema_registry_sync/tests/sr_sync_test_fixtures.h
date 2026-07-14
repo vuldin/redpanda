@@ -138,6 +138,19 @@ struct fake_source_state {
     chunked_hash_map<ppsr::context_subject, srs::source_error>
       read_config_errors;
 
+    // Unsupported config fields to attach to a target's read_config, letting a
+    // test drive the config-path unsupported-feature policy.
+    chunked_hash_map<
+      ppsr::context_subject,
+      chunked_vector<ppsr::unsupported_feature>>
+      config_unsupported;
+
+    void set_config_unsupported(
+      const ppsr::context_subject& sub,
+      chunked_vector<ppsr::unsupported_feature> features) {
+        config_unsupported[sub] = std::move(features);
+    }
+
     void fail_read(
       const ppsr::context_subject& sub,
       int32_t version,
@@ -319,17 +332,23 @@ public:
         co_return std::optional<ppsr::mode>{std::nullopt};
     }
 
-    ss::future<srs::source_result<std::optional<ppsr::compatibility_level>>>
+    ss::future<srs::source_result<srs::source_config_read>>
     read_config(ppsr::context_subject sub, ss::abort_source&) override {
         if (
           auto it = _state->read_config_errors.find(sub);
           it != _state->read_config_errors.end()) {
             co_return std::unexpected(it->second);
         }
+        srs::source_config_read out;
         if (auto it = _state->configs.find(sub); it != _state->configs.end()) {
-            co_return std::optional<ppsr::compatibility_level>{it->second};
+            out.compatibility = it->second;
         }
-        co_return std::optional<ppsr::compatibility_level>{std::nullopt};
+        if (
+          auto it = _state->config_unsupported.find(sub);
+          it != _state->config_unsupported.end()) {
+            out.unsupported = it->second.copy();
+        }
+        co_return out;
     }
 
 private:
@@ -554,6 +573,33 @@ public:
 
 private:
     chunked_hash_map<ppsr::subject_version, ppsr::error_info> _failures;
+};
+
+// Wraps a destination registry so a test can make write_config fail for a
+// subject, exercising the REMOVE "no count on a failed config write" path the
+// plain fake (which never rejects a config write) cannot.
+class failing_config_registry final : public delegating_registry {
+public:
+    using delegating_registry::delegating_registry;
+
+    void fail_config(
+      const ppsr::context_subject& sub,
+      ppsr::error_code code,
+      ss::sstring message) {
+        _failures.emplace(sub, ppsr::error_info{code, std::move(message)});
+    }
+
+    ss::future<bool> write_config(
+      ppsr::context_subject sub, ppsr::compatibility_level c) override {
+        if (auto it = _failures.find(sub); it != _failures.end()) {
+            return ss::make_exception_future<bool>(
+              ppsr::as_exception(it->second));
+        }
+        return _inner->write_config(std::move(sub), c);
+    }
+
+private:
+    chunked_hash_map<ppsr::context_subject, ppsr::error_info> _failures;
 };
 
 // Wraps a destination registry, modeling the real Schema Registry's refusal to

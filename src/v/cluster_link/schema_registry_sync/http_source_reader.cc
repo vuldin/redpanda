@@ -326,8 +326,7 @@ http_source_reader::read_mode(ppsr::context_subject sub, ss::abort_source& as) {
     co_return narrowed;
 }
 
-ss::future<source_result<std::optional<ppsr::compatibility_level>>>
-http_source_reader::read_config(
+ss::future<source_result<source_config_read>> http_source_reader::read_config(
   ppsr::context_subject sub, ss::abort_source& as) {
     auto units = co_await ss::get_units(_inflight, 1, as);
     auto client = co_await ensure_client(as);
@@ -343,26 +342,32 @@ http_source_reader::read_config(
                      sub, rtc, ppsr::default_to_global::no);
     if (!res.has_value()) {
         if (std::holds_alternative<rc::subject_config_not_found>(res.error())) {
-            co_return std::optional<ppsr::compatibility_level>{std::nullopt};
+            co_return source_config_read{.compatibility = std::nullopt};
         }
         co_return std::unexpected(to_source_error(std::move(res.error())));
     }
-    auto narrowed = narrow_compat(res.value().level);
-    if (!narrowed.has_value()) {
-        co_return std::unexpected(
-          source_error{
-            .kind = source_error_kind::operation_failed,
-            .message = fmt::format(
-              "source compatibility level '{}' of {} is not supported by the "
-              "destination",
-              res.value().raw,
-              sub)});
+    // A governance-only config (no compatibility level) is "no override"; its
+    // unsupported fields still reach the policy. The Config API documents the
+    // subject-level compatibility as optional ("the compatibility, if any"):
+    // https://docs.confluent.io/platform/current/schema-registry/develop/api.html#config
+    std::optional<ppsr::compatibility_level> narrowed;
+    if (res.value().level.has_value()) {
+        narrowed = narrow_compat(*res.value().level);
+        if (!narrowed.has_value()) {
+            co_return std::unexpected(
+              source_error{
+                .kind = source_error_kind::operation_failed,
+                .message = fmt::format(
+                  "source compatibility level '{}' of {} is not supported by "
+                  "the destination",
+                  res.value().raw,
+                  sub)});
+        }
     }
-    // Unsupported config fields (config_info::unknown_fields, e.g.
-    // defaultRuleSet or compatibilityGroup) are ignored; honoring
-    // unsupported_schema_feature_policy is future work, as it is for the
-    // schema-body path in read_subject_version.
-    co_return narrowed;
+    // Carry the unsupported config fields through for the sync's policy.
+    co_return source_config_read{
+      .compatibility = narrowed,
+      .unsupported = std::move(res.value().unsupported)};
 }
 
 ss::future<> http_source_reader::stop() {

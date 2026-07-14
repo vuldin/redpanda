@@ -453,13 +453,13 @@ TEST(registry_mode_test, to_string_view_and_format) {
 
 TEST_CORO(parse_config_test, compatibility_level_only) {
     // Redpanda's server emits just compatibilityLevel; nothing is recorded as
-    // an unknown field.
+    // an unsupported feature.
     auto res = co_await parse_config(
       iobuf::from(R"({"compatibilityLevel": "BACKWARD"})"));
     ASSERT_TRUE_CORO(res.has_value());
     ASSERT_EQ_CORO(res->level, registry_compatibility_level::backward);
     ASSERT_EQ_CORO(res->raw, "BACKWARD");
-    ASSERT_TRUE_CORO(res->unknown_fields.empty());
+    ASSERT_TRUE_CORO(res->unsupported.empty());
 }
 
 TEST_CORO(parse_config_test, all_known_levels_map_to_enumerators) {
@@ -505,8 +505,9 @@ TEST_CORO(parse_config_test, empty_level_is_unknown_not_error) {
 
 TEST_CORO(parse_config_test, records_unmodeled_fields) {
     // A Confluent registry may return a rich object. Only compatibilityLevel is
-    // modeled; every other top-level field's name is recorded (in encounter
-    // order) and its value skipped, whatever its shape (scalar, object, null).
+    // modeled; every other non-null top-level field is recorded (in encounter
+    // order) as an unsupported feature with a JSON pointer and type. A
+    // null-valued field is treated as absent (defaultRuleSet below).
     auto res = co_await parse_config(
       iobuf::from(
         R"({"compatibilityLevel": "FULL", "normalize": true, )"
@@ -515,11 +516,13 @@ TEST_CORO(parse_config_test, records_unmodeled_fields) {
         R"("defaultRuleSet": null})"));
     ASSERT_TRUE_CORO(res.has_value());
     ASSERT_EQ_CORO(res->level, registry_compatibility_level::full);
-    ASSERT_EQ_CORO(res->unknown_fields.size(), size_t{4});
-    ASSERT_EQ_CORO(res->unknown_fields[0], "normalize");
-    ASSERT_EQ_CORO(res->unknown_fields[1], "validateFields");
-    ASSERT_EQ_CORO(res->unknown_fields[2], "defaultMetadata");
-    ASSERT_EQ_CORO(res->unknown_fields[3], "defaultRuleSet");
+    ASSERT_EQ_CORO(res->unsupported.size(), size_t{3});
+    ASSERT_EQ_CORO(res->unsupported[0].json_pointer, "/normalize");
+    ASSERT_EQ_CORO(res->unsupported[0].json_type, "boolean");
+    ASSERT_EQ_CORO(res->unsupported[1].json_pointer, "/validateFields");
+    ASSERT_EQ_CORO(res->unsupported[1].json_type, "boolean");
+    ASSERT_EQ_CORO(res->unsupported[2].json_pointer, "/defaultMetadata");
+    ASSERT_EQ_CORO(res->unsupported[2].json_type, "object");
 }
 
 TEST_CORO(parse_config_test, compatibility_level_need_not_come_first) {
@@ -527,17 +530,53 @@ TEST_CORO(parse_config_test, compatibility_level_need_not_come_first) {
       iobuf::from(R"({"normalize": true, "compatibilityLevel": "FORWARD"})"));
     ASSERT_TRUE_CORO(res.has_value());
     ASSERT_EQ_CORO(res->level, registry_compatibility_level::forward);
-    ASSERT_EQ_CORO(res->unknown_fields.size(), size_t{1});
-    ASSERT_EQ_CORO(res->unknown_fields[0], "normalize");
+    ASSERT_EQ_CORO(res->unsupported.size(), size_t{1});
+    ASSERT_EQ_CORO(res->unsupported[0].json_pointer, "/normalize");
 }
 
-TEST_CORO(parse_config_test, missing_compatibility_level_is_error) {
-    // compatibilityLevel is the one field a config response must carry.
-    for (std::string_view body : {R"({})", R"({"normalize": true})"}) {
+TEST_CORO(parse_config_test, missing_compatibility_level_is_absent) {
+    // A config without compatibilityLevel parses with the level absent (a
+    // Confluent subject config may carry only governance fields), and a null
+    // level is treated the same way. The unmodeled fields still surface.
+    for (std::string_view body :
+         {R"({})",
+          R"({"normalize": true})",
+          R"({"compatibilityLevel": null, "normalize": true})"}) {
         SCOPED_TRACE(body);
         auto res = co_await parse_config(iobuf::from(body));
-        ASSERT_FALSE_CORO(res.has_value());
+        ASSERT_TRUE_CORO(res.has_value());
+        ASSERT_FALSE_CORO(res->level.has_value());
     }
+}
+
+TEST_CORO(parse_config_test, duplicate_compatibility_level_is_last_wins) {
+    // Duplicate keys follow last-wins JSON semantics: a later null clears an
+    // earlier value, and a later string replaces an earlier null.
+    auto cleared = co_await parse_config(
+      iobuf::from(
+        R"({"compatibilityLevel": "FULL", "compatibilityLevel": null})"));
+    ASSERT_TRUE_CORO(cleared.has_value());
+    ASSERT_FALSE_CORO(cleared->level.has_value());
+
+    auto set = co_await parse_config(
+      iobuf::from(
+        R"({"compatibilityLevel": null, "compatibilityLevel": "FULL"})"));
+    ASSERT_TRUE_CORO(set.has_value());
+    ASSERT_EQ_CORO(set->level, registry_compatibility_level::full);
+}
+
+TEST_CORO(parse_config_test, governance_only_config_surfaces_unsupported) {
+    // A subject config where only governance fields were set (legal in
+    // Confluent Data Contracts): no compatibilityLevel, and the governance
+    // field must reach the unsupported-feature policy instead of being masked
+    // by a parse error.
+    auto res = co_await parse_config(
+      iobuf::from(R"({"compatibilityGroup": "app.major.version"})"));
+    ASSERT_TRUE_CORO(res.has_value());
+    ASSERT_FALSE_CORO(res->level.has_value());
+    ASSERT_EQ_CORO(res->unsupported.size(), size_t{1});
+    ASSERT_EQ_CORO(res->unsupported[0].json_pointer, "/compatibilityGroup");
+    ASSERT_EQ_CORO(res->unsupported[0].json_type, "string");
 }
 
 TEST_CORO(parse_config_test, non_object_is_error) {
@@ -550,9 +589,9 @@ TEST_CORO(parse_config_test, non_object_is_error) {
 }
 
 TEST_CORO(parse_config_test, non_string_compatibility_level_is_error) {
+    // Null is absent (covered above); any other non-string level is malformed.
     for (std::string_view body :
          {R"({"compatibilityLevel": 5})",
-          R"({"compatibilityLevel": null})",
           R"({"compatibilityLevel": ["BACKWARD"]})",
           R"({"compatibilityLevel": {}})",
           R"({"compatibilityLevel": true})"}) {
@@ -591,8 +630,8 @@ TEST_CORO(parse_config_test, fragmented_input) {
     ASSERT_EQ_CORO(
       res->level, registry_compatibility_level::backward_transitive);
     ASSERT_EQ_CORO(res->raw, "BACKWARD_TRANSITIVE");
-    ASSERT_EQ_CORO(res->unknown_fields.size(), size_t{1});
-    ASSERT_EQ_CORO(res->unknown_fields[0], "normalize");
+    ASSERT_EQ_CORO(res->unsupported.size(), size_t{1});
+    ASSERT_EQ_CORO(res->unsupported[0].json_pointer, "/normalize");
 }
 
 TEST_CORO(parse_config_test, malformed_or_truncated_is_error) {

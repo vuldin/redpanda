@@ -231,12 +231,12 @@ FIXTURE_TEST(sr_rest_client_integration, pandaproxy_test_fixture) {
     {
         // No global config has been set, so the registry reports its built-in
         // default. The real server emits {"compatibilityLevel":"BACKWARD"} and
-        // nothing else, so unknown_fields is empty.
+        // nothing else, so unsupported is empty.
         auto res = sut.get_config(rtc).get();
         BOOST_REQUIRE(res.has_value());
         BOOST_REQUIRE(res->level == rc::registry_compatibility_level::backward);
         BOOST_REQUIRE_EQUAL(res->raw, "BACKWARD");
-        BOOST_REQUIRE(res->unknown_fields.empty());
+        BOOST_REQUIRE(res->unsupported.empty());
     }
 
     info(

@@ -428,8 +428,10 @@ TEST(http_source_reader, read_config_narrows_and_classifies) {
                      .get();
         reader.stop().get();
         ASSERT_TRUE(res.has_value());
-        ASSERT_TRUE(res->has_value());
-        EXPECT_EQ(**res, pps::compatibility_level::full_transitive);
+        ASSERT_TRUE(res->compatibility.has_value());
+        EXPECT_EQ(
+          *res->compatibility, pps::compatibility_level::full_transitive);
+        EXPECT_TRUE(res->unsupported.empty());
     }
     {
         auto reader = reader_over([](mock_client& m) {
@@ -443,7 +445,7 @@ TEST(http_source_reader, read_config_narrows_and_classifies) {
                      .get();
         reader.stop().get();
         ASSERT_TRUE(res.has_value());
-        EXPECT_FALSE(res->has_value());
+        EXPECT_FALSE(res->compatibility.has_value());
     }
     {
         auto reader = reader_over([](mock_client& m) {
@@ -458,6 +460,26 @@ TEST(http_source_reader, read_config_narrows_and_classifies) {
         reader.stop().get();
         ASSERT_FALSE(res.has_value());
         EXPECT_EQ(res.error().kind, srs::source_error_kind::operation_failed);
+    }
+    {
+        // Governance-only subject config: no compatibility level, only an
+        // unsupported field. The read succeeds ("no override") and carries the
+        // field for the policy instead of failing the parse.
+        auto reader = reader_over([](mock_client& m) {
+            EXPECT_CALL(m, request_and_collect_response(_, _, _))
+              .WillOnce(respond(
+                bh::status::ok,
+                R"({"compatibilityGroup":"app.major.version"})"));
+        });
+        ss::abort_source as;
+        auto res = reader
+                     .read_config(pps::context_subject::unqualified("s1"), as)
+                     .get();
+        reader.stop().get();
+        ASSERT_TRUE(res.has_value());
+        EXPECT_FALSE(res->compatibility.has_value());
+        ASSERT_EQ(res->unsupported.size(), size_t{1});
+        EXPECT_EQ(res->unsupported[0].json_pointer, "/compatibilityGroup");
     }
 }
 
