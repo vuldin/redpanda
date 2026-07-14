@@ -4255,8 +4255,10 @@ ss::future<usage_report> disk_log_impl::disk_usage(gc_config cfg) {
           usage{},
           [](usage acc, usage u) { return acc + u; });
 
-        vlog(
-          gclog.warn,
+        vlogl(
+          gclog,
+          ssx::is_shutdown_exception(e) ? ss::log_level::debug
+                                        : ss::log_level::warn,
           "Unable to collect disk usage for ntp {}: {}, reporting usage of {} "
           "with no reclaimable bytes",
           config().ntp(),
