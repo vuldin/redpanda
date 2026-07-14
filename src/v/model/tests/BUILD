@@ -253,6 +253,7 @@ redpanda_cc_gtest(
         "//src/v/bytes:iobuf",
         "//src/v/bytes:iobuf_parser",
         "//src/v/model",
+        "//src/v/serde",
         "//src/v/test_utils:gtest",
         "@googletest//:gtest",
     ],
