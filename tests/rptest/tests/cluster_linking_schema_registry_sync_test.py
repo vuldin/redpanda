@@ -1053,7 +1053,14 @@ class SchemaRegistrySyncMixin:
             self._register(src, subject, self._large_schema(i, body))
             pairs.append((subject, 1))
 
-        self._create_sr_link()
+        # Effectively unthrottled: at the default 30 req/s the periodic full
+        # syncs saturate the 2s interval on slow CI hardware, so teardown
+        # always lands mid-sync and can hang node shutdown on an unabortable
+        # destination write racing raft shutdown (issue #31108). A fast sync
+        # restores the idle-at-teardown profile this test always ran with;
+        # drop the override once #31108 is fixed. Rate-limiting behavior
+        # itself is covered by test_schema_registry_api_sync_teardown_mid_sync.
+        self._create_sr_link(max_source_requests_per_second=1000)
         self._wait_synced(src, dest, pairs)
 
     def _test_schema_registry_api_sync_teardown_mid_sync(self):
