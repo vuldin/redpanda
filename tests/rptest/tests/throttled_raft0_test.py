@@ -152,11 +152,19 @@ class AddNode:
     pinned) id to appear in the controller group_configuration learners list;
     ``False`` asserts it does not become a learner within a short window (e.g.
     because raft0 is already stuck on another in-flight add). ``None`` skips
-    the check."""
+    the check.
+
+    ``wait_node_voter`` blocks until the node has fully joined raft0 as a voter
+    (its add reconfiguration has completed and raft0 is back to `simple`) before
+    the operation returns. Use to make add->throttle ordering deterministic
+    instead of racing an in-flight add against a subsequent throttle: a learner
+    still catching up keeps raft0 in a reconfiguration that, once recovery is
+    throttled to 0, can never complete and blocks later adds."""
 
     node_id: int | None = None
     node: ClusterNode | None = None
     expect_learner: bool | None = None
+    wait_node_voter: bool = False
 
 
 @dataclass
@@ -312,6 +320,14 @@ class _StuckRaft0LearnerBase(RedpandaTest):
         if config is None:
             return set()
         return set(config.current.learners)
+
+    def _raft0_voter_ids(self) -> set[int]:
+        """node ids that are voters in the controller leader's current raft0
+        configuration"""
+        config = self._raft0_configuration()
+        if config is None:
+            return set()
+        return set(config.current.voters)
 
     def _broker_ids(self) -> set[int]:
         """node ids currently registered as cluster members"""
@@ -1401,6 +1417,23 @@ class Raft0MembershipOpsTest(_StuckRaft0LearnerBase):
                 )
                 if op.expect_learner is not None:
                     self._assert_learner_expectation(assigned_id, op.expect_learner, i)
+                if op.wait_node_voter:
+                    self.logger.info(
+                        f"[raft0-ops] op {i}: waiting for node_id={assigned_id} "
+                        f"to fully join raft0 as a voter"
+                    )
+                    wait_until(
+                        lambda aid=assigned_id: (
+                            self._controller_state() == GroupConfigurationState.SIMPLE
+                            and aid in self._raft0_voter_ids()
+                        ),
+                        timeout_sec=LONG_TIMEOUT.timeout_s,
+                        backoff_sec=LONG_TIMEOUT.backoff_s,
+                        err_msg=(
+                            f"op {i}: node_id={assigned_id} never became a "
+                            f"stable raft0 voter"
+                        ),
+                    )
             elif isinstance(op, StopNode):
                 node = resolve_node(op, i, "StopNode")
                 self.logger.info(f"[raft0-ops] op {i}: stopping node {node.name}")
@@ -1496,7 +1529,7 @@ class Raft0MembershipOpsTest(_StuckRaft0LearnerBase):
         self._start_seed_cluster()
         self._run_operations(
             [
-                AddNode(node_id=NEW_JOINER),
+                AddNode(node_id=NEW_JOINER, wait_node_voter=True),
                 ThrottleRaft0(),
                 AddNode(node_id=STUCK_JOINER, expect_learner=True),
                 StopNode(node_id=STUCK_JOINER),
