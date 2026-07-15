@@ -40,6 +40,14 @@ struct http_source_connection {
     std::optional<net::key_store> client_key;
     bool provide_sni{true};
     std::optional<rc::basic_auth_credentials> auth;
+    /// Cap on requests/sec to the source, resolved from the link's
+    /// max_source_requests_per_second (always > 0: conversion rejects
+    /// negatives and maps zero/unset to the default). Like the other
+    /// connection settings, a link-config change applies when the task next
+    /// (re)starts.
+    size_t max_requests_per_sec{
+      model::schema_registry_sync_config::shadow_schema_registry_api::
+        default_max_source_requests_per_second};
 };
 
 /// Resolves a source Schema Registry URL to the host:port the transport should

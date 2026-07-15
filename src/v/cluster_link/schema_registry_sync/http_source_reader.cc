@@ -21,6 +21,7 @@
 #include "net/transport.h"
 #include "pandaproxy/schema_registry/rest_client/error.h"
 #include "pandaproxy/schema_registry/rest_client/pooled_client.h"
+#include "pandaproxy/schema_registry/rest_client/rate_limited_client.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/coroutine.hh>
@@ -214,8 +215,13 @@ http_source_reader::ensure_client(ss::abort_source& as) {
         for (size_t i = 0; i < pool_size; ++i) {
             transports.push_back(std::make_unique<http::client>(cfg));
         }
+        // Limiter over pool: a request pays for dispatch (rate cap and any
+        // server-imposed Retry-After pause) before competing for a
+        // connection.
         _client = std::make_unique<rc::client>(
-          std::make_unique<rc::pooled_client>(std::move(transports)),
+          std::make_unique<rc::rate_limited_client>(
+            std::make_unique<rc::pooled_client>(std::move(transports)),
+            _conn->max_requests_per_sec),
           _conn->endpoint,
           _conn->auth,
           ppsr::qualified_subjects_enabled::yes);
@@ -411,7 +417,9 @@ std::unique_ptr<source_reader> http_source_reader_factory::create(
       .address = std::move(*address),
       .endpoint = api_cfg->source_url,
       .tls_enabled = bool(api_cfg->tls_enabled),
-      .provide_sni = bool(api_cfg->tls_provide_sni)};
+      .provide_sni = bool(api_cfg->tls_provide_sni),
+      .max_requests_per_sec = static_cast<size_t>(
+        api_cfg->get_max_source_requests_per_second())};
 
     if (api_cfg->ca.has_value()) {
         conn.truststore = to_certificate(api_cfg->ca.value());
