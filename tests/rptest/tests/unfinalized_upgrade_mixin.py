@@ -73,17 +73,6 @@ class UnfinalizedUpgradeMixin:
         self._wait_for_cluster_settled()
         return self._node_latest_logical_version(self.redpanda.nodes[0])
 
-    def _wait_for_cluster_version(self, target, timeout_sec=60):
-        """Wait until every node reports cluster_version == target."""
-
-        def check():
-            return all(
-                self.admin.get_features(node=n)["cluster_version"] == target
-                for n in self.redpanda.nodes
-            )
-
-        wait_until(check, timeout_sec=timeout_sec, backoff_sec=1)
-
     def _wait_for_cluster_settled(self, timeout_sec=90):
         """Wait for the cluster to settle after a restart: every broker has
         rejoined and no under-replicated partitions remain. `start_node` only

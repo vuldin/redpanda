@@ -1678,7 +1678,7 @@ class ManualFinalizationUpgradeTest(UnfinalizedUpgradeMixin, FeaturesTestBase):
         # latest; the flag rides along in the controller log untouched.
         self.logger.info(f"Upgrading to intermediate release {mid}")
         mid_logical = self._upgrade_all_to(mid)
-        self._wait_for_cluster_version(mid_logical)
+        self._wait_for_version_everywhere(mid_logical, timeout_sec=60)
         held_version = mid_logical
 
         # The v26.1 hop was NOT gated, so the active version -- which doubles as
