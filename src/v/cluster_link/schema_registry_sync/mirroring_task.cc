@@ -30,6 +30,7 @@
 
 #include <fmt/ranges.h>
 
+#include <ranges>
 #include <utility>
 
 namespace cluster_link::schema_registry_sync {
@@ -61,6 +62,19 @@ bool is_reference_blocked(const std::exception_ptr& ep) {
         std::rethrow_exception(ep);
     } catch (const ppsr::exception& e) {
         return e.code() == ppsr::error_code::subject_version_has_references;
+    } catch (...) {
+    }
+    return false;
+}
+
+// A context delete blocked because the context still has subjects (e.g. a
+// reference-blocked version survived the purge); retried on the next full sync
+// rather than counted as a hard error.
+bool is_context_not_empty(const std::exception_ptr& ep) {
+    try {
+        std::rethrow_exception(ep);
+    } catch (const ppsr::exception& e) {
+        return e.code() == ppsr::error_code::context_not_empty;
     } catch (...) {
     }
     return false;
@@ -337,6 +351,59 @@ ss::future<uint64_t> mirroring_task::purge_destination_only_versions(
         targets = std::move(next_round);
     }
     co_return purged;
+}
+
+ss::future<> mirroring_task::delete_source_absent_contexts(
+  const chunked_hash_set<ppsr::context>& contexts,
+  const ss::noncopyable_function<bool(const ppsr::context_subject&)>& in_scope,
+  ss::abort_source& as) {
+    // Enumerated in the destination namespace. A destination context is a
+    // deletion target when it is owned by this link (reverse-maps to a source
+    // context), managed as a whole (in scope as a context, not merely via a
+    // subject filter), is not the default context (which always exists), and is
+    // no longer present at the source. Its subjects were already purged above.
+    // `dest_contexts` is a named local, so the lazy view is safe to iterate
+    // across the deletes below (which touch the store, not these operands).
+    const auto dest_contexts = co_await _destination->list_contexts();
+    auto to_delete
+      = dest_contexts | std::views::filter([&](const ppsr::context& dest_ctx) {
+            if (dest_ctx == ppsr::default_context) {
+                return false;
+            }
+            auto src_ctx = _mapper.reverse(dest_ctx);
+            return src_ctx.has_value()
+                   && in_scope(
+                     ppsr::context_subject{*src_ctx, ppsr::subject{""}})
+                   && !contexts.contains(*src_ctx);
+        });
+
+    for (const auto& dest_ctx : to_delete) {
+        as.check();
+        auto fut = co_await ss::coroutine::as_future(
+          _destination->delete_context(dest_ctx));
+        if (fut.failed()) {
+            auto ex = fut.get_exception();
+            if (ssx::is_shutdown_exception(ex)) {
+                std::rethrow_exception(ex);
+            }
+            if (is_context_not_empty(ex)) {
+                // The purge could not empty it this run (e.g. a
+                // reference-blocked version); retry on the next full sync.
+                vlog(
+                  logger().debug,
+                  "Deferring delete of source-absent context {}: {}",
+                  dest_ctx,
+                  ex);
+                continue;
+            }
+            record_error(
+              fmt::format(
+                "failed to delete source-absent context {}: {}", dest_ctx, ex));
+            continue;
+        }
+        vlog(
+          logger().info, "Deleted context {} absent from the source", dest_ctx);
+    }
 }
 
 bool mirroring_task::fail_if_contains_unsupported(
@@ -770,6 +837,11 @@ ss::future<task::state_transition> mirroring_task::full_source_sync(
     if (mc_unavailable.has_value()) {
         co_return make_unavailable(mc_unavailable->message);
     }
+
+    // Tombstone any destination context whose source context is gone (its
+    // subjects were purged above). Runs after mode/config so a
+    // source-unavailable run backs off before touching contexts.
+    co_await delete_source_absent_contexts(contexts, in_scope, as);
 
     // Re-scan now that imports have landed so the reported destination counts
     // reflect the post-sync state, not the pre-import baseline the diff used.
