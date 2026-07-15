@@ -38,6 +38,12 @@ class UnfinalizedUpgradeMixin:
     ``_restart_at_new`` sets ``self.new_logical``.
     """
 
+    # The pre-upgrade binary must be a released patch that already carries the
+    # backported `features_auto_finalization` knob, so auto-finalization can be
+    # disabled *before* upgrading to a HEAD build that ships the gating logic.
+    # Backported to v26.1.9.
+    MIN_OLD_RELEASE = (26, 1, 9)
+
     def _restart_at_new(self, nodes):
         """Upgrade `nodes` to the HEAD build and restart them in place."""
         self.installer.install(nodes, RedpandaInstaller.HEAD)

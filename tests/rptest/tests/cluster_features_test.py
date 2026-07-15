@@ -1174,12 +1174,6 @@ class ManualFinalizationTest(FeaturesTestBase):
         ]
 
 
-# The `features_auto_finalization` knob was backported to v26.1.9, so the real
-# upgrade below must start from a released patch that already has it. The knob
-# lets a cluster opt out of auto-finalization *before* upgrading to a HEAD build
-# that ships the gating logic and the admin v2 RPCs.
-MANUAL_FINALIZE_MIN_OLD_RELEASE = (26, 1, 9)
-
 # The same knob was also backported to v25.3.15, the oldest release from which a
 # multi-hop upgrade (v25.3 -> v26.1 -> HEAD) can carry the opt-out through every
 # hop with the flag set only once.
@@ -1279,10 +1273,10 @@ class ManualFinalizationUpgradeTest(UnfinalizedUpgradeMixin, FeaturesTestBase):
         old_release = self.installer.highest_from_prior_feature_version(
             RedpandaInstaller.HEAD
         )
-        assert old_release >= MANUAL_FINALIZE_MIN_OLD_RELEASE, (
+        assert old_release >= self.MIN_OLD_RELEASE, (
             f"prior feature version {old_release} predates the "
             f"features_auto_finalization backport "
-            f"{MANUAL_FINALIZE_MIN_OLD_RELEASE}; cannot opt out before upgrade"
+            f"{self.MIN_OLD_RELEASE}; cannot opt out before upgrade"
         )
         self.old_release = old_release
         self.logger.info(f"Starting cluster on old release {old_release}")
@@ -1658,9 +1652,8 @@ class ManualFinalizationUpgradeTest(UnfinalizedUpgradeMixin, FeaturesTestBase):
             f"backport {MANUAL_FINALIZE_MIN_OLDEST_RELEASE}"
         )
         mid, _ = self.installer.latest_for_line((26, 1))
-        assert mid >= MANUAL_FINALIZE_MIN_OLD_RELEASE, (
-            f"latest v26.1 patch {mid} predates the backport "
-            f"{MANUAL_FINALIZE_MIN_OLD_RELEASE}"
+        assert mid >= self.MIN_OLD_RELEASE, (
+            f"latest v26.1 patch {mid} predates the backport {self.MIN_OLD_RELEASE}"
         )
 
         # Hop 0: boot the oldest release and opt out of auto-finalization once.

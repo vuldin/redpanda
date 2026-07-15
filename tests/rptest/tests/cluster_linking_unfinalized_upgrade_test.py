@@ -31,12 +31,6 @@ from rptest.tests.rbac_test_v2 import AdminV2RoleWrapper
 from rptest.tests.schema_registry_test import SchemaRegistryRedpandaClient
 from rptest.tests.unfinalized_upgrade_mixin import UnfinalizedUpgradeMixin
 
-# The old release the target starts on must carry the backported
-# `features_auto_finalization` knob so the opt-out can be set before upgrading
-# to a HEAD build that ships the gating logic. Backported to v26.1.9. Kept in
-# sync with ManualFinalizationUpgradeTest's MANUAL_FINALIZE_MIN_OLD_RELEASE.
-MIN_OLD_RELEASE = (26, 1, 9)
-
 LINK_NAME = "unfinalized-link"
 
 # Gate messages from shadow_link.cc (check_role_sync_supported /
@@ -109,10 +103,10 @@ class ShadowLinkUnfinalizedUpgradeTest(ShadowLinkTestBase, UnfinalizedUpgradeMix
         self.old_release = self.installer.highest_from_prior_feature_version(
             RedpandaInstaller.HEAD
         )
-        assert self.old_release >= MIN_OLD_RELEASE, (
+        assert self.old_release >= self.MIN_OLD_RELEASE, (
             f"prior feature version {self.old_release} predates the "
-            f"features_auto_finalization backport {MIN_OLD_RELEASE}; cannot opt "
-            "out before upgrade"
+            f"features_auto_finalization backport {self.MIN_OLD_RELEASE}; cannot "
+            "opt out before upgrade"
         )
         self.logger.info(f"Target starts on old release {self.old_release}")
         self.installer.install(self.redpanda.nodes, self.old_release)
