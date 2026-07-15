@@ -30,6 +30,7 @@ from rptest.services.cluster import cluster
 from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST
 from rptest.services.redpanda_installer import RedpandaInstaller, wait_for_num_versions
 from rptest.tests.redpanda_test import RedpandaTest
+from rptest.tests.unfinalized_upgrade_mixin import UnfinalizedUpgradeMixin
 from rptest.util import expect_exception, wait_until_result
 from rptest.utils.node_operations import NodeDecommissionWaiter
 from rptest.utils.rpenv import sample_license, sample_license_v1
@@ -1173,12 +1174,6 @@ class ManualFinalizationTest(FeaturesTestBase):
         ]
 
 
-# The `features_auto_finalization` knob was backported to v26.1.9, so the real
-# upgrade below must start from a released patch that already has it. The knob
-# lets a cluster opt out of auto-finalization *before* upgrading to a HEAD build
-# that ships the gating logic and the admin v2 RPCs.
-MANUAL_FINALIZE_MIN_OLD_RELEASE = (26, 1, 9)
-
 # The same knob was also backported to v25.3.15, the oldest release from which a
 # multi-hop upgrade (v25.3 -> v26.1 -> HEAD) can carry the opt-out through every
 # hop with the flag set only once.
@@ -1244,7 +1239,7 @@ PERTURB_ACKNOWLEDGED_FEATURES = frozenset(
 )
 
 
-class ManualFinalizationUpgradeTest(FeaturesTestBase):
+class ManualFinalizationUpgradeTest(UnfinalizedUpgradeMixin, FeaturesTestBase):
     """
     Real-upgrade counterpart to ManualFinalizationTest.
 
@@ -1294,10 +1289,10 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
         old_release = self.installer.highest_from_prior_feature_version(
             RedpandaInstaller.HEAD
         )
-        assert old_release >= MANUAL_FINALIZE_MIN_OLD_RELEASE, (
+        assert old_release >= self.MIN_OLD_RELEASE, (
             f"prior feature version {old_release} predates the "
             f"features_auto_finalization backport "
-            f"{MANUAL_FINALIZE_MIN_OLD_RELEASE}; cannot opt out before upgrade"
+            f"{self.MIN_OLD_RELEASE}; cannot opt out before upgrade"
         )
         self.old_release = old_release
         self.logger.info(f"Starting cluster on old release {old_release}")
@@ -1308,76 +1303,6 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
         self.logger.info(
             f"Old release {old_release} reports logical version {self.old_logical}"
         )
-
-    def _restart_at_new(self, nodes):
-        """Upgrade `nodes` to the HEAD build and restart them in place."""
-        self.installer.install(nodes, RedpandaInstaller.HEAD)
-        self.redpanda.restart_nodes(nodes)
-        self._wait_for_cluster_settled()
-
-        self.new_logical = self._node_latest_logical_version(nodes[0])
-        self.logger.info(f"HEAD build reports logical version {self.new_logical}")
-        assert self.new_logical > self.old_logical, (
-            f"expected HEAD logical version {self.new_logical} to exceed the old "
-            f"version {self.old_logical}; the upgrade did not raise the version"
-        )
-
-    def _node_latest_logical_version(self, node):
-        """Read a (possibly just-restarted) node's latest logical version,
-        tolerating the brief window before it is serving the admin API."""
-
-        def query():
-            return self.admin.get_features(node=node).get("node_latest_version")
-
-        return wait_until_result(
-            query,
-            timeout_sec=30,
-            backoff_sec=1,
-            err_msg="node did not report node_latest_version after upgrade",
-        )
-
-    def _upgrade_all_to(self, version):
-        """Install `version` on every node, restart in place, and return the
-        binary's latest logical version."""
-        self.installer.install(self.redpanda.nodes, version)
-        self.redpanda.restart_nodes(self.redpanda.nodes)
-        self._wait_for_cluster_settled()
-        return self._node_latest_logical_version(self.redpanda.nodes[0])
-
-    def _wait_for_cluster_version(self, target, timeout_sec=60):
-        """Wait until every node reports cluster_version == target."""
-
-        def check():
-            return all(
-                self.admin.get_features(node=n)["cluster_version"] == target
-                for n in self.redpanda.nodes
-            )
-
-        wait_until(check, timeout_sec=timeout_sec, backoff_sec=1)
-
-    def _wait_for_cluster_settled(self, timeout_sec=90):
-        """Wait for the cluster to settle after a restart: every broker has
-        rejoined and no under-replicated partitions remain. `start_node` only
-        waits for per-node readiness (the v1 ready probe), not cluster
-        convergence -- so without this a "did not advance" assertion could pass
-        merely because the controller has not yet observed the upgrade."""
-        self.redpanda.wait_for_membership(first_start=False)
-        wait_until(
-            self.redpanda.healthy,
-            timeout_sec=timeout_sec,
-            backoff_sec=2,
-            err_msg="cluster did not become healthy after restart",
-        )
-
-    def _downgrade_all_to(self, release):
-        """Roll every node back to `release` (an older binary) without
-        finalizing, then wait for the cluster to come back healthy. This is the
-        rollback the unfinalized-upgrade feature is meant to preserve: because
-        the active version was never advanced, the older binary can still run on
-        the existing on-disk data."""
-        self.installer.install(self.redpanda.nodes, release)
-        self.redpanda.restart_nodes(self.redpanda.nodes)
-        self._wait_for_cluster_settled()
 
     def _perturb(self, phase):
         """Perturb the cluster while it sits in `phase` (e.g.
@@ -1802,45 +1727,6 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
             "step, or acknowledge them in PERTURB_ACKNOWLEDGED_FEATURES"
         )
 
-    def _disable_auto_finalization(self):
-        self.redpanda.set_cluster_config({"features_auto_finalization": False})
-
-    def _call_with_leader_retry(self, call, timeout_sec=30):
-        """Retry a controller-leader-routed admin v2 call through the transient
-        UNAVAILABLE window after restarts/leadership changes. See the identical
-        helper in ManualFinalizationTest for the rationale."""
-        deadline = time.time() + timeout_sec
-        while True:
-            try:
-                return call()
-            except ConnectError as e:
-                if e.code != ConnectErrorCode.UNAVAILABLE or time.time() >= deadline:
-                    raise
-                time.sleep(1)
-
-    def _finalize(self):
-        return self._call_with_leader_retry(
-            lambda: self.admin_v2.features().finalize_upgrade(
-                features_pb2.FinalizeUpgradeRequest()
-            )
-        )
-
-    def _get_upgrade_status(self):
-        return self._call_with_leader_retry(
-            lambda: self.admin_v2.features().get_upgrade_status(
-                features_pb2.GetUpgradeStatusRequest()
-            )
-        )
-
-    def _wait_for_status_state(self, state, timeout_sec=30):
-        """Wait until GetUpgradeStatus reports `state`; return that status."""
-        wait_until(
-            lambda: self._get_upgrade_status().state == state,
-            timeout_sec=timeout_sec,
-            backoff_sec=1,
-        )
-        return self._get_upgrade_status()
-
     @cluster(num_nodes=3, log_allow_list=RESTART_LOG_ALLOW_LIST)
     def test_auto_finalization_disabled_blocks_advance(self):
         """
@@ -1942,9 +1828,8 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
             f"backport {MANUAL_FINALIZE_MIN_OLDEST_RELEASE}"
         )
         mid, _ = self.installer.latest_for_line((26, 1))
-        assert mid >= MANUAL_FINALIZE_MIN_OLD_RELEASE, (
-            f"latest v26.1 patch {mid} predates the backport "
-            f"{MANUAL_FINALIZE_MIN_OLD_RELEASE}"
+        assert mid >= self.MIN_OLD_RELEASE, (
+            f"latest v26.1 patch {mid} predates the backport {self.MIN_OLD_RELEASE}"
         )
 
         # Hop 0: boot the oldest release and opt out of auto-finalization once.
@@ -1962,7 +1847,7 @@ class ManualFinalizationUpgradeTest(FeaturesTestBase):
         # latest; the flag rides along in the controller log untouched.
         self.logger.info(f"Upgrading to intermediate release {mid}")
         mid_logical = self._upgrade_all_to(mid)
-        self._wait_for_cluster_version(mid_logical)
+        self._wait_for_version_everywhere(mid_logical, timeout_sec=60)
         held_version = mid_logical
 
         # The v26.1 hop was NOT gated, so the active version -- which doubles as
