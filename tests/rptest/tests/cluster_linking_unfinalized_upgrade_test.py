@@ -212,13 +212,14 @@ class ShadowLinkUnfinalizedUpgradeTest(ShadowLinkTestBase, UnfinalizedUpgradeMix
     def _create_link_mirroring_topic(self, topic):
         """Create the shadow link mirroring only `topic`.
 
-        Deliberately NOT mirror_all_topics: a "*" filter also mirrors the
-        internal _schemas topic, which would carry the source's schemas to the
-        target's Schema Registry via ordinary (v25.3) topic mirroring --
-        independently of the v26.2 SR API-mode sync feature -- and make
-        _verify_sr_api_sync_works vacuous. Restricting the filter to the data
-        topic leaves SR API-mode sync as the only path for a schema to reach
-        the target SR."""
+        The internal _schemas topic is not mirrored by an ordinary topic
+        filter: the source topic syncer special-cases it (select_topic gates
+        _schemas on is_topic_mode()), so it is shadowed only when topic-mode
+        Schema Registry sync is configured -- never via the topic filter, "*"
+        included. That is what keeps _verify_sr_api_sync_works non-vacuous:
+        with topic-mode off, API-mode sync is the only path for a source
+        schema to reach the target SR. The single literal filter just keeps
+        this test's mirrored set to the one data topic it asserts on."""
         req = self.create_default_link_request(
             LINK_NAME,
             mirror_all_topics=False,
@@ -352,8 +353,9 @@ class ShadowLinkUnfinalizedUpgradeTest(ShadowLinkTestBase, UnfinalizedUpgradeMix
         """Post-finalize: configuring SR API-mode sync is accepted and the
         source's subject appears in the target's Schema Registry.
 
-        The link mirrors only the data topic (not _schemas), so SR API-mode is
-        the only path by which a schema can reach the target SR. Assert the
+        _schemas is never topic-mirrored here (it is shadowed only under
+        topic-mode sync, not by the topic filter), so SR API-mode is the only
+        path by which a schema can reach the target SR. Assert the
         subject is absent before configuring it, so its later appearance is
         attributable to the feature rather than to topic mirroring or pre-existing
         state -- the same rigor the role-sync check gets from the migrator being
