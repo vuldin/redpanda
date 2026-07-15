@@ -672,13 +672,14 @@ seq_writer::do_delete_context(context ctx, model::offset write_at) {
     }
 }
 
-ss::future<> seq_writer::delete_context(context ctx) {
+ss::future<> seq_writer::delete_context(context ctx, write_source src) {
     auto ctx_copy = ctx;
     co_await sequenced_write(
       [ctx{std::move(ctx)}](model::offset write_at, seq_writer& seq) {
           return seq.do_delete_context(ctx, write_at);
       },
-      std::move(ctx_copy));
+      std::move(ctx_copy),
+      src);
 }
 
 /// Impermanent delete: update a version with is_deleted=true
