@@ -139,8 +139,23 @@ void mirroring_task::reset_sync_state() {
     _last_full_sync.reset();
 }
 
+ss::future<cl_result<void>> mirroring_task::start() {
+    auto res = co_await task::start();
+    // The series stay registered for the task's whole non-stopped life,
+    // including while paused; stop() removes them. See probe.h for the
+    // lifecycle rationale. setup is idempotent, so resuming from paused
+    // (which also lands here) is fine.
+    if (res.has_value()) {
+        _probe.setup(get_link()->get_config()->name, [this] {
+            return get_live_sync_status().totals_since_task_start;
+        });
+    }
+    co_return res;
+}
+
 ss::future<cl_result<void>> mirroring_task::stop() noexcept {
     auto res = co_await task::stop();
+    _probe.clear();
     // task::stop() closed the runner's gate, so no run_impl is in flight and it
     // is safe to reset the state directly (unlike update_config, which races a
     // running fiber and defers via _config_changed). Reset so a later leader
@@ -203,30 +218,35 @@ bool mirroring_task::should_long_sync() const {
            >= full_sync_interval(_config);
 }
 
+model::schema_registry_sync_status
+mirroring_task::get_live_sync_status() const {
+    auto status = _status;
+    // Reflect the in-flight reconcile's live counters for mid-sync
+    // progress. Guarded on current_sync so it cannot double-count after the
+    // fold (which zeroes _reconcile_stats and bakes them into _status).
+    if (status.current_sync.has_value()) {
+        status.current_sync->summary.subject_versions_changed
+          += _reconcile_stats.versions_changed;
+        status.current_sync->summary.errors += _reconcile_stats.errors;
+        status.current_sync->summary.unsupported_features_removed
+          += _reconcile_stats.unsupported_features_removed;
+        status.totals_since_task_start.subject_versions_changed
+          += _reconcile_stats.versions_changed;
+        status.totals_since_task_start.errors += _reconcile_stats.errors;
+        status.totals_since_task_start.unsupported_features_removed
+          += _reconcile_stats.unsupported_features_removed;
+    }
+    return status;
+}
+
 model::task_status_report mirroring_task::get_status_report() const {
     auto report = task::get_status_report();
     // Only the shard leading _schemas/0 runs the sync; a stopped shard's empty
     // status must not win the admin aggregation over the leader's, so suppress
     // it.
     if (get_state() != model::task_state::stopped) {
-        auto status = _status;
-        // Reflect the in-flight reconcile's live counters for mid-sync
-        // progress. Guarded on current_sync so it cannot double-count after the
-        // fold (which zeroes _reconcile_stats and bakes them into _status).
-        if (status.current_sync.has_value()) {
-            status.current_sync->summary.subject_versions_changed
-              += _reconcile_stats.versions_changed;
-            status.current_sync->summary.errors += _reconcile_stats.errors;
-            status.current_sync->summary.unsupported_features_removed
-              += _reconcile_stats.unsupported_features_removed;
-            status.totals_since_task_start.subject_versions_changed
-              += _reconcile_stats.versions_changed;
-            status.totals_since_task_start.errors += _reconcile_stats.errors;
-            status.totals_since_task_start.unsupported_features_removed
-              += _reconcile_stats.unsupported_features_removed;
-        }
         report.detail = model::task_detail{
-          .schema_registry_sync_status = std::move(status)};
+          .schema_registry_sync_status = get_live_sync_status()};
     }
     return report;
 }
