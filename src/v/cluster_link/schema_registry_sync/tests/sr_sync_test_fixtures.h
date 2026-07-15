@@ -467,6 +467,9 @@ public:
     get_subjects(ppsr::include_deleted inc) const override {
         return _inner->get_subjects(inc);
     }
+    ss::future<chunked_vector<ppsr::context>> list_contexts() const override {
+        return _inner->list_contexts();
+    }
     ss::future<ppsr::context_schema_id>
     create_schema(ppsr::subject_schema s) override {
         return _inner->create_schema(std::move(s));
@@ -493,6 +496,9 @@ public:
     }
     ss::future<bool> delete_config(ppsr::context_subject sub) override {
         return _inner->delete_config(std::move(sub));
+    }
+    ss::future<> delete_context(ppsr::context ctx) override {
+        return _inner->delete_context(std::move(ctx));
     }
 
 protected:
