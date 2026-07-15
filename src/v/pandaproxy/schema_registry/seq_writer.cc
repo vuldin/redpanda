@@ -673,6 +673,11 @@ seq_writer::do_delete_context(context ctx, model::offset write_at) {
 }
 
 ss::future<> seq_writer::delete_context(context ctx, write_source src) {
+    // Enforced here, on the path every caller shares (REST handler and the
+    // internal shadow-link sync alike), rather than only at the HTTP edge.
+    if (ctx == default_context) {
+        throw as_exception(cannot_delete_default_context());
+    }
     auto ctx_copy = ctx;
     co_await sequenced_write(
       [ctx{std::move(ctx)}](model::offset write_at, seq_writer& seq) {
