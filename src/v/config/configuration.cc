@@ -1070,9 +1070,9 @@ configuration::configuration()
       "The topic property `min.cleanable.dirty.ratio` overrides the value of "
       "`min_cleanable_dirty_ratio` at the topic level.",
       {.needs_restart = needs_restart::no,
-       .example = "0.2",
+       .example = "0.5",
        .visibility = visibility::user},
-      0.2,
+      0.5,
       {.min = 0.0, .max = 1.0})
   , min_compaction_lag_ms(
       *this,
