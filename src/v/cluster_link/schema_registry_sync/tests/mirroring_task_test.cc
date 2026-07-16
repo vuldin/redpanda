@@ -1554,6 +1554,53 @@ TEST_F(mirroring_task_test, destination_inventory_spans_contexts_and_deleted) {
     EXPECT_THAT(inv.all, testing::UnorderedElementsAre(a_v1, c_v1, a_v2));
 }
 
+TEST_F(mirroring_task_test, deletes_source_absent_context) {
+    // The destination holds a subject under .prod, materializing that context;
+    // the source has no .prod context at all. The whole context is a deletion:
+    // its subject is purged, then the now-empty context is tombstoned so it no
+    // longer lists. A default-context subject present at the source is synced
+    // and left alone, showing the phase deletes only the source-absent context.
+    auto prod_orders = ppsr::context_subject{
+      ppsr::context{".prod"}, ppsr::subject{"orders-value"}};
+    _registry.import_schema(make_schema(prod_orders, 1, R"({"v":1})")).get();
+    auto keep = ppsr::context_subject::unqualified("keep-value");
+    _source_state.add(keep, 1);
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    // Present, error-free, and exactly two subject-version changes: keep-value
+    // imported (+1) and the source-absent .prod subject purged (+1).
+    ASSERT_THAT(
+      status,
+      testing::Optional(
+        testing::Field(
+          &model::schema_registry_sync_status::last_full_sync,
+          testing::Optional(
+            testing::AllOf(
+              testing::Field(&model::schema_registry_sync_summary::errors, 0),
+              testing::Field(
+                &model::schema_registry_sync_summary::subject_versions_changed,
+                2))))));
+
+    // The .prod subject was purged; only keep-value remains.
+    EXPECT_THAT(
+      _registry.get_all(),
+      testing::ElementsAre(
+        testing::Field(
+          &ppsr::stored_schema::schema,
+          testing::Property(&ppsr::subject_schema::sub, keep))));
+
+    // .prod is tombstoned: only the default context is still materialized.
+    EXPECT_THAT(
+      _registry.list_contexts().get(),
+      testing::ElementsAre(ppsr::default_context));
+}
+
 // Fixture whose destination wraps `_registry` so a test can make permanent
 // deletes fail, exercising the hard-delete retry loop the plain fake cannot.
 class mirroring_task_delete_retry_test : public mirroring_task_test {
@@ -1633,6 +1680,42 @@ TEST_F(
     EXPECT_EQ(status->last_full_sync->subject_versions_changed, 1);
     EXPECT_EQ(status->last_full_sync->errors, 1);
     EXPECT_EQ(_deferring.permanent_delete_attempts(stuck), 1);
+}
+
+TEST_F(mirroring_task_delete_retry_test, defers_delete_of_non_empty_context) {
+    // The .prod context is source-absent, but its only subject's purge is
+    // permanently blocked, so the context never empties. delete_context is
+    // skipped (context_not_empty) rather than counted as an extra error or
+    // faulted, leaving the context listed for a later full sync to retry.
+    auto prod_orders = ppsr::context_subject{
+      ppsr::context{".prod"}, ppsr::subject{"orders-value"}};
+    _registry.import_schema(make_schema(prod_orders, 1, R"({"v":1})")).get();
+    _deferring.reject_forever(prod_orders);
+
+    lead_schema_registry();
+    fixture()->upsert_link(get_default_metadata()).get();
+
+    auto status = wait_for_sync_status([](const auto& s) {
+                      return s.last_full_sync.has_value()
+                             && !s.current_sync.has_value();
+                  }).get();
+    // The single error is the stuck purge; the skipped context delete adds
+    // none.
+    ASSERT_THAT(
+      status,
+      testing::Optional(
+        testing::Field(
+          &model::schema_registry_sync_status::last_full_sync,
+          testing::Optional(
+            testing::Field(&model::schema_registry_sync_summary::errors, 1)))));
+
+    // .prod is not deleted: it stays listed alongside the default context, so a
+    // later full sync retries it. A still-listed non-empty context also implies
+    // its blocked subject survived.
+    EXPECT_THAT(
+      _registry.list_contexts().get(),
+      testing::UnorderedElementsAre(
+        ppsr::default_context, ppsr::context{".prod"}));
 }
 
 } // namespace cluster_link::tests

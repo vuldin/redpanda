@@ -190,6 +190,19 @@ private:
       ppsr::schema_version version,
       bool was_active);
 
+    /// Tombstones every destination context this link owns and holds in scope
+    /// as a whole that no longer exists at the source (`contexts`). The
+    /// context's subjects must already have been purged; a not-yet-empty
+    /// context (e.g. a reference-blocked version survived the purge) is left
+    /// for the next full sync. Matches Confluent's DELETE /contexts: only the
+    /// context marker is removed, leaving any context-level mode/config
+    /// overrides untouched.
+    ss::future<> delete_source_absent_contexts(
+      const chunked_hash_set<ppsr::context>& contexts,
+      const ss::noncopyable_function<bool(const ppsr::context_subject&)>&
+        in_scope,
+      ss::abort_source& as);
+
     /// Replicates one target's (subject or context-only) source mode and
     /// compatibility config onto the destination: writes the source's own
     /// override when it has one, deletes the destination override otherwise.

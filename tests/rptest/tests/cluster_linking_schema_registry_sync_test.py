@@ -766,6 +766,56 @@ class SchemaRegistrySyncMixin:
         # The in-source subject is untouched by the purge.
         assert self._schema_view(dest, keep, 1) is not None
 
+    def _test_schema_registry_api_sync_context_delete(self):
+        # A whole source context is deleted (Confluent-style: empty it, then
+        # DELETE /contexts). The destination must converge: the context's
+        # subjects purged and the context itself tombstoned so it no longer
+        # lists, while a default-context subject is left untouched.
+        src = self._make_source_client()
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+
+        prod_orders = ":.prod:orders-value"
+        keep = "keep-value"  # default context
+
+        self._register(
+            src, prod_orders, self._record("Orders", [{"name": "v", "type": "string"}])
+        )
+        self._register(
+            src, keep, self._record("Keep", [{"name": "v", "type": "string"}])
+        )
+
+        self._create_sr_link()
+
+        # Both subjects replicate and the .prod context materializes on the
+        # destination.
+        self._wait_synced(src, dest, [(prod_orders, 1), (keep, 1)])
+        wait_until(
+            lambda: ".prod" in set(dest.get_contexts().json()),
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="the .prod context did not materialize on the destination",
+        )
+
+        # Delete the whole .prod context at the source: hard-delete its only
+        # subject to empty it (soft then permanent, as the source requires), then
+        # DELETE /contexts/.prod.
+        assert src.delete_subject(prod_orders).status_code == 200
+        assert src.delete_subject(prod_orders, permanent=True).status_code == 200
+        assert src.delete_context(".prod").status_code in (200, 204)
+
+        # The next full sync purges the .prod subject and tombstones the context,
+        # so the destination's context listing drops back to the default context.
+        wait_until(
+            lambda: ".prod" not in set(dest.get_contexts().json()),
+            timeout_sec=90,
+            backoff_sec=1,
+            err_msg="source context deletion did not propagate to the destination",
+        )
+
+        # The default-context subject is untouched; the .prod subject is gone.
+        assert self._schema_view(dest, keep, 1) is not None
+        assert self._schema_view(dest, prod_orders, 1) is None
+
     def _test_schema_registry_api_sync_context_remap(self):
         src = self._make_source_client()
         dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
@@ -1415,6 +1465,10 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase, SchemaRegistrySyncMixin):
         self._test_schema_registry_api_sync_context_remap()
 
     @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_context_delete(self):
+        self._test_schema_registry_api_sync_context_delete()
+
+    @cluster(num_nodes=6)
     def test_schema_registry_api_sync_out_of_scope_reference(self):
         self._test_schema_registry_api_sync_out_of_scope_reference()
 
@@ -1537,6 +1591,10 @@ class ConfluentSchemaRegistrySyncE2ETest(ShadowLinkTestBase, SchemaRegistrySyncM
     @cluster(num_nodes=5)
     def test_schema_registry_api_sync_context_remap(self):
         self._test_schema_registry_api_sync_context_remap()
+
+    @cluster(num_nodes=5)
+    def test_schema_registry_api_sync_context_delete(self):
+        self._test_schema_registry_api_sync_context_delete()
 
     @cluster(num_nodes=5)
     def test_schema_registry_api_sync_unsupported_schema_remove(self):
