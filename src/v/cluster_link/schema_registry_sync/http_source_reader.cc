@@ -21,6 +21,7 @@
 #include "net/transport.h"
 #include "pandaproxy/schema_registry/rest_client/error.h"
 #include "pandaproxy/schema_registry/rest_client/pooled_client.h"
+#include "pandaproxy/schema_registry/rest_client/rate_limited_client.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/coroutine.hh>
@@ -177,10 +178,25 @@ http_source_reader::http_source_reader(std::unique_ptr<rc::client> client)
 
 ss::future<source_result<rc::client*>>
 http_source_reader::ensure_client(ss::abort_source& as) {
+    // Checked before the fast path: stop() nulls _client, and a call arriving
+    // after stop (fibers may still be unwinding when the reader is stopped)
+    // must fail rather than rebuild a client nothing would ever stop.
+    if (_stopped) {
+        co_return std::unexpected(
+          source_error{
+            .kind = source_error_kind::source_unavailable,
+            .message = "source reader is stopped"});
+    }
     if (_client) {
         co_return _client.get();
     }
     auto build = co_await ss::get_units(_build, 1, as);
+    if (_stopped) {
+        co_return std::unexpected(
+          source_error{
+            .kind = source_error_kind::source_unavailable,
+            .message = "source reader is stopped"});
+    }
     if (_client) {
         co_return _client.get();
     }
@@ -214,8 +230,13 @@ http_source_reader::ensure_client(ss::abort_source& as) {
         for (size_t i = 0; i < pool_size; ++i) {
             transports.push_back(std::make_unique<http::client>(cfg));
         }
+        // Limiter over pool: a request pays for dispatch (rate cap and any
+        // server-imposed Retry-After pause) before competing for a
+        // connection.
         _client = std::make_unique<rc::client>(
-          std::make_unique<rc::pooled_client>(std::move(transports)),
+          std::make_unique<rc::rate_limited_client>(
+            std::make_unique<rc::pooled_client>(std::move(transports)),
+            _conn->max_requests_per_sec),
           _conn->endpoint,
           _conn->auth,
           ppsr::qualified_subjects_enabled::yes);
@@ -389,7 +410,12 @@ ss::future<> http_source_reader::stop() {
     // Idempotent: the reader can be stopped more than once (e.g. an in-flight
     // reconciler stopping the task before link teardown stops it again). The
     // rest_client's gate must be closed exactly once, so release the client
-    // after shutting it down and skip it on a repeat call.
+    // after shutting it down and skip it on a repeat call. The sticky
+    // _stopped flag rejects post-stop rebuilds, and waiting out the build
+    // mutex means a build that raced this stop is shut down here rather than
+    // leaked.
+    _stopped = true;
+    auto build = co_await ss::get_units(_build, 1);
     if (auto client = std::move(_client); client) {
         co_await client->shutdown();
     }
@@ -411,7 +437,9 @@ std::unique_ptr<source_reader> http_source_reader_factory::create(
       .address = std::move(*address),
       .endpoint = api_cfg->source_url,
       .tls_enabled = bool(api_cfg->tls_enabled),
-      .provide_sni = bool(api_cfg->tls_provide_sni)};
+      .provide_sni = bool(api_cfg->tls_provide_sni),
+      .max_requests_per_sec = static_cast<size_t>(
+        api_cfg->get_max_source_requests_per_second())};
 
     if (api_cfg->ca.has_value()) {
         conn.truststore = to_certificate(api_cfg->ca.value());

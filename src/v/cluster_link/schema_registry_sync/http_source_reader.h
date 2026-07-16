@@ -40,6 +40,14 @@ struct http_source_connection {
     std::optional<net::key_store> client_key;
     bool provide_sni{true};
     std::optional<rc::basic_auth_credentials> auth;
+    /// Cap on requests/sec to the source, resolved from the link's
+    /// max_source_requests_per_second (always > 0: conversion rejects
+    /// negatives and maps zero/unset to the default). Like the other
+    /// connection settings, a link-config change applies when the task next
+    /// (re)starts.
+    size_t max_requests_per_sec{
+      model::schema_registry_sync_config::shadow_schema_registry_api::
+        default_max_source_requests_per_second};
 };
 
 /// Resolves a source Schema Registry URL to the host:port the transport should
@@ -99,6 +107,10 @@ private:
     // Connection inputs for the lazy build; nullopt once a client is injected.
     std::optional<http_source_connection> _conn;
     std::unique_ptr<rc::client> _client;
+    // Set by stop(): the reader is stopped while the reconcile engine's
+    // fibers may still be unwinding, and a late call must fail rather than
+    // lazily rebuild the client (which nothing would ever stop).
+    bool _stopped{false};
     // Serializes the lazy client build only. Requests run concurrently: the
     // reconcile engine drives this reader from several fibers, and the
     // rest_client's pooled transport bounds them to one in-flight request per

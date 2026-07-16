@@ -222,6 +222,7 @@ class SchemaRegistrySyncMixin:
         exact_context_map: dict[str, str] | None = None,
         feature_policy: shadow_link_pb2.UnsupportedSchemaFeaturePolicy.ValueType
         | None = None,
+        max_source_requests_per_second: int | None = None,
     ) -> str:
         # Create a shadow link that syncs only the Schema Registry, in API mode,
         # pointing at the source cluster's SR endpoint (or an explicit URL, e.g.
@@ -243,6 +244,8 @@ class SchemaRegistrySyncMixin:
                 seconds=full_sync_interval_sec
             ),
         )
+        if max_source_requests_per_second is not None:
+            api.max_source_requests_per_second = max_source_requests_per_second
         if feature_policy is not None:
             api.unsupported_schema_feature_policy = feature_policy
         if source_filter_subjects is not None:
@@ -1100,8 +1103,40 @@ class SchemaRegistrySyncMixin:
             self._register(src, subject, self._large_schema(i, body))
             pairs.append((subject, 1))
 
-        self._create_sr_link()
+        # Effectively unthrottled: at the default 30 req/s the periodic full
+        # syncs saturate the 2s interval on slow CI hardware, so teardown
+        # always lands mid-sync and can hang node shutdown on an unabortable
+        # destination write racing raft shutdown (issue #31108). A fast sync
+        # restores the idle-at-teardown profile this test always ran with;
+        # drop the override once #31108 is fixed. Rate-limiting behavior
+        # itself is covered by test_schema_registry_api_sync_teardown_mid_sync.
+        self._create_sr_link(max_source_requests_per_second=1000)
         self._wait_synced(src, dest, pairs)
+
+    def _test_schema_registry_api_sync_teardown_mid_sync(self):
+        src = self._make_source_client()
+        dest = SchemaRegistryRedpandaClient(self.target_cluster_service)
+
+        # Enough subjects that a full sync at 2 requests/s takes far longer
+        # than the 2s full-sync interval, so the task is effectively always
+        # mid-sync from here on.
+        pairs: list[Pair] = []
+        for i in range(16):
+            subject = f"subj-{i}-value"
+            self._register(src, subject, self._leaf_schema(i))
+            pairs.append((subject, 1))
+
+        # The per-link cap doubles as coverage that the admin field reaches
+        # the reader's rate limiter: at the default rate this sync finishes in
+        # a couple of seconds, so _wait_synced only passes this slowly because
+        # the field applied.
+        self._create_sr_link(max_source_requests_per_second=2)
+        self._wait_synced(src, dest, pairs)
+        # The regression under test fires at teardown: stopping a node while
+        # the throttled sync is mid-flight used to deadlock cluster_link
+        # shutdown (the manager drained its work queue and gate before
+        # aborting the tasks they were blocked on) until the 30s node-stop
+        # timeout killed the node. Success here is simply a clean teardown.
 
     def _test_schema_registry_api_sync_survives_leadership_change(self):
         src = self._make_source_client()
@@ -1483,6 +1518,12 @@ class SchemaRegistrySyncE2ETest(ShadowLinkTestBase, SchemaRegistrySyncMixin):
     @cluster(num_nodes=6)
     def test_schema_registry_api_sync_survives_leadership_change(self):
         self._test_schema_registry_api_sync_survives_leadership_change()
+
+    # Redpanda-source only: the teardown behavior under test is
+    # vendor-agnostic, so one leaf suffices.
+    @cluster(num_nodes=6)
+    def test_schema_registry_api_sync_teardown_mid_sync(self):
+        self._test_schema_registry_api_sync_teardown_mid_sync()
 
 
 class ConfluentSchemaRegistrySyncE2ETest(ShadowLinkTestBase, SchemaRegistrySyncMixin):
