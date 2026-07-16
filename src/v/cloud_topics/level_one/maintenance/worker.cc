@@ -398,6 +398,8 @@ ss::future<> compaction_worker::compact_log(compaction_job* job) {
       _metastore,
       _as,
       config::shard_local_cfg().cloud_topics_compaction_max_object_size.bind(),
+      config::shard_local_cfg()
+        .cloud_topics_compaction_commit_interval_bytes.bind(),
       _upload_part_size,
       _probe,
       ctxlog,
@@ -494,6 +496,8 @@ ss::future<> compaction_worker::do_level_range(leveling_job* job) {
       _as,
       config::shard_local_cfg()
         .cloud_topics_reconciliation_max_object_size.bind(),
+      config::shard_local_cfg()
+        .cloud_topics_leveling_commit_interval_bytes.bind(),
       _upload_part_size,
       _probe,
       ctxlog,
