@@ -882,6 +882,7 @@ redpanda_cc_btest(
     cpu = "1",
     deps = [
         ":kafka_test_utils",
+        "//src/v/bytes:iobuf_parser",
         "//src/v/cluster:cluster_link_table",
         "//src/v/cluster:cluster_link_types",
         "//src/v/cluster:controller_log_limiter",
@@ -899,6 +900,7 @@ redpanda_cc_btest(
         "//src/v/kafka/protocol:produce",
         "//src/v/kafka/server",
         "//src/v/model",
+        "//src/v/model:batch_compression",
         "//src/v/random:generators",
         "//src/v/redpanda/tests:fixture",
         "//src/v/storage:record_batch_builder",
