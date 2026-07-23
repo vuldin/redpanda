@@ -220,6 +220,7 @@ struct configuration final : public config_store {
     enum_property<model::kafka_batch_validation_mode>
       kafka_produce_batch_validation;
     enum_property<model::compression> log_compression_type;
+    property<bool> kafka_produce_enable_batch_compression;
     property<size_t> fetch_max_bytes;
     property<bool> use_fetch_scheduler_group;
     property<bool> kafka_fetch_read_coalescing_enabled;

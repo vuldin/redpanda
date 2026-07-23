@@ -887,6 +887,19 @@ configuration::configuration()
        model::compression::lz4,
        model::compression::zstd,
        model::compression::producer})
+  , kafka_produce_enable_batch_compression(
+      *this,
+      "kafka_produce_enable_batch_compression",
+      "Enables broker-side compression on the produce path. When enabled, "
+      "produced batches are recompressed to match the topic's effective "
+      "`compression.type` if their codec differs from it. An effective "
+      "compression type of `producer` retains the codec set by the producing "
+      "client. When disabled, batches are always stored with the codec set by "
+      "the producing client.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      true,
+      property<bool>::noop_validator,
+      legacy_default<bool>{false, legacy_version{18}})
   , fetch_max_bytes(
       *this,
       "fetch_max_bytes",
