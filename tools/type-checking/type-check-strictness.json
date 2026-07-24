@@ -421,6 +421,7 @@
         "rptest/tests/rpk_cluster_quota_test.py",
         "rptest/tests/rpk_cluster_test.py",
         "rptest/tests/rpk_debug_bundle_test.py",
+        "rptest/tests/rpk_permission_test.py",
         "rptest/tests/rpk_profile_test.py",
         "rptest/tests/rpk_registry_test.py",
         "rptest/tests/rpk_start_test.py",
