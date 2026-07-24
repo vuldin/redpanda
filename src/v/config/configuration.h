@@ -835,6 +835,7 @@ public:
     bounded_property<double, numeric_bounds>
       cloud_topics_leveling_min_extent_size_ratio;
     property<size_t> cloud_topics_leveling_max_range_bytes;
+    property<size_t> cloud_topics_leveling_max_ranges_per_partition;
     property<size_t> cloud_topics_compaction_commit_interval_bytes;
     property<size_t> cloud_topics_leveling_commit_interval_bytes;
     property<bool> cloud_topics_compaction_disabled;
