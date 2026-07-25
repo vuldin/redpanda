@@ -5048,6 +5048,37 @@ configuration::configuration()
       "in time and blast radius. Lower values mean more, smaller jobs.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       1_GiB)
+  , cloud_topics_leveling_max_ranges_per_partition(
+      *this,
+      "cloud_topics_leveling_max_ranges_per_partition",
+      "Maximum number of levelable ranges returned per partition by a single "
+      "leveling scan. Bounds the scan reply's size as well as the rate at "
+      "which leveling work is produced along with "
+      "`cloud_topics_leveling_interval_ms`.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      5)
+  , cloud_topics_compaction_commit_interval_bytes(
+      *this,
+      "cloud_topics_compaction_commit_interval_bytes",
+      "Bytes of finished output an L1 compaction job accumulates before "
+      "committing it to the metastore. Commits happen at the next source "
+      "extent boundary once at least this much output is pending. Lower "
+      "values bound the work lost to a failed job and the time committed "
+      "objects spend pre-registered, at the cost of more metastore commits "
+      "and one potentially undersized trailing object per commit.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      512_MiB)
+  , cloud_topics_leveling_commit_interval_bytes(
+      *this,
+      "cloud_topics_leveling_commit_interval_bytes",
+      "Bytes of finished output an L1 leveling job accumulates before "
+      "committing it to the metastore. Commits happen at the next source "
+      "extent boundary once at least this much output is pending. Lower "
+      "values bound the work lost to a failed job and the time committed "
+      "objects spend pre-registered, at the cost of more metastore commits "
+      "and one potentially undersized trailing object per commit.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      512_MiB)
   , cloud_topics_compaction_disabled(
       *this,
       "cloud_topics_compaction_disabled",

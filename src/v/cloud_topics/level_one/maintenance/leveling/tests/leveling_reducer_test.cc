@@ -61,7 +61,8 @@ ss::future<> do_level(
   l1::metastore::compaction_epoch epoch,
   l1::metastore* metastore,
   l1::io* io,
-  size_t max_object_size = 128_MiB) {
+  size_t max_object_size = 128_MiB,
+  size_t commit_interval_bytes = 512_MiB) {
     ss::abort_source as;
     auto state = l1::compaction_job_state::running;
     l1::compaction_worker_probe probe;
@@ -82,6 +83,7 @@ ss::future<> do_level(
       metastore,
       as,
       config::mock_binding<size_t>(max_object_size),
+      config::mock_binding<size_t>(commit_interval_bytes),
       test_upload_part_size,
       probe,
       test_ctxlog);
@@ -269,6 +271,120 @@ TEST_F(LevelingReducerTest, PreservesBatchData) {
     }
 }
 
+// Leveling commits its output incrementally, one replace_objects() per
+// range boundary once at least a full object's worth of output has
+// accumulated. Unlike compaction's partial commits, leveling commits must
+// not bump the compaction epoch: leveling must never fence a concurrent
+// compaction job.
+TEST_F(LevelingReducerTest, IncrementalCommitsPreserveEpoch) {
+    auto [ntp, tidp] = make_ntidp("test_topic");
+    const int records_per_batch = 10;
+    const int batches_per_extent = 5;
+    const int num_extents = 4;
+    const int records_per_extent = batches_per_extent * records_per_batch;
+
+    for (int i = 0; i < num_extents; ++i) {
+        upload_batches(
+          tidp,
+          model::offset{i * records_per_extent},
+          batches_per_extent,
+          records_per_batch);
+    }
+
+    auto orig_reader = make_reader(ntp, tidp);
+    auto orig_batches = read_all(std::move(orig_reader));
+    ASSERT_GT(orig_batches.size(), 0);
+
+    auto leveling_info = get_all_leveling_info(tidp, 100_KiB);
+    ASSERT_FALSE(leveling_info.ranges.empty());
+    auto initial_epoch = leveling_info.epoch;
+
+    // Split the run into two ranges so the job crosses two range
+    // boundaries; a tiny max_object_size makes each boundary's accumulated
+    // output exceed the commit threshold, forcing one commit per range.
+    chunked_vector<l1::levelable_range> ranges;
+    ranges.push_back(
+      l1::levelable_range{
+        .base_offset = kafka::offset{0},
+        .last_offset = kafka::offset{2 * records_per_extent - 1},
+        .extent_count = 2});
+    ranges.push_back(
+      l1::levelable_range{
+        .base_offset = kafka::offset{2 * records_per_extent},
+        .last_offset = kafka::offset{4 * records_per_extent - 1},
+        .extent_count = 2});
+
+    do_level(
+      ntp,
+      tidp,
+      std::move(ranges),
+      initial_epoch,
+      &_metastore,
+      &_io,
+      /*max_object_size=*/512,
+      /*commit_interval_bytes=*/512)
+      .get();
+
+    // Leveling commits never bump the compaction epoch.
+    auto after_info = get_all_leveling_info(tidp, 100_KiB);
+    EXPECT_EQ(after_info.epoch, initial_epoch);
+
+    // Every record survives the rewrite byte-for-byte.
+    auto new_reader = make_reader(ntp, tidp);
+    auto new_batches = read_all(std::move(new_reader));
+    ASSERT_EQ(orig_batches.size(), new_batches.size());
+    for (size_t i = 0; i < orig_batches.size(); ++i) {
+        EXPECT_EQ(orig_batches[i].header(), new_batches[i].header())
+          << "Batch header mismatch at index " << i;
+        EXPECT_EQ(orig_batches[i].data(), new_batches[i].data())
+          << "Batch data mismatch at index " << i;
+    }
+}
+
+// A leveling commit rejected by the metastore (stale compaction epoch, e.g.
+// a compaction job committed since this job read its snapshot) aborts the
+// run without replacing any extents.
+TEST_F(LevelingReducerTest, StaleEpochAbortsJob) {
+    auto [ntp, tidp] = make_ntidp("test_topic");
+    const int records_per_batch = 10;
+    const int batches_per_extent = 5;
+    const int num_extents = 4;
+    const int records_per_extent = batches_per_extent * records_per_batch;
+
+    for (int i = 0; i < num_extents; ++i) {
+        upload_batches(
+          tidp,
+          model::offset{i * records_per_extent},
+          batches_per_extent,
+          records_per_batch);
+    }
+    auto extents_before = count_extents(tidp);
+
+    auto leveling_info = get_all_leveling_info(tidp, 100_KiB);
+    ASSERT_FALSE(leveling_info.ranges.empty());
+    auto initial_epoch = leveling_info.epoch;
+    auto stale_epoch = l1::metastore::compaction_epoch{initial_epoch() + 1};
+
+    // A tiny commit interval forces the commit through the range-boundary
+    // path, whose failure aborts the run.
+    EXPECT_THROW(
+      do_level(
+        ntp,
+        tidp,
+        std::move(leveling_info.ranges),
+        stale_epoch,
+        &_metastore,
+        &_io,
+        /*max_object_size=*/512,
+        /*commit_interval_bytes=*/512)
+        .get(),
+      std::runtime_error);
+
+    // Nothing was replaced and the epoch is untouched.
+    EXPECT_EQ(count_extents(tidp), extents_before);
+    EXPECT_EQ(get_all_leveling_info(tidp, 100_KiB).epoch, initial_epoch);
+}
+
 // If hard_stop is requested, the source stops iteration immediately and the
 // sink does not commit any replacement.
 TEST_F(LevelingReducerTest, HardStopPreempts) {
@@ -314,6 +430,7 @@ TEST_F(LevelingReducerTest, HardStopPreempts) {
       &_metastore,
       as,
       config::mock_binding<size_t>(128_MiB),
+      config::mock_binding<size_t>(512_MiB),
       test_upload_part_size,
       probe,
       test_ctxlog);
@@ -371,6 +488,7 @@ TEST_F(LevelingReducerTest, EmptyLevelingRangesIsNoOp) {
       &_metastore,
       as,
       config::mock_binding<size_t>(128_MiB),
+      config::mock_binding<size_t>(512_MiB),
       test_upload_part_size,
       probe,
       test_ctxlog);
