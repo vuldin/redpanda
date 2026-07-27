@@ -23,6 +23,7 @@
 #include <seastar/util/noncopyable_function.hh>
 
 #include <exception>
+#include <vector>
 
 namespace wasm {
 // Metadata about a record within a batch
@@ -85,6 +86,18 @@ struct batch_transform_context {
     // The remaining records to transform
     ss::chunked_fifo<record_metadata> records;
     record_callback* callback;
+    // Records written by the guest via write_record/write_record_with_options,
+    // buffered here (synchronously, non-blocking) rather than emitted
+    // immediately. Drained - with the real, backpressure-capable emit() -
+    // once per batch. See the PR-08 finding in the wasm roadmap doc: this is
+    // what lets write_record avoid Wasmtime's async host-call path on every
+    // record while still applying real backpressure, just at a coarser
+    // granularity. The topic is owned (not a view) because the guest memory
+    // backing write_record_with_options's options buffer is only valid for
+    // the duration of that one call.
+    ss::chunked_fifo<
+      std::pair<std::optional<model::topic>, model::transformed_data>>
+      pending_writes;
 };
 
 /**
@@ -95,7 +108,12 @@ struct batch_transform_context {
  */
 class transform_module {
 public:
-    explicit transform_module(wasi::preview1_module*);
+    // `valid_output_topics` is the set of topics this transform is allowed to
+    // write to (from `model::transform_metadata::output_topics`), used to
+    // synchronously validate an explicit output topic in write_record_with_
+    // options without needing the real (async) emit() to run first.
+    explicit transform_module(
+      wasi::preview1_module*, std::vector<model::topic> valid_output_topics);
     transform_module(const transform_module&) = delete;
     transform_module(transform_module&&) = delete;
     transform_module& operator=(const transform_module&) = delete;
@@ -146,22 +164,44 @@ public:
       int16_t* producer_epoch,
       int32_t* base_sequence);
 
-    ss::future<int32_t> read_next_record(
+    // Synchronous: unlike read_batch_header, this never needs to suspend.
+    // The whole batch's bytes are already resident in host memory (parsed
+    // by for_each_record_async before the guest is woken), so there is
+    // nothing to wait on here. See the PR-08 finding in the wasm roadmap
+    // doc for why this matters: an `ss::future<T>` return type forces
+    // Wasmtime's heavier async host-call path on every single record.
+    int32_t read_next_record(
       uint8_t* attributes,
       int64_t* timestamp_delta,
       model::offset* offset_delta,
       ffi::array<uint8_t>);
 
-    ss::future<int32_t> write_record(ffi::array<uint8_t>);
+    // Synchronous, for the same reason read_next_record is: the actual
+    // (backpressure-capable) emit() is deferred to drain_pending_writes(),
+    // called once per batch rather than once per record. See
+    // batch_transform_context::pending_writes.
+    int32_t write_record(ffi::array<uint8_t>);
 
-    ss::future<int32_t>
-      write_record_with_options(ffi::array<uint8_t>, ffi::array<uint8_t>);
+    int32_t write_record_with_options(ffi::array<uint8_t>, ffi::array<uint8_t>);
 
     // End ABI exports
 
 private:
     ss::future<> guest_wait_for_batch();
     ss::future<> host_wait_for_proccessing();
+
+    // Whether writing to this output (nullopt means the default output) is
+    // known-valid without needing to ask the (async, backpressure-capable)
+    // callback. True for the default output and any topic in
+    // _valid_output_topics; this mirrors transform_processor's _outputs map
+    // lookup, which is what the real emit() would otherwise check anyway.
+    bool is_valid_output_topic(const std::optional<model::topic_view>&) const;
+
+    // Emits everything buffered in _call_ctx->pending_writes, in order, via
+    // the real callback (so this is where backpressure is actually applied),
+    // then clears the buffer. Called once per batch. Must only be called
+    // when _call_ctx is set.
+    ss::future<> drain_pending_writes();
 
     // The following condition variables are optional so that they can be reset,
     // as engines can be restarted.
@@ -175,5 +215,6 @@ private:
 
     std::optional<batch_transform_context> _call_ctx;
     wasi::preview1_module* _wasi_module;
+    std::vector<model::topic> _valid_output_topics;
 };
 } // namespace wasm
