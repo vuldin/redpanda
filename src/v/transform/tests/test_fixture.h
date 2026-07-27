@@ -159,7 +159,6 @@ class fake_offset_tracker : public offset_tracker {
 public:
     ss::future<> start() override;
     ss::future<> stop() override;
-    ss::future<> wait_for_previous_flushes(ss::abort_source*) override;
 
     ss::future<absl::flat_hash_map<model::output_topic_index, kafka::offset>>
     load_committed_offsets() override;

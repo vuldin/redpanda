@@ -286,15 +286,33 @@ struct transform_offsets_key
 struct transform_offsets_value
   : serde::envelope<
       transform_offsets_value,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
     kafka::offset offset;
+    // The raft term of the partition that produced this commit, used to
+    // fence stale writes from a superseded owner (see
+    // cluster::distributed_kv_stm's should_replace customization point).
+    // Defaults to term_id{} (0) for values written before this field
+    // existed, or by a writer that doesn't know its term - 0 is also a
+    // legitimate first-ever term, but since real terms only increase from
+    // there, comparing with >= still does the right thing: a genuine
+    // continuation of writes from the same (or a legacy, unknown) epoch is
+    // never incorrectly rejected.
+    model::term_id epoch{};
 
     fmt::iterator format_to(fmt::iterator it) const {
-        return fmt::format_to(it, "{{ offset: {} }}", offset);
+        return fmt::format_to(it, "{{ offset: {}, epoch: {} }}", offset, epoch);
     }
 
-    auto serde_fields() { return std::tie(offset); }
+    // Used by cluster::distributed_kv_stm to decide whether this value
+    // should overwrite an existing one for the same key, rather than racing
+    // a stale flush from a superseded owner against a fresher commit purely
+    // on timing (see the PR-06 finding in the wasm roadmap doc).
+    bool should_replace(const transform_offsets_value& older) const {
+        return epoch >= older.epoch;
+    }
+
+    auto serde_fields() { return std::tie(offset, epoch); }
 };
 
 using transform_offsets_map
