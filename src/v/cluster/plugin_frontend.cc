@@ -24,6 +24,8 @@
 #include "model/transform.h"
 #include "strings/utf8.h"
 
+#include <seastar/core/smp.hh>
+
 #include <utility>
 
 namespace cluster {
@@ -241,11 +243,30 @@ errc plugin_frontend::validate_mutation(const transform_cmd& cmd) {
     for (const auto& topic : noproduce) {
         no_sink_topics.emplace(topic);
     }
-    const size_t max_transforms
-      = config::shard_local_cfg()
-          .data_transforms_per_core_memory_reservation.value()
-        / config::shard_local_cfg()
-            .data_transforms_per_function_memory_limit.value();
+    // How many transform instances (i.e. heap slots, see wasm::heap_allocator)
+    // fit on a single core - mirrors the same reservation/limit-or-explicit-
+    // count logic application_bootstrap.cc uses to size the real allocator,
+    // so this validator's notion of capacity matches what's actually
+    // provisioned.
+    const auto& cluster_cfg = config::shard_local_cfg();
+    size_t max_instances_per_core
+      = cluster_cfg.data_transforms_max_instances_per_core.value();
+    size_t instances_per_core
+      = max_instances_per_core > 0
+          ? max_instances_per_core
+          : cluster_cfg.data_transforms_per_core_memory_reservation.value()
+              / cluster_cfg.data_transforms_per_function_memory_limit.value();
+    // Scaling by this node's core count is a necessary-but-not-sufficient
+    // check: it catches the case where the cluster could not possibly have
+    // enough aggregate heap-slot capacity for the requested partition count
+    // under *any* placement, but it does not guard against uneven placement
+    // concentrating too many partition-leaders (and therefore too many
+    // engine/heap instances, since each partition gets its own) on a single
+    // core. It also does not yet account for other brokers' core counts -
+    // that needs a members_table dependency this frontend doesn't have
+    // today, and is left as a follow-up.
+    const size_t max_transforms = instances_per_core
+                                  * ss::this_smp_shard_count();
 
     validator v(
       _topics,
@@ -413,12 +434,6 @@ errc plugin_frontend::validator::validate_mutation(const transform_cmd& cmd) {
 
           // create!
 
-          if (_table->all_transforms().size() >= _max_transforms) {
-              vlog(
-                clusterlog.info, "too many transforms, more memory required");
-              return errc::transform_count_limit_exceeded;
-          }
-
           if (cmd.value.name().empty()) {
               vlog(
                 clusterlog.info,
@@ -467,6 +482,40 @@ errc plugin_frontend::validator::validate_mutation(const transform_cmd& cmd) {
               return errc::topic_not_exists;
           }
           const auto& input_config = input_topic->get_configuration();
+          // Checked here, rather than up front, because it's counted in
+          // partition-instances (the actual heap-slot-consuming quantity,
+          // since each partition gets its own wasm engine on whatever
+          // core leads it), not in distinct transforms deployed - a handful
+          // of high-partition-count transforms can consume far more
+          // capacity than many low-partition-count ones, so counting
+          // transforms rather than partitions was checking the wrong unit
+          // entirely, independent of the per-core-ratio issue this cap is
+          // also being fixed for.
+          size_t existing_partitions = 0;
+          for (const auto& [_, meta] : _table->all_transforms()) {
+              auto existing_topic = _topics->get_topic_metadata(
+                meta.input_topic);
+              if (existing_topic) {
+                  existing_partitions += size_t(
+                    existing_topic->get_configuration().partition_count);
+              }
+          }
+          size_t new_partitions = size_t(input_config.partition_count);
+          if (existing_partitions + new_partitions > _max_transforms) {
+              vlog(
+                clusterlog.info,
+                "deploy of transform {} needs {} partition-instances, which "
+                "would bring the total to {} (existing {} + new {}), "
+                "exceeding the estimated cluster capacity of {} - more "
+                "memory or cores required",
+                cmd.value.name,
+                new_partitions,
+                existing_partitions + new_partitions,
+                existing_partitions,
+                new_partitions,
+                _max_transforms);
+              return errc::transform_count_limit_exceeded;
+          }
           if (input_config.is_internal()) {
               vlog(
                 clusterlog.info,

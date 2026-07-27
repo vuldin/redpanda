@@ -691,10 +691,24 @@ void application::wire_up_and_start(
     if (
       wasm_data_transforms_enabled() && !config::node().recovery_mode_enabled) {
         const auto& cluster = config::shard_local_cfg();
+        // data_transforms_max_instances_per_core, when set, controls
+        // concurrency directly instead of it being derived from dividing
+        // the reservation by the per-function limit: that division
+        // silently yields zero usable instances if the per-function limit
+        // is raised (e.g. to GiB scale) without also inflating the
+        // reservation to match.
+        size_t max_instances
+          = cluster.data_transforms_max_instances_per_core.value();
+        size_t per_function_limit
+          = cluster.data_transforms_per_function_memory_limit.value();
+        size_t per_core_pool_size_bytes
+          = max_instances > 0
+              ? max_instances * per_function_limit
+              : cluster.data_transforms_per_core_memory_reservation.value();
         wasm::runtime::config config = {
           .heap_memory = {
-            .per_core_pool_size_bytes = cluster.data_transforms_per_core_memory_reservation.value(),
-            .per_engine_memory_limit = cluster.data_transforms_per_function_memory_limit.value(),
+            .per_core_pool_size_bytes = per_core_pool_size_bytes,
+            .per_engine_memory_limit = per_function_limit,
           },
           .stack_memory = {
             .debug_host_stack_usage = false,
