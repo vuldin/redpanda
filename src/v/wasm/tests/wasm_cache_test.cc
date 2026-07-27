@@ -102,7 +102,7 @@ public:
     ~fake_factory() noexcept override { --_state->factories; }
 
     ss::future<ss::shared_ptr<engine>>
-    make_engine(std::unique_ptr<wasm::logger>) override {
+    make_engine(model::ntp, std::unique_ptr<wasm::logger>) override {
         co_return ss::make_shared<fake_engine>(_state);
     }
 
@@ -213,11 +213,14 @@ TEST_F(WasmCacheTest, CachesFactories) {
 
 TEST_F(WasmCacheTest, CachesEngines) {
     auto meta = random_metadata();
+    auto ntp = model::random_ntp();
     auto factory = ss::make_foreign(make_factory(meta));
     static thread_local ss::shared_ptr<engine> live_engine;
-    invoke_on_all([&factory] {
-        auto engine_one = factory->make_engine(std::make_unique<fake_logger>());
-        auto engine_two = factory->make_engine(std::make_unique<fake_logger>());
+    invoke_on_all([&factory, &ntp] {
+        auto engine_one = factory->make_engine(
+          ntp, std::make_unique<fake_logger>());
+        auto engine_two = factory->make_engine(
+          ntp, std::make_unique<fake_logger>());
         auto engine = engine_one.get();
         EXPECT_EQ(engine, engine_two.get());
         live_engine = engine;
@@ -225,7 +228,8 @@ TEST_F(WasmCacheTest, CachesEngines) {
     EXPECT_EQ(state()->engines, ss::this_smp_shard_count());
 
     // This engine doesn't actually create new instances under the hood.
-    auto engine = factory->make_engine(std::make_unique<fake_logger>()).get();
+    auto engine
+      = factory->make_engine(ntp, std::make_unique<fake_logger>()).get();
     EXPECT_EQ(state()->engines, ss::this_smp_shard_count());
     engine = nullptr;
     EXPECT_EQ(state()->engines, ss::this_smp_shard_count());
@@ -236,13 +240,14 @@ TEST_F(WasmCacheTest, CachesEngines) {
 
 TEST_F(WasmCacheTest, CanMultiplexEngines) {
     auto meta = random_metadata();
+    auto ntp = model::random_ntp();
     auto factory = ss::make_foreign(make_factory(meta));
     auto engine_one
-      = factory->make_engine(std::make_unique<fake_logger>()).get();
+      = factory->make_engine(ntp, std::make_unique<fake_logger>()).get();
     auto engine_two
-      = factory->make_engine(std::make_unique<fake_logger>()).get();
+      = factory->make_engine(ntp, std::make_unique<fake_logger>()).get();
     auto engine_three
-      = factory->make_engine(std::make_unique<fake_logger>()).get();
+      = factory->make_engine(ntp, std::make_unique<fake_logger>()).get();
     EXPECT_EQ(state()->engines, 1);
     ss::when_all_succeed(
       [&engine_two] { return engine_two->start(); },
@@ -262,11 +267,12 @@ TEST_F(WasmCacheTest, CanMultiplexEngines) {
 
 TEST_F(WasmCacheTest, CanMultiplexTransforms) {
     auto meta = random_metadata();
+    auto ntp = model::random_ntp();
     auto factory = ss::make_foreign(make_factory(meta));
     auto engine_one
-      = factory->make_engine(std::make_unique<fake_logger>()).get();
+      = factory->make_engine(ntp, std::make_unique<fake_logger>()).get();
     auto engine_two
-      = factory->make_engine(std::make_unique<fake_logger>()).get();
+      = factory->make_engine(ntp, std::make_unique<fake_logger>()).get();
     engine_one->start().get();
     engine_two->start().get();
     state()->engine_transform_should_throw = true;
@@ -294,10 +300,11 @@ TEST_F(WasmCacheTest, CanMultiplexTransforms) {
 
 TEST_F(WasmCacheTest, GC) {
     auto meta = random_metadata();
+    auto ntp = model::random_ntp();
     auto factory = ss::make_foreign(make_factory(meta));
     // Create an engine and destroy it
-    invoke_on_all([&factory] {
-        factory->make_engine(std::make_unique<fake_logger>()).get();
+    invoke_on_all([&factory, &ntp] {
+        factory->make_engine(ntp, std::make_unique<fake_logger>()).get();
     });
     EXPECT_EQ(state()->engines, 0);
     // We should GC each engine for each core
@@ -319,16 +326,37 @@ TEST_F(WasmCacheTest, FactoryReplacementBeforeGC) {
     EXPECT_EQ(state()->factories, 1);
 }
 
-TEST_F(WasmCacheTest, EngineReplacementBeforeGC) {
+// The engine cache is keyed on (transform offset, ntp), not just transform
+// offset: two partitions of the same transform led on this shard must not
+// share an engine (and so must not share linear memory, or serialize on each
+// other's transform calls).
+TEST_F(WasmCacheTest, DifferentPartitionsGetDifferentEngines) {
     auto meta = random_metadata();
     auto factory = ss::make_foreign(make_factory(meta));
-    auto engine = factory->make_engine(std::make_unique<fake_logger>()).get();
+    auto engine_one = factory
+                        ->make_engine(
+                          model::random_ntp(), std::make_unique<fake_logger>())
+                        .get();
+    auto engine_two = factory
+                        ->make_engine(
+                          model::random_ntp(), std::make_unique<fake_logger>())
+                        .get();
+    EXPECT_NE(engine_one, engine_two);
+    EXPECT_EQ(state()->engines, 2);
+}
+
+TEST_F(WasmCacheTest, EngineReplacementBeforeGC) {
+    auto meta = random_metadata();
+    auto ntp = model::random_ntp();
+    auto factory = ss::make_foreign(make_factory(meta));
+    auto engine
+      = factory->make_engine(ntp, std::make_unique<fake_logger>()).get();
     EXPECT_EQ(state()->engines, 1);
     engine = nullptr;
     EXPECT_EQ(state()->engines, 0);
     // Catches a bug when we were asserting incorrectly because an engine was
     // replaced in the cache instead of being inserted.
-    engine = factory->make_engine(std::make_unique<fake_logger>()).get();
+    engine = factory->make_engine(ntp, std::make_unique<fake_logger>()).get();
     EXPECT_EQ(state()->engines, 1);
 }
 

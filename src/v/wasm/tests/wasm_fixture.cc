@@ -131,7 +131,8 @@ void WasmTestFixture::load_wasm(std::string_view filename) {
       [this](ss::log_level, std::string_view log) {
           _log_lines.emplace_back(log);
       });
-    _engine = _factory->make_engine(std::move(logger)).get();
+    _engine
+      = _factory->make_engine(model::random_ntp(), std::move(logger)).get();
     _engine->start().get();
 }
 

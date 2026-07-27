@@ -88,6 +88,7 @@ public:
         auto factory = co_await _runtime->make_factory(
           meta, std::move(wasm_binary));
         _engine = co_await factory->make_engine(
+          model::random_ntp(),
           std::make_unique<wasm_logger>(meta.name(), &wasm::wasm_log));
         co_await _engine->start();
     }

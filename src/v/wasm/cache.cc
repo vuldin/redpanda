@@ -186,18 +186,26 @@ private:
 };
 } // namespace
 
-/** A cache for engines on a particular core. */
+/**
+ * A cache for engines on a particular core.
+ *
+ * Keyed on a transform's deploy offset together with the specific partition
+ * (ntp) an engine processes, so that each partition of a transform led on
+ * this shard gets its own engine instance and linear memory rather than
+ * sharing (and serializing on) one.
+ */
 class engine_cache {
 public:
-    void
-    put(model::offset offset, const ss::shared_ptr<shared_engine>& engine) {
-        _cache.insert_or_assign(offset, engine->weak_from_this());
+    using key_type = std::pair<model::offset, model::ntp>;
+
+    void put(key_type key, const ss::shared_ptr<shared_engine>& engine) {
+        _cache.insert_or_assign(std::move(key), engine->weak_from_this());
     }
 
     ss::future<ssx::mutex::units> lock() { return _mu.get_units(); }
 
-    ss::optimized_optional<ss::shared_ptr<engine>> get(model::offset offset) {
-        auto it = _cache.find(offset);
+    ss::optimized_optional<ss::shared_ptr<engine>> get(const key_type& key) {
+        auto it = _cache.find(key);
         if (it == _cache.end() || !it->second) {
             return {};
         }
@@ -208,7 +216,7 @@ public:
 
 private:
     ssx::mutex _mu{"wasm_engine_cache"};
-    absl::btree_map<model::offset, ss::weak_ptr<shared_engine>> _cache;
+    absl::btree_map<key_type, ss::weak_ptr<shared_engine>> _cache;
 };
 
 /**
@@ -231,8 +239,9 @@ public:
       , _engine_cache(e) {}
 
     ss::future<ss::shared_ptr<engine>>
-    make_engine(std::unique_ptr<wasm::logger> logger) override {
-        auto engine = _engine_cache->local().get(_offset);
+    make_engine(model::ntp ntp, std::unique_ptr<wasm::logger> logger) override {
+        engine_cache::key_type key{_offset, ntp};
+        auto engine = _engine_cache->local().get(key);
         // Try to grab an engine outside the lock
         if (engine) {
             co_return *std::move(engine);
@@ -240,7 +249,7 @@ public:
         // Acquire the lock for this core
         auto u = co_await _engine_cache->local().lock();
         // Double check nobody created one while we were grabbing the lock.
-        engine = _engine_cache->local().get(_offset);
+        engine = _engine_cache->local().get(key);
         if (engine) {
             co_return *std::move(engine);
         }
@@ -252,9 +261,9 @@ public:
         // created.
         auto foreign_this = co_await foreign_from_this();
         auto created = ss::make_shared<shared_engine>(
-          co_await _underlying->make_engine(std::move(logger)),
+          co_await _underlying->make_engine(std::move(ntp), std::move(logger)),
           std::move(foreign_this));
-        _engine_cache->local().put(_offset, created);
+        _engine_cache->local().put(std::move(key), created);
         co_return created;
     }
 

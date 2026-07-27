@@ -77,8 +77,17 @@ public:
     factory& operator=(const factory&) = delete;
     factory(factory&&) = delete;
     factory& operator=(factory&&) = delete;
+    /**
+     * Create (or, for a caching factory, reuse) an engine to process `ntp`.
+     *
+     * `ntp` identifies the specific partition the returned engine will
+     * process. A caching factory uses it, alongside its own transform
+     * identity, to key its engine cache per partition rather than sharing one
+     * engine and its linear memory across every partition of a transform that
+     * happens to be led on this shard.
+     */
     virtual ss::future<ss::shared_ptr<engine>>
-      make_engine(std::unique_ptr<wasm::logger>) = 0;
+      make_engine(model::ntp, std::unique_ptr<wasm::logger>) = 0;
     virtual ~factory() = default;
 };
 
