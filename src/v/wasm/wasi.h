@@ -29,7 +29,6 @@
 #pragma once
 
 #include "absl/container/flat_hash_map.h"
-#include "model/timestamp.h"
 #include "utils/named_type.h"
 #include "wasm/ffi.h"
 #include "wasm/wasi_logger.h"
@@ -262,9 +261,6 @@ public:
     preview1_module& operator=(preview1_module&&) = default;
     ~preview1_module() = default;
 
-    // Set the current timestamp that clocks will return.
-    void set_walltime(model::timestamp);
-
     static constexpr std::string_view name = "wasi_snapshot_preview1";
 
     errno_t clock_res_get(clock_id_t, timestamp_t*);
@@ -325,10 +321,6 @@ public:
     errno_t sock_shutdown(fd_t, uint8_t);
 
 private:
-    using unix_millis = std::chrono::milliseconds;
-
-    unix_millis _wall_time{0};
-    unix_millis _monotonic_time{0};
     std::vector<ss::sstring> _args;
     std::vector<ss::sstring> _environ;
     wasm::logger* _logger;
