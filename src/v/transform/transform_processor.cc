@@ -57,6 +57,7 @@ public:
         // model::record_batch.
         _last_offset = model::offset_cast(b.last_offset());
         _probe->increment_read_bytes(b.size_bytes());
+        _probe->record_input_delay(b.header().max_timestamp);
         co_await _output->push(std::move(b), _as);
         co_return ss::stop_iteration::no;
     }
@@ -285,7 +286,8 @@ ss::future<> processor::run_consumer_loop(kafka::offset offset) {
     // This is important because on restart we start processing from the minimum
     // offset.
     for (auto& [_, output] : _outputs) {
-        co_await output.queue.push({kafka::prev_offset(offset)}, &_as);
+        co_await output.queue.push(
+          {progress_marker{.offset = kafka::prev_offset(offset)}}, &_as);
     }
     while (!_as.abort_requested()) {
         auto reader = co_await _source->read_batch(offset, &_as);
@@ -312,6 +314,10 @@ ss::future<> processor::run_transform_loop() {
             continue;
         }
         auto offset = model::offset_cast(batch->last_offset());
+        // Captured before the batch is handed to the engine so that the
+        // producer can report end-to-end latency against the input record's
+        // own append time.
+        auto source_timestamp = batch->header().max_timestamp;
         ss::chunked_fifo<model::transformed_data> transformed;
         vlog(_logger.trace, "transforming offset {}", offset);
         co_await _engine->transform(
@@ -335,7 +341,10 @@ ss::future<> processor::run_transform_loop() {
         vlog(_logger.trace, "transformed offset {}", offset);
         // Mark all queues as processsed up to this point.
         for (auto& [_, output] : _outputs) {
-            co_await output.queue.push({offset}, &_as);
+            co_await output.queue.push(
+              {progress_marker{
+                .offset = offset, .source_timestamp = source_timestamp}},
+              &_as);
         }
     }
 }
@@ -402,6 +411,7 @@ ss::future<> processor::run_producer_loop(
             continue;
         }
         kafka::offset latest_offset = last_committed;
+        std::optional<model::timestamp> latest_source_timestamp;
         ss::chunked_fifo<model::transformed_data> records;
         for (auto& entry : popped) {
             ss::visit(
@@ -412,14 +422,19 @@ ss::future<> processor::run_producer_loop(
                   }
                   records.push_back(std::move(d));
               },
-              [&latest_offset, &suppress, last_committed](
-                kafka::offset offset) {
+              [&latest_offset,
+               &latest_source_timestamp,
+               &suppress,
+               last_committed](const progress_marker& marker) {
                   // Stop supressing new records when we see new records from
                   // the last commit.
                   // This can happen if other sinks are behind this one and we
                   // have to replay history.
-                  suppress = last_committed > offset;
-                  latest_offset = offset;
+                  suppress = last_committed > marker.offset;
+                  latest_offset = marker.offset;
+                  if (marker.source_timestamp.has_value()) {
+                      latest_source_timestamp = marker.source_timestamp;
+                  }
               });
         }
         while (!records.empty()) {
@@ -461,6 +476,12 @@ ss::future<> processor::run_producer_loop(
             co_await _offset_tracker->commit_offset(index, latest_offset);
             report_lag(index, _source->latest_offset() - latest_offset);
             last_committed = latest_offset;
+            // The output for this input is now written and its progress
+            // committed, so this is the point at which the record is fully
+            // through the pipeline.
+            if (latest_source_timestamp.has_value()) {
+                _probe->record_e2e_latency(*latest_source_timestamp);
+            }
         }
     }
 }
@@ -511,7 +532,7 @@ size_t transformed_output::memory_usage() const {
                  // accounts for.
                  return d.memory_usage() - sizeof(model::transformed_data);
              },
-             [](kafka::offset) { return size_t(0); });
+             [](const progress_marker&) { return size_t(0); });
 }
 
 } // namespace transform

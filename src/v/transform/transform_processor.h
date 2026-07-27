@@ -16,6 +16,7 @@
 #include "io.h"
 #include "model/fundamental.h"
 #include "model/record.h"
+#include "model/timestamp.h"
 #include "model/transform.h"
 #include "transform/memory_limiter.h"
 #include "transform/probe.h"
@@ -28,6 +29,7 @@
 #include <seastar/util/noncopyable_function.hh>
 
 #include <memory>
+#include <optional>
 #include <variant>
 
 namespace transform {
@@ -58,11 +60,25 @@ struct memory_limits {
 };
 
 /**
+ * Marks that the input has been processed up to (and including) `offset`.
+ *
+ * `source_timestamp` is the max timestamp of the source batch this marker
+ * follows, carried through the pipeline so that the producer can report
+ * end-to-end latency once the corresponding output has actually been written.
+ * It is nullopt for the priming marker pushed when a producer starts, which
+ * does not follow any source batch.
+ */
+struct progress_marker {
+    kafka::offset offset;
+    std::optional<model::timestamp> source_timestamp;
+};
+
+/**
  * A holder of the result of a transform, which is either a batch of data or a
- * committed offset.
+ * marker recording progress through the input.
  */
 struct transformed_output {
-    std::variant<model::transformed_data, kafka::offset> data;
+    std::variant<model::transformed_data, progress_marker> data;
 
     // How much memory this object is using.
     size_t memory_usage() const;

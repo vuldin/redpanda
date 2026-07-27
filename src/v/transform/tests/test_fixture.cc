@@ -54,8 +54,8 @@ class read_timed_out : public ss::condition_variable_timed_out {
     }
 };
 
-ss::future<model::record> fake_sink::read() {
-    co_await _cond_var.wait(1s, [this] { return !_records.empty(); })
+ss::future<model::record> fake_sink::read(std::chrono::milliseconds timeout) {
+    co_await _cond_var.wait(timeout, [this] { return !_records.empty(); })
       .handle_exception([](auto) { throw read_timed_out(); });
     auto record = std::move(_records.front());
     _records.pop_front();
@@ -106,8 +106,21 @@ kafka::offset fake_source::start_offset() const {
     return _batches.begin()->first;
 }
 
+void fake_source::set_empty_reads_when_caught_up(bool enabled) {
+    _empty_reads_when_caught_up = enabled;
+}
+
 ss::future<model::record_batch_reader>
 fake_source::read_batch(kafka::offset offset, ss::abort_source* as) {
+    if (_empty_reads_when_caught_up) {
+        as->check();
+        auto it = _batches.lower_bound(offset);
+        if (it == _batches.end()) {
+            co_return model::make_memory_record_batch_reader(
+              model::record_batch_reader::data_t{});
+        }
+        co_return model::make_memory_record_batch_reader(it->second.copy());
+    }
     auto sub = as->subscribe([this]() noexcept { _cond_var.broadcast(); });
     co_await _cond_var.wait([this, as, offset] {
         if (as->abort_requested()) {
