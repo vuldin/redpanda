@@ -28,6 +28,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <functional>
 #include <iterator>
 #include <memory>
@@ -212,6 +213,22 @@ public:
     }
     std::vector<model::record> read_records(size_t n) {
         return read_records({}, n);
+    }
+    std::vector<model::record> read_records_within(
+      model::output_topic_index idx,
+      size_t n,
+      std::chrono::milliseconds timeout) {
+        std::vector<model::record> records;
+        for (size_t i = 0; i < n; ++i) {
+            records.push_back(_sinks[idx()]->read(timeout).get());
+        }
+        return records;
+    }
+
+    // Make the source report having caught up instead of blocking until data
+    // arrives, the way the real partition_source does.
+    void report_caught_up_reads() {
+        _src->set_empty_reads_when_caught_up(true);
     }
     bool sink_empty(model::output_topic_index idx) {
         return _sinks[idx()]->empty();
@@ -457,6 +474,45 @@ TEST_P(ProcessorTestFixture, RecoversFromProduceFailureViaRestart) {
     for (auto o : output_topics()) {
         EXPECT_FALSE(read_records(o, 1).empty());
     }
+}
+
+// Measures how long a record appended to an idle transform waits before its
+// output appears.
+//
+// Every other test in this file reads through a source that blocks until data
+// arrives, so the processor is always handed a batch the moment one exists and
+// `processor::poll_sleep` is never reached. The real partition_source instead
+// returns an empty read once it has caught up, which sends the processor to
+// sleep for a jittered interval, and a record appended during that sleep waits
+// it out. `report_caught_up_reads` reproduces that so the delay is observable.
+//
+// This deliberately asserts only that the record arrives, and reports the delay
+// rather than pinning it to a target: the point is that the number moves
+// visibly when the polling loop is replaced with a notification. Tighten the
+// bound at that point.
+TEST_P(ProcessorTestFixture, MeasuresIdlePollingDelay) {
+    using namespace std::chrono_literals;
+    constexpr auto generous_timeout = 30s;
+
+    report_caught_up_reads();
+
+    // Push one record through so the processor reaches its caught-up state and
+    // starts polling.
+    auto warmup = make_records(1);
+    push_batch(warmup);
+    EXPECT_FALSE(read_records_within({}, 1, generous_timeout).empty());
+
+    // Now append to an idle processor and time how long the round trip takes.
+    auto batch = make_records(1);
+    auto start = std::chrono::steady_clock::now();
+    push_batch(batch);
+    auto returned = read_records_within({}, 1, generous_timeout);
+    auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - start);
+
+    EXPECT_THAT(returned, SameRecords(batch));
+    EXPECT_EQ(error_count(), 0);
+    GTEST_LOG_(INFO) << "idle-path delay: " << delay.count() << "ms";
 }
 
 INSTANTIATE_TEST_SUITE_P(

@@ -23,6 +23,7 @@
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/condition-variable.hh>
 
+#include <chrono>
 #include <optional>
 
 namespace transform::testing {
@@ -85,16 +86,38 @@ public:
 
     ss::future<> push_batch(model::record_batch batch);
 
+    /**
+     * Report having caught up, by returning an empty read when there is nothing
+     * at or past the requested offset, instead of waiting for a batch to be
+     * pushed.
+     *
+     * This mirrors the real `partition_source`, which short circuits to an
+     * empty reader once it has caught up to the end of the log. The default
+     * blocking behaviour hides `processor::poll_sleep` completely: `read_batch`
+     * never returns empty, so the processor never sleeps, and no test can
+     * observe how long the processor actually takes to pick up a newly appended
+     * record.
+     */
+    void set_empty_reads_when_caught_up(bool);
+
 private:
     absl::btree_map<kafka::offset, model::record_batch> _batches;
     ss::condition_variable _cond_var;
+    bool _empty_reads_when_caught_up = false;
 };
 
 class fake_sink : public sink {
 public:
     ss::future<> write(ss::chunked_fifo<model::record_batch> batches) override;
 
-    ss::future<model::record> read();
+    /**
+     * Read one record, waiting up to `timeout` for one to arrive.
+     *
+     * The timeout is a parameter because tests that exercise the processor's
+     * polling interval have to wait longer than a record normally takes.
+     */
+    ss::future<model::record>
+    read(std::chrono::milliseconds timeout = std::chrono::seconds(1));
     bool empty() const { return _records.empty(); }
 
     /**
