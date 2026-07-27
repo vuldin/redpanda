@@ -16,8 +16,10 @@
 #include "base/vlog.h"
 #include "ffi.h"
 #include "logger.h"
+#include "model/timestamp.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
 #include <seastar/core/print.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/later.hh>
@@ -36,17 +38,21 @@ namespace wasm::wasi {
 using unix_millis = std::chrono::milliseconds;
 
 namespace {
-// Return our clock resolution (1ms) in nanoseconds.
-constexpr std::chrono::milliseconds clock_resolution() {
-    // We only have millisecond resolution because we're using record
-    // timestamps as the clock value, and they only have millisecond
-    // resolution themselves.
+// REALTIME is sourced from model::timestamp::now(), which is itself
+// millisecond-resolution (see model/timestamp.h), so that's the best
+// resolution we can honestly report for it.
+constexpr std::chrono::milliseconds realtime_resolution() {
     return std::chrono::milliseconds(1);
 }
 
 constexpr timestamp_t to_timestamp(unix_millis ts) {
     using namespace std::chrono_literals;
     return timestamp_t(ts / 1ns);
+}
+
+constexpr timestamp_t to_timestamp(ss::steady_clock_type::duration d) {
+    return timestamp_t(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
 }
 } // namespace
 
@@ -71,20 +77,21 @@ preview1_module::preview1_module(
     }
 }
 
-void preview1_module::set_walltime(model::timestamp ts) {
-    _wall_time = unix_millis(ts.value());
-}
-
 // We don't have control over this API, so there will be some redundant
 // wrappers. NOLINTBEGIN(bugprone-easily-swappable-parameters)
 
 errno_t preview1_module::clock_res_get(clock_id_t id, timestamp_t* out) {
     switch (id) {
-    case REALTIME_CLOCK_ID:
+    case REALTIME_CLOCK_ID: {
+        *out = to_timestamp(realtime_resolution());
+        return ERRNO_SUCCESS;
+    }
     case MONOTONIC_CLOCK_ID:
     case PROCESS_CPUTIME_CLOCK_ID:
     case THREAD_CPUTIME_CLOCK_ID: {
-        *out = to_timestamp(clock_resolution());
+        // Report the native resolution of the underlying steady clock rather
+        // than a made-up value, now that we're backed by a real clock.
+        *out = to_timestamp(ss::steady_clock_type::duration(1));
         return ERRNO_SUCCESS;
     }
     default:
@@ -96,16 +103,26 @@ errno_t
 preview1_module::clock_time_get(clock_id_t id, timestamp_t, timestamp_t* out) {
     switch (id) {
     case REALTIME_CLOCK_ID: {
-        *out = to_timestamp(_wall_time);
+        // A genuine broker wall clock reading. This used to be derived from
+        // the timestamp of the record being processed, which a producer
+        // fully controls and can use to move the guest's notion of "now"
+        // forward, backward, or make it repeat. There's no cross-node
+        // deterministic-replay reliance on transform execution, so a real,
+        // not-necessarily-identical-across-replicas wall clock
+        // introduces no new determinism risk.
+        *out = to_timestamp(unix_millis(model::timestamp::now().value()));
         return ERRNO_SUCCESS;
     }
     case MONOTONIC_CLOCK_ID:
     case PROCESS_CPUTIME_CLOCK_ID:
     case THREAD_CPUTIME_CLOCK_ID: {
-        *out = to_timestamp(_monotonic_time);
-        // Increment by our minimal resolution here so that busy sleep loops
-        // used by languages by reading from the monotonic clock don't hang.
-        _monotonic_time += clock_resolution();
+        // A genuine monotonic clock reading. PROCESS_CPUTIME/THREAD_CPUTIME
+        // are approximated with the same wall-derived monotonic clock as
+        // MONOTONIC rather than real CPU-time accounting, same as the fake
+        // implementation this replaces did; that's an existing simplification
+        // this change doesn't attempt to fix, since nothing in-tree relies on
+        // genuine CPU-time semantics.
+        *out = to_timestamp(ss::steady_clock_type::now().time_since_epoch());
         return ERRNO_SUCCESS;
     }
     default:
