@@ -343,7 +343,18 @@ iobuf transformed_data::to_serialized_record(
     bytes od = vint::to_bytes(offset_delta);
     out.append(od.data(), od.size());
 
-    out.append(std::move(_data));
+    // append(iobuf&&) applies iobuf's general "pack small buffers together"
+    // heuristic (try_copy_append): it copies the incoming fragment if its
+    // size is at or below the destination's last allocation size (here,
+    // the small header reservation above), falling back to a zero-copy
+    // splice only once the payload is large enough to make copying not
+    // worth it. That's the right default for arbitrary small appends, but
+    // it means _data - the actual guest-produced record - would get a
+    // second copy for small payloads. append_fragments shares the
+    // underlying fragments (ref-counted, not copied) unconditionally, so
+    // this is one guest-to-host copy total regardless of payload size. See
+    // the PR-11 finding in the wasm roadmap doc.
+    out.append_fragments(std::move(_data));
 
     bytes encoded_size = vint::to_bytes(
       int64_t(out.size_bytes() - vint::max_length));
