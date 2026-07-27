@@ -23,10 +23,11 @@
 #include "wasi.h"
 
 #include <seastar/core/condition-variable.hh>
-#include <seastar/coroutine/maybe_yield.hh>
 
+#include <algorithm>
 #include <exception>
 #include <optional>
+#include <utility>
 
 namespace wasm {
 
@@ -58,8 +59,10 @@ struct write_options {
 
 } // namespace
 
-transform_module::transform_module(wasi::preview1_module* m)
-  : _wasi_module(m) {}
+transform_module::transform_module(
+  wasi::preview1_module* m, std::vector<model::topic> valid_output_topics)
+  : _wasi_module(m)
+  , _valid_output_topics(std::move(valid_output_topics)) {}
 
 ss::future<> transform_module::for_each_record_async(
   model::record_batch input, record_callback* cb) {
@@ -107,8 +110,19 @@ ss::future<> transform_module::for_each_record_async(
         .callback = cb,
       });
 
-    return host_wait_for_proccessing().finally(
-      [this] { _call_ctx = std::nullopt; });
+    // Draining is only attempted on the success path: a failure here means
+    // the engine is stopping or restarting (transform_module::stop() breaks
+    // the condition variables), and anything still buffered is lost exactly
+    // like any other in-flight state on error/restart (see G12 in the wasm
+    // roadmap doc) - not a new loss mode introduced by buffering writes.
+    try {
+        co_await host_wait_for_proccessing();
+        co_await drain_pending_writes();
+    } catch (...) {
+        _call_ctx = std::nullopt;
+        throw;
+    }
+    _call_ctx = std::nullopt;
 }
 
 void transform_module::check_abi_version_1() {
@@ -166,13 +180,13 @@ ss::future<int32_t> transform_module::read_batch_header(
     co_return _call_ctx->max_input_record_size;
 }
 
-ss::future<int32_t> transform_module::read_next_record(
+int32_t transform_module::read_next_record(
   uint8_t* attributes,
   int64_t* timestamp,
   model::offset* offset,
   ffi::array<uint8_t> buf) {
     if (!_call_ctx || _call_ctx->records.empty()) {
-        co_return NO_ACTIVE_TRANSFORM;
+        return NO_ACTIVE_TRANSFORM;
     }
 
     // Callback that we finished processing the previous record,
@@ -183,8 +197,6 @@ ss::future<int32_t> transform_module::read_next_record(
         _call_ctx->callback->post_record();
     }
 
-    co_await ss::coroutine::maybe_yield();
-
     auto record = _call_ctx->records.front();
     if (buf.size() < record.payload_size) {
         vlog(
@@ -193,7 +205,7 @@ ss::future<int32_t> transform_module::read_next_record(
           buf.size(),
           record.payload_size);
         // Buffer wrong size
-        co_return INVALID_BUFFER;
+        return INVALID_BUFFER;
     }
     _call_ctx->records.pop_front();
 
@@ -217,44 +229,89 @@ ss::future<int32_t> transform_module::read_next_record(
     // Call back so we can refuel.
     _call_ctx->callback->pre_record();
 
-    co_return int32_t(record.payload_size);
+    return int32_t(record.payload_size);
 }
 
-ss::future<int32_t> transform_module::write_record(ffi::array<uint8_t> buf) {
+int32_t transform_module::write_record(ffi::array<uint8_t> buf) {
     if (!_call_ctx) {
-        co_return NO_ACTIVE_TRANSFORM;
+        return NO_ACTIVE_TRANSFORM;
     }
     iobuf b;
     b.append(buf.data(), buf.size());
     auto d = model::transformed_data::create_validated(std::move(b));
     if (!d) {
-        co_return INVALID_BUFFER;
+        return INVALID_BUFFER;
     }
-    auto success = co_await _call_ctx->callback->emit(
-      std::nullopt, *std::move(d));
-    co_return success ? int32_t(buf.size()) : INVALID_WRITE;
+    _call_ctx->pending_writes.emplace_back(std::nullopt, *std::move(d));
+    return int32_t(buf.size());
 }
 
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-ss::future<int32_t> transform_module::write_record_with_options(
+int32_t transform_module::write_record_with_options(
   ffi::array<uint8_t> buf, ffi::array<uint8_t> options_buf) {
     // NOLINTEND(bugprone-easily-swappable-parameters)
     if (!_call_ctx) {
-        co_return NO_ACTIVE_TRANSFORM;
+        return NO_ACTIVE_TRANSFORM;
     }
     iobuf b;
     b.append(buf.data(), buf.size());
     auto d = model::transformed_data::create_validated(std::move(b));
     if (!d) {
-        co_return INVALID_BUFFER;
+        return INVALID_BUFFER;
     }
     auto options = write_options::parse(options_buf);
     if (!options) {
-        co_return INVALID_BUFFER;
+        return INVALID_BUFFER;
     }
-    auto success = co_await _call_ctx->callback->emit(
-      options->topic, *std::move(d));
-    co_return success ? int32_t(buf.size()) : INVALID_WRITE;
+    if (!is_valid_output_topic(options->topic)) {
+        return INVALID_WRITE;
+    }
+    // Own the topic name: options_buf is guest memory, only valid for the
+    // duration of this call, but pending_writes outlives it.
+    std::optional<model::topic> owned_topic;
+    if (options->topic) {
+        owned_topic = model::topic(*options->topic);
+    }
+    _call_ctx->pending_writes.emplace_back(
+      std::move(owned_topic), *std::move(d));
+    return int32_t(buf.size());
+}
+
+bool transform_module::is_valid_output_topic(
+  const std::optional<model::topic_view>& topic) const {
+    if (!topic) {
+        return true;
+    }
+    return std::ranges::any_of(
+      _valid_output_topics, [&topic](const model::topic& valid) {
+          return model::topic_view(valid) == *topic;
+      });
+}
+
+ss::future<> transform_module::drain_pending_writes() {
+    if (!_call_ctx) {
+        co_return;
+    }
+    auto pending = std::exchange(_call_ctx->pending_writes, {});
+    while (!pending.empty()) {
+        auto [topic, data] = std::move(pending.front());
+        pending.pop_front();
+        std::optional<model::topic_view> topic_view;
+        if (topic) {
+            topic_view = model::topic_view(*topic);
+        }
+        auto success = co_await _call_ctx->callback->emit(
+          topic_view, std::move(data));
+        if (success == write_success::no) {
+            // Should be unreachable: write_record_with_options already
+            // validated the topic synchronously via is_valid_output_topic.
+            vlog(
+              wasm_log.error,
+              "dropped a buffered transform write to output topic {} that "
+              "passed synchronous validation",
+              topic);
+        }
+    }
 }
 
 void transform_module::start() {

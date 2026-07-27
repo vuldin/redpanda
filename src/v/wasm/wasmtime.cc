@@ -468,6 +468,16 @@ make_environment_vars(const model::transform_metadata& meta) {
     return env;
 }
 
+std::vector<model::topic>
+extract_output_topics(const model::transform_metadata& meta) {
+    std::vector<model::topic> topics;
+    topics.reserve(meta.output_topics.size());
+    for (const auto& tn : meta.output_topics) {
+        topics.push_back(tn.tp);
+    }
+    return topics;
+}
+
 class wasmtime_engine : public engine {
 public:
     wasmtime_engine(
@@ -485,7 +495,7 @@ public:
       , _sr_module(sr)
       , _wasi_module(
           {_meta.name()}, make_environment_vars(_meta), _logger.get())
-      , _transform_module(&_wasi_module) {}
+      , _transform_module(&_wasi_module, extract_output_topics(_meta)) {}
     wasmtime_engine(const wasmtime_engine&) = delete;
     wasmtime_engine& operator=(const wasmtime_engine&) = delete;
     wasmtime_engine(wasmtime_engine&&) = delete;
