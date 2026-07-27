@@ -90,22 +90,6 @@ public:
     ss::future<> stop();
 
     /**
-     * When moving nodes, we need to give the previous node a chance to commit
-     * the pending interval otherwise leadership changes will likely cause
-     * duplicate processing.
-     *
-     * While the duplicates are inevitable in our current system, reduce the
-     * likelyhood of these by waiting for the previous node to flush it's commit
-     * offsets. We do this by assuming every node has the same commit interval
-     * and waiting for one commit interval to pass. This is a best effort to
-     * allow for flushing at the cost of latency. However, we mostly try to keep
-     * leadership stable, so this should not make a large difference in
-     * practice.
-     */
-    ss::future<>
-    wait_for_previous_flushes(model::transform_offsets_key, ss::abort_source*);
-
-    /**
      * Preload the coordinator information for a given key.
      *
      * This is not a requirement as partitions can change and internally the

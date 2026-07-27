@@ -320,12 +320,14 @@ public:
       model::partition_id pid,
       uint32_t output_topic_count,
       rpc::client* client,
-      commit_batcher<>* batcher)
+      commit_batcher<>* batcher,
+      ss::lw_shared_ptr<cluster::partition> partition_for_term)
       : _id(tid)
       , _partition(pid)
       , _output_topic_count(output_topic_count)
       , _client(client)
-      , _batcher(batcher) {}
+      , _batcher(batcher)
+      , _partition_for_term(std::move(partition_for_term)) {}
 
     ss::future<> start() override { return ss::now(); }
 
@@ -339,19 +341,6 @@ public:
             _batcher->unload(key);
         }
         return ss::now();
-    }
-
-    ss::future<> wait_for_previous_flushes(ss::abort_source* as) override {
-        return ss::parallel_for_each(
-          boost::irange(_output_topic_count),
-          [this, as](model::output_topic_index idx) {
-              model::transform_offsets_key key = {
-                .id = _id,
-                .partition = _partition,
-                .output_topic = idx,
-              };
-              return _batcher->wait_for_previous_flushes(key, as);
-          });
     }
 
     ss::future<absl::flat_hash_map<model::output_topic_index, kafka::offset>>
@@ -392,7 +381,15 @@ public:
           .partition = _partition,
           .output_topic = index,
         };
-        return _batcher->commit_offset(key, {.offset = offset});
+        // Fences a stale flush from a superseded owner of this partition
+        // against a fresher commit - see distributed_kv_stm's
+        // should_replace() customization point and the PR-06 finding in the
+        // wasm roadmap doc. Falls back to term_id{} (treated as the oldest
+        // possible epoch) if there's no local raft group to ask, e.g. a
+        // benign race with the partition being removed.
+        model::term_id epoch = _partition_for_term ? _partition_for_term->term()
+                                                   : model::term_id{};
+        return _batcher->commit_offset(key, {.offset = offset, .epoch = epoch});
     }
 
 private:
@@ -401,6 +398,7 @@ private:
     model::output_topic_index _output_topic_count;
     rpc::client* _client;
     commit_batcher<>* _batcher;
+    ss::lw_shared_ptr<cluster::partition> _partition_for_term;
 };
 
 using wasm_engine_factory = ss::noncopyable_function<
@@ -454,7 +452,12 @@ public:
         }
 
         auto offset_tracker = std::make_unique<offset_tracker_impl>(
-          id, ntp.tp.partition, meta.output_topics.size(), _client, _batcher);
+          id,
+          ntp.tp.partition,
+          meta.output_topics.size(),
+          _client,
+          _batcher,
+          partition_for_wait);
 
         co_return std::make_unique<processor>(
           id,

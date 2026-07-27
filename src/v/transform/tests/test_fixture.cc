@@ -244,8 +244,4 @@ ss::future<> fake_offset_tracker::wait_for_committed_offset(
       .handle_exception([](auto) { throw commit_wait_timed_out(); });
 }
 
-ss::future<> fake_offset_tracker::wait_for_previous_flushes(ss::abort_source*) {
-    co_return;
-}
-
 } // namespace transform::testing

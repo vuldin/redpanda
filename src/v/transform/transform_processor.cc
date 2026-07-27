@@ -197,7 +197,6 @@ ss::future<> processor::stop() {
 
 ss::future<absl::flat_hash_map<model::output_topic_index, kafka::offset>>
 processor::load_latest_committed() {
-    co_await _offset_tracker->wait_for_previous_flushes(&_as);
     auto latest_committed = co_await _offset_tracker->load_committed_offsets();
     auto latest = _source->latest_offset();
     auto start = _source->start_offset();

@@ -710,12 +710,14 @@ class DataTransformsLeadershipChangingTest(BaseDataTransformsTest):
                 # Disable leader balancer, as this test is doing its own
                 # leadership transfers and the balancer would interfere
                 "enable_leader_balancer": False,
-                # Lower the delay before we start processing.
-                # In slow debug mode tests the default here is
-                # three seconds, and we have to wait on leadership
-                # transfer this long for commits to be flushed, so
-                # we can more easily timeout with the long wait.
-                "data_transforms_commit_interval_ms": 500,
+                # NOTE: data_transforms_commit_interval_ms used to be lowered
+                # to 500 here because a leadership transfer waited out the
+                # commit interval for pending commits to flush, and the 3s
+                # default made this test prone to timing out. That wait is
+                # gone - commits are fenced by epoch instead, so a stale
+                # commit is rejected rather than waited for - and the override
+                # is deliberately not replaced: running at the default is what
+                # makes this test able to catch a regression of that fencing.
             },
             **kwargs,
         )
