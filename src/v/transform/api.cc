@@ -30,6 +30,7 @@
 #include "model/timeout_clock.h"
 #include "model/timestamp.h"
 #include "model/transform.h"
+#include "raft/consensus.h"
 #include "ssx/future-util.h"
 #include "transform/logging/log_manager.h"
 #include "transform/logging/rpc_client.h"
@@ -47,6 +48,7 @@
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/coroutine/exception.hh>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -127,8 +129,11 @@ private:
 
 class partition_source final : public source {
 public:
-    explicit partition_source(kafka::partition_proxy p)
-      : _partition(std::move(p)) {}
+    explicit partition_source(
+      kafka::partition_proxy p,
+      ss::lw_shared_ptr<cluster::partition> partition_for_wait)
+      : _partition(std::move(p))
+      , _partition_for_wait(std::move(partition_for_wait)) {}
 
     ss::future<> start() final {
         _gate = {};
@@ -228,11 +233,46 @@ public:
           std::move(tracker), std::move(translater.reader));
     }
 
+    ss::future<> wait_for_offset(
+      kafka::offset offset,
+      model::timeout_clock::time_point deadline,
+      ss::abort_source* as) final {
+        auto consensus = _partition_for_wait ? _partition_for_wait->raft()
+                                             : nullptr;
+        if (!consensus) {
+            // No local Raft group to subscribe to - this partition may have
+            // moved away from this shard between processor creation and now.
+            // Fall back to just waiting out the deadline so the caller's own
+            // retry loop still makes progress; it will pick up a fresh
+            // partition_source the next time the processor is (re)created.
+            co_await ss::sleep_abortable<ss::lowres_clock>(
+              std::chrono::duration_cast<ss::lowres_clock::duration>(
+                deadline - model::timeout_clock::now()),
+              *as)
+              .handle_exception([](const std::exception_ptr&) {});
+            co_return;
+        }
+        // This only promises that `offset` is *likely* visible once it
+        // resolves - `_last_applied` tracks Raft's visible offset, which can
+        // momentarily lead the Kafka last stable offset while a transaction is
+        // open. Callers always re-check via `read_batch` regardless, so a
+        // spurious wakeup here just costs one extra (still empty) read.
+        co_await consensus->visible_offset_monitor()
+          .wait(kafka::offset_cast(offset), deadline, *as)
+          .handle_exception([](const std::exception_ptr&) {});
+    }
+
 private:
     // This gate is only to guard against the case when the abort has fired and
     // there is still a live future that holds a reference to _partition.
     ss::gate _gate;
     kafka::partition_proxy _partition;
+    // Held separately from `_partition` so that `wait_for_offset` can reach
+    // Raft's offset_monitor directly, the same way the Kafka fetch handler
+    // does for long-poll. May be null if the partition could not be found at
+    // construction time, in which case waits just fall back to their
+    // deadline.
+    ss::lw_shared_ptr<cluster::partition> _partition_for_wait;
 };
 
 class registry_adapter : public registry {
@@ -396,7 +436,14 @@ public:
         if (!partition) {
             throw std::runtime_error("unable to create transform source");
         }
-        auto src = std::make_unique<partition_source>(*std::move(partition));
+        // Held alongside the partition_proxy so partition_source can wait on
+        // Raft's offset_monitor directly, the same way the Kafka fetch
+        // handler does for long-poll. May be null (e.g. a benign race with
+        // the partition being removed) - partition_source falls back to its
+        // deadline in that case.
+        auto partition_for_wait = _partition_manager->get(ntp);
+        auto src = std::make_unique<partition_source>(
+          *std::move(partition), std::move(partition_for_wait));
 
         std::vector<std::unique_ptr<sink>> sinks;
         sinks.reserve(meta.output_topics.size());
