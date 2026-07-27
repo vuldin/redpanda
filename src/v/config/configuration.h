@@ -143,6 +143,7 @@ struct configuration final : public config_store {
     property<size_t> data_transforms_logging_line_max_bytes;
     bounded_property<size_t> data_transforms_read_buffer_memory_percentage;
     bounded_property<size_t> data_transforms_write_buffer_memory_percentage;
+    bounded_property<int16_t> data_transforms_scheduling_group_shares;
 
     // Controller
     bounded_property<std::optional<std::size_t>> topic_memory_per_partition;

@@ -155,7 +155,7 @@ public:
     ss::scheduling_group archival_upload() { return _archival_upload; }
     ss::scheduling_group raft_heartbeats() { return _raft_heartbeats; }
     ss::scheduling_group self_test_sg() { return _self_test; }
-    ss::scheduling_group transforms_sg() { return _transforms; }
+    ss::scheduling_group transforms_sg() const { return _transforms; }
     ss::scheduling_group datalake_sg() { return _datalake; }
     /**
      * @brief Scheduling group for fetch requests.

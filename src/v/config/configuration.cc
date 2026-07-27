@@ -287,6 +287,22 @@ configuration::configuration()
       },
       45,
       {.min = 1, .max = 99})
+  , data_transforms_scheduling_group_shares(
+      *this,
+      "data_transforms_scheduling_group_shares",
+      "The CPU shares allotted to the scheduling group data transforms run "
+      "in, relative to other scheduling groups such as `kafka`, `fetch`, and "
+      "`produce`, which each run at 1000. The default is deliberately low "
+      "so that transforms cannot starve request handling; raise it if "
+      "transforms are falling behind under load and CPU is the bottleneck. "
+      "Takes effect live, without a restart.",
+      {
+        .needs_restart = needs_restart::no,
+        .example = "1000",
+        .visibility = visibility::tunable,
+      },
+      100,
+      {.min = 1, .max = 1000})
   , topic_memory_per_partition(
       *this,
       "topic_memory_per_partition",
