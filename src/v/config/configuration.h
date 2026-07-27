@@ -135,6 +135,7 @@ struct configuration final : public config_store {
     property<std::chrono::milliseconds> data_transforms_commit_interval_ms;
     bounded_property<size_t> data_transforms_per_core_memory_reservation;
     bounded_property<size_t> data_transforms_per_function_memory_limit;
+    bounded_property<size_t> data_transforms_max_instances_per_core;
     property<std::chrono::milliseconds> data_transforms_runtime_limit_ms;
     bounded_property<size_t> data_transforms_binary_max_size;
     bounded_property<size_t> data_transforms_logging_buffer_capacity_bytes;

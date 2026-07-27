@@ -194,10 +194,15 @@ configuration::configuration()
       *this,
       "data_transforms_per_core_memory_reservation",
       "The amount of memory to reserve per core for data transform (Wasm) "
-      "virtual machines. Memory is reserved on boot. The maximum number of "
-      "functions that can be deployed to a cluster is equal to "
+      "virtual machines. Memory is reserved on boot. Unless "
+      "`data_transforms_max_instances_per_core` is set, the number of "
+      "concurrent transform instances per core is "
       "`data_transforms_per_core_memory_reservation` / "
-      "`data_transforms_per_function_memory_limit`.",
+      "`data_transforms_per_function_memory_limit` - which means raising "
+      "the per-function limit without also raising this reservation can "
+      "silently reduce concurrency to zero. Prefer setting "
+      "`data_transforms_max_instances_per_core` directly instead of sizing "
+      "this to work backwards from a desired instance count.",
       {
         .needs_restart = needs_restart::yes,
         .example = std::to_string(25_MiB),
@@ -210,9 +215,11 @@ configuration::configuration()
       *this,
       "data_transforms_per_function_memory_limit",
       "The amount of memory to give an instance of a data transform (Wasm) "
-      "virtual machine. The maximum number of functions that can be deployed "
-      "to a cluster is equal to `data_transforms_per_core_memory_reservation` "
-      "/ `data_transforms_per_function_memory_limit`.",
+      "virtual machine. Can be raised to GiB scale for transforms with "
+      "substantial working-set requirements; pair with "
+      "`data_transforms_max_instances_per_core` to control concurrency "
+      "independently of this size, rather than inflating "
+      "`data_transforms_per_core_memory_reservation` to match.",
       {
         .needs_restart = needs_restart::yes,
         .example = std::to_string(5_MiB),
@@ -222,6 +229,24 @@ configuration::configuration()
       2_MiB,
       // WebAssembly uses 64KiB pages and has a 32bit address space
       {.min = 64_KiB, .max = 4_GiB})
+  , data_transforms_max_instances_per_core(
+      *this,
+      "data_transforms_max_instances_per_core",
+      "The number of concurrent data transform (Wasm) virtual machine "
+      "instances to pre-carve per core, each sized by "
+      "`data_transforms_per_function_memory_limit`. When set (non-zero), "
+      "this takes precedence over deriving the instance count from "
+      "`data_transforms_per_core_memory_reservation` / "
+      "`data_transforms_per_function_memory_limit`, and the effective "
+      "per-core reservation becomes the product of the two. Leave at the "
+      "default of 0 to keep the legacy division-based behavior.",
+      {
+        .needs_restart = needs_restart::yes,
+        .example = "4",
+        .visibility = visibility::user,
+      },
+      0,
+      {.min = 0, .max = 1024})
   , data_transforms_runtime_limit_ms(
       *this,
       "data_transforms_runtime_limit_ms",
