@@ -131,7 +131,7 @@ private:
     ss::future<> cleanup_wasm_binary(uuid_t);
 
     ss::future<ss::optimized_optional<ss::shared_ptr<wasm::engine>>>
-      create_engine(model::transform_metadata);
+      create_engine(model::ntp, model::transform_metadata);
 
     ss::future<
       ss::optimized_optional<ss::foreign_ptr<ss::shared_ptr<wasm::factory>>>>

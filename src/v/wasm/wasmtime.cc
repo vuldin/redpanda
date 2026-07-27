@@ -1286,8 +1286,12 @@ public:
       , _sr(sr) {}
 
     // This can be invoked on any shard and must be thread safe.
+    //
+    // This factory always creates a fresh engine, so which partition it will
+    // process makes no difference here - caching per partition is the caching
+    // factory's concern, one layer up.
     ss::future<ss::shared_ptr<engine>>
-    make_engine(std::unique_ptr<wasm::logger> logger) final {
+    make_engine(model::ntp, std::unique_ptr<wasm::logger> logger) final {
         auto copy = co_await _preinitialized.copy();
         co_return ss::make_shared<wasmtime_engine>(
           _runtime, _meta, std::move(copy), _sr, std::move(logger));

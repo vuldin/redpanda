@@ -405,7 +405,7 @@ private:
 
 using wasm_engine_factory = ss::noncopyable_function<
   ss::future<ss::optimized_optional<ss::shared_ptr<wasm::engine>>>(
-    model::transform_metadata)>;
+    model::ntp, model::transform_metadata)>;
 
 class proc_factory : public processor_factory {
 public:
@@ -428,7 +428,7 @@ public:
       processor::state_callback cb,
       probe* p,
       memory_limits* ml) final {
-        auto engine = co_await _wasm_engine_factory(meta);
+        auto engine = co_await _wasm_engine_factory(ntp, meta);
         if (!engine) {
             throw std::runtime_error("unable to create wasm engine");
         }
@@ -586,8 +586,8 @@ ss::future<> service::start() {
       std::make_unique<registry_adapter>(
         &_plugin_frontend->local(), &_partition_manager->local()),
       std::make_unique<proc_factory>(
-        [this](model::transform_metadata meta) {
-            return create_engine(std::move(meta));
+        [this](model::ntp ntp, model::transform_metadata meta) {
+            return create_engine(std::move(ntp), std::move(meta));
         },
         &_topic_table->local(),
         &_partition_manager->local(),
@@ -789,14 +789,15 @@ ss::future<> service::cleanup_wasm_binary(uuid_t key) {
 }
 
 ss::future<ss::optimized_optional<ss::shared_ptr<wasm::engine>>>
-service::create_engine(model::transform_metadata meta) {
+service::create_engine(model::ntp ntp, model::transform_metadata meta) {
     auto logger = std::make_unique<transform::logger>(
       meta.name, _log_manager.get());
     auto factory = co_await get_factory(std::move(meta));
     if (!factory) {
         co_return ss::shared_ptr<wasm::engine>(nullptr);
     }
-    co_return co_await (*factory)->make_engine(std::move(logger));
+    co_return co_await (*factory)->make_engine(
+      std::move(ntp), std::move(logger));
 }
 
 ss::future<
