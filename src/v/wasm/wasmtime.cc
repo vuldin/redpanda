@@ -50,11 +50,14 @@
 
 #include <algorithm>
 #include <alloca.h>
+#include <atomic>
+#include <chrono>
 #include <csignal>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 #include <variant>
@@ -77,9 +80,15 @@ constexpr size_t max_host_function_stack_usage = vm_stack_size
                                                  - max_vm_guest_stack_usage
                                                  - 4_KiB;
 
-// This amount of fuel allows the VM to run for about 1 millisecond for an
-// infinite loop workload on x86_64.
-constexpr uint64_t millisecond_fuel_amount = 2'000'000;
+// How many engine-epoch ticks ahead of "now" to arm the next epoch deadline
+// check for. The ticker (see wasmtime_runtime::run_epoch_ticker) increments
+// the engine-global epoch roughly once per millisecond, so re-arming by this
+// many ticks each time gives ~1ms checkpoints - the same granularity fuel's
+// async-yield-interval gave, but epoch checks are a cheap counter comparison
+// at function entries/loop backedges rather than a fuel decrement on every
+// relevant instruction, so there's no per-instruction instrumentation tax to
+// pay for it. See the PR-07 finding in the wasm roadmap doc.
+constexpr uint64_t epoch_ticks_per_check = 1;
 
 // The reserved memory for an instance of a WebAssembly VM.
 //
@@ -161,10 +170,16 @@ public:
 
     engine_probe_cache* engine_probe_cache();
 
-    size_t per_invocation_fuel_amount() const;
+    std::chrono::milliseconds per_invocation_timeout() const;
 
 private:
     void register_metrics();
+
+    // Runs on _alien_thread: increments the engine-global epoch roughly
+    // once per millisecond until stop() requests it to exit. Off-reactor
+    // because a Seastar timer on the same shard can't fire while that
+    // reactor thread is inside Wasmtime executing guest code.
+    void run_epoch_ticker();
 
     static wasmtime_error_t* allocate_stack_memory(
       void* env, size_t size, bool zeroed, wasmtime_stack_memory_t* memory_ret);
@@ -195,7 +210,15 @@ private:
     size_t _total_executable_memory = 0;
     metrics::public_metric_groups _public_metrics;
     ss::sharded<wasm::engine_probe_cache> _engine_probe_cache;
-    size_t _per_invocation_fuel_amount = 0;
+    std::chrono::milliseconds _per_invocation_timeout{0};
+    std::atomic<bool> _epoch_ticker_stop{false};
+    // A dedicated OS thread, not a task submitted to _alien_thread: the
+    // latter is a single-worker task queue meant for short-lived, one-shot
+    // work (compiling a module, querying memory usage) - a task that never
+    // returns, like this ticker's loop, would permanently occupy that one
+    // worker thread and starve every other submission to _alien_thread
+    // forever. See the PR-07 finding in the wasm roadmap doc.
+    std::thread _epoch_ticker_thread;
 };
 
 void check_error(const wasmtime_error_t* error) {
@@ -567,6 +590,18 @@ public:
         _pending_host_function.emplace(std::move(fut));
     }
 
+    // Arms this engine's deadline (checked by epoch_deadline_reached) at
+    // `timeout` from now, and arms the store's epoch deadline to fire the
+    // callback again soon so that check actually happens promptly. Public
+    // because invoke_transform's local callback_impl class calls this on a
+    // wasmtime_engine* it's handed, rather than relying on a local class's
+    // access to its enclosing class's private members.
+    void
+    reset_deadline(wasmtime_context_t* ctx, std::chrono::milliseconds timeout) {
+        _current_deadline = ss::steady_clock_type::now() + timeout;
+        wasmtime_context_set_epoch_deadline(ctx, epoch_ticks_per_check);
+    }
+
 private:
     uint64_t memory_usage_size_bytes() const {
         if (!_store) {
@@ -591,11 +626,28 @@ private:
         _probe.report_memory_usage(memory_usage_size_bytes());
     }
 
-    void reset_fuel(wasmtime_context_t* ctx) {
-        handle<wasmtime_error_t, wasmtime_error_delete> error(
-          wasmtime_context_set_fuel(
-            ctx, _runtime->per_invocation_fuel_amount()));
-        check_error(error.get());
+    // The epoch-deadline callback registered per-store in create_instance().
+    // Wasmtime calls this whenever the running call's epoch deadline has
+    // been reached. Traps if the *wall-clock* deadline (not just the epoch
+    // tick count) has actually passed, otherwise re-arms for another
+    // ~1ms-out check and yields to the async host in between - this is the
+    // replacement for fuel's async-yield-interval, at a much lower
+    // instrumentation cost since epoch checks are cheap counter comparisons
+    // rather than a fuel decrement on every relevant instruction.
+    static wasmtime_error_t* epoch_deadline_reached(
+      wasmtime_context_t*,
+      void* data,
+      uint64_t* epoch_deadline_delta,
+      wasmtime_update_deadline_kind_t* update_kind) {
+        auto* self = static_cast<wasmtime_engine*>(data);
+        if (ss::steady_clock_type::now() >= self->_current_deadline) {
+            return wasmtime_error_new(
+              "wasm invocation exceeded its configured runtime limit");
+        }
+        *epoch_deadline_delta = epoch_ticks_per_check;
+        *update_kind = static_cast<wasmtime_update_deadline_kind_t>(
+          WASMTIME_UPDATE_DEADLINE_YIELD);
+        return nullptr;
     }
 
     /**
@@ -657,10 +709,13 @@ private:
         _probe.report_memory_usage(0);
         auto* context = wasmtime_store_context(store.get());
 
-        wasmtime_context_fuel_async_yield_interval(
-          context, millisecond_fuel_amount);
+        wasmtime_store_epoch_deadline_callback(
+          store.get(),
+          &wasmtime_engine::epoch_deadline_reached,
+          /*data=*/this,
+          /*finalizer=*/nullptr);
 
-        reset_fuel(context);
+        reset_deadline(context, _runtime->per_invocation_timeout());
 
         _wasi_module.set_walltime(model::timestamp::min());
 
@@ -732,7 +787,7 @@ private:
       const wasmtime_func_t* func,
       std::span<const wasmtime_val_t> args,
       std::span<wasmtime_val_t> results) {
-        reset_fuel(ctx);
+        reset_deadline(ctx, _runtime->per_invocation_timeout());
         handle<wasmtime_error_t, wasmtime_error_delete> error;
         handle<wasm_trap_t, wasm_trap_delete> trap;
 
@@ -807,18 +862,18 @@ private:
         public:
             callback_impl(
               wasmtime_context_t* context,
-              size_t fuel_amt,
+              wasmtime_engine* engine,
+              std::chrono::milliseconds timeout,
               transform_callback cb,
               transform_probe* p)
               : _context(context)
-              , _fuel_amt(fuel_amt)
+              , _engine(engine)
+              , _timeout(timeout)
               , _cb(std::move(cb))
               , _probe(p) {}
 
             void pre_record() final {
-                handle<wasmtime_error_t, wasmtime_error_delete> error(
-                  wasmtime_context_set_fuel(_context, _fuel_amt));
-                check_error(error.get());
+                _engine->reset_deadline(_context, _timeout);
                 _measurement = _probe->latency_measurement();
             }
 
@@ -832,14 +887,16 @@ private:
 
         private:
             wasmtime_context_t* _context;
-            size_t _fuel_amt;
+            wasmtime_engine* _engine;
+            std::chrono::milliseconds _timeout;
             transform_callback _cb;
             transform_probe* _probe;
             std::unique_ptr<transform_probe::hist_t::measurement> _measurement;
         };
         callback_impl callback(
           wasmtime_store_context(_store.get()),
-          _runtime->per_invocation_fuel_amount(),
+          this,
+          _runtime->per_invocation_timeout(),
           std::move(cb),
           p);
 
@@ -862,6 +919,12 @@ private:
     wasmtime_instance_t _instance{};
     std::optional<ss::future<>> _pending_host_function;
     ss::future<> _main_task = ss::now();
+    // The wall-clock deadline for whatever call is currently running on this
+    // engine's store (startup, or the current record) - checked by
+    // epoch_deadline_reached whenever the epoch-tick callback fires. See
+    // reset_deadline and the PR-07 finding in the wasm roadmap doc.
+    ss::steady_clock_type::time_point _current_deadline
+      = ss::steady_clock_type::time_point::max();
 };
 
 // If strict stack checking is configured
@@ -1320,8 +1383,15 @@ wasmtime_runtime::wasmtime_runtime(std::unique_ptr<schema::registry> sr)
 
     // Spend more time compiling so that we can have faster code.
     wasmtime_config_cranelift_opt_level_set(config, WASMTIME_OPT_LEVEL_SPEED);
-    // Fuel allows us to stop execution after some time.
-    wasmtime_config_consume_fuel_set(config, true);
+    // Epoch interruption lets us stop execution after some time, and yield
+    // periodically during a long-running call, at a much lower instrumentation
+    // cost than fuel consumption (a cheap counter comparison at function
+    // entries/loop backedges, instead of a decrement on every relevant
+    // instruction). The engine-global epoch is ticked by run_epoch_ticker;
+    // per-store/per-call deadlines are set via wasmtime_context_set_epoch_
+    // deadline and enforced/extended by the callback registered in
+    // create_instance().
+    wasmtime_config_epoch_interruption_set(config, true);
     // We want to enable memcopy and other efficent memcpy operators
     wasmtime_config_wasm_bulk_memory_set(config, true);
     // Our build disables this feature, so we don't need to turn it
@@ -1372,9 +1442,7 @@ wasmtime_runtime::wasmtime_runtime(std::unique_ptr<schema::registry> sr)
 }
 
 ss::future<> wasmtime_runtime::start(runtime::config c) {
-    using namespace std::chrono_literals;
-    _per_invocation_fuel_amount = (c.cpu.per_invocation_timeout / 1ms)
-                                  * millisecond_fuel_amount;
+    _per_invocation_timeout = c.cpu.per_invocation_timeout;
 
     size_t page_size = ::getpagesize();
     size_t aligned_pool_size = ss::align_down(
@@ -1419,6 +1487,13 @@ ss::future<> wasmtime_runtime::start(runtime::config c) {
         .tracking_enabled = c.stack_memory.debug_host_stack_usage,
       });
     co_await _alien_thread.start({.name = "wasm"});
+    // The epoch counter is engine-global (one wasm_engine_t serves every
+    // shard, see construct_single_service(_wasm_runtime, ...) in
+    // application_runtime.cc), so one ticker thread is enough to serve all
+    // shards; deadlines themselves stay per-store/per-call. This is a
+    // dedicated std::thread, not a task submitted to _alien_thread - see the
+    // comment on _epoch_ticker_thread for why.
+    _epoch_ticker_thread = std::thread([this] { run_epoch_ticker(); });
     co_await ss::smp::invoke_on_all([] {
         // wasmtime needs some signals for it's handling, make sure we
         // unblock them.
@@ -1430,6 +1505,13 @@ ss::future<> wasmtime_runtime::start(runtime::config c) {
     });
     co_await _engine_probe_cache.start();
     register_metrics();
+}
+
+void wasmtime_runtime::run_epoch_ticker() {
+    while (!_epoch_ticker_stop.load(std::memory_order_relaxed)) {
+        wasmtime_engine_increment_epoch(_engine.get());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 void wasmtime_runtime::register_metrics() {
@@ -1450,6 +1532,12 @@ void wasmtime_runtime::register_metrics() {
 ss::future<> wasmtime_runtime::stop() {
     _public_metrics.clear();
     co_await _engine_probe_cache.stop();
+    // Signal the ticker thread to exit, then join it - bounded by its own
+    // ~1ms sleep granularity, so this is a short wait, not an unbounded one.
+    // Joining is a blocking call, so do it via _alien_thread rather than on
+    // the reactor thread directly.
+    _epoch_ticker_stop.store(true, std::memory_order_relaxed);
+    co_await _alien_thread.submit([this] { _epoch_ticker_thread.join(); });
     co_await _alien_thread.stop();
     co_await _heap_allocator.stop();
     co_await _stack_allocator.stop();
@@ -1525,8 +1613,8 @@ heap_allocator* wasmtime_runtime::heap_allocator() {
 engine_probe_cache* wasmtime_runtime::engine_probe_cache() {
     return &_engine_probe_cache.local();
 }
-size_t wasmtime_runtime::per_invocation_fuel_amount() const {
-    return _per_invocation_fuel_amount;
+std::chrono::milliseconds wasmtime_runtime::per_invocation_timeout() const {
+    return _per_invocation_timeout;
 }
 
 wasmtime_error_t* wasmtime_runtime::allocate_stack_memory(
