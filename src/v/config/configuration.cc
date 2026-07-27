@@ -3992,6 +3992,25 @@ configuration::configuration()
       "interval specified by this property.",
       {.needs_restart = needs_restart::no, .visibility = visibility::user},
       300s)
+  , wasm_trusted_modules(
+      *this,
+      "wasm_trusted_modules",
+      "Allowlist of specific wasm binaries, identified by their own SHA-256 "
+      "digest, granted elevated capabilities beyond the default wasm "
+      "transform sandbox (e.g. real outbound networking to a fixed set of "
+      "targets). Trust follows the exact binary, not the transform name - "
+      "redeploying different code under an already-trusted transform name "
+      "does not inherit these capabilities.",
+      {
+        .needs_restart = needs_restart::no,
+        .example
+        = R"([{'sha256': '<64 hex chars>', 'capabilities': ['network'], 'allowed_targets': [{'address': 'refdata.internal', 'port': 443}]}])",
+        .visibility = visibility::user,
+      },
+      {},
+      [](auto& v) {
+          return validate_wasm_trusted_modules(v.cbegin(), v.cend());
+      })
   , enable_schema_id_validation(
       *this,
       std::vector<pandaproxy::schema_registry::schema_id_validation_mode>{
