@@ -11,6 +11,7 @@
 #pragma once
 
 #include "absl/container/flat_hash_map.h"
+#include "model/timestamp.h"
 #include "model/transform.h"
 #include "wasm/transform_probe.h"
 
@@ -34,6 +35,32 @@ public:
     void state_change(processor_state_change);
     void report_lag(model::output_topic_index, int64_t delta);
 
+    /**
+     * Record how old a batch was when the processor began working on it, from
+     * that batch's max timestamp.
+     *
+     * Read this together with lag. A caught-up transform is only as old as the
+     * delay before it noticed the record, so this isolates input-side delay
+     * from time spent doing work. A transform working through a backlog is
+     * instead reading records that were already old when it got to them, so
+     * this reports that age rather than any slowness on our part.
+     */
+    void record_input_delay(model::timestamp source_batch_timestamp);
+
+    /**
+     * Record the total time from a batch being appended to the input topic to
+     * the output derived from it being written and its progress committed, from
+     * that batch's max timestamp.
+     *
+     * This covers every stage of the pipeline, unlike
+     * `transform_execution_latency_sec`, which covers only time spent inside
+     * the VM and so excludes input delay, queueing, and the write path. The
+     * same caught-up-versus-backlog caveat as `record_input_delay` applies. For
+     * a transform with several output topics this records one sample per output
+     * topic, since each is written and committed independently.
+     */
+    void record_e2e_latency(model::timestamp source_batch_timestamp);
+
 private:
     friend class ProcessorTestFixture;
 
@@ -43,6 +70,8 @@ private:
     std::vector<uint64_t> _lag;
     absl::flat_hash_map<model::transform_report::processor::state, uint64_t>
       _processor_state;
+    hist_t _input_delay;
+    hist_t _e2e_latency;
 };
 
 } // namespace transform

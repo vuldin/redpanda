@@ -16,7 +16,36 @@
 
 #include <seastar/core/metrics.hh>
 
+#include <chrono>
+#include <optional>
+
 namespace transform {
+
+namespace {
+
+/**
+ * How long ago `event_time` was, for a wall-clock timestamp carried on a record
+ * batch.
+ *
+ * Returns nullopt when there is no meaningful delay to report. That covers a
+ * missing timestamp, and also a timestamp in the future, which is expected
+ * rather than exceptional: when the input topic uses producer-supplied
+ * (CreateTime) timestamps we are comparing against a clock that is not ours, so
+ * a producer running ahead of us would otherwise contribute a bogus sample.
+ */
+std::optional<std::chrono::milliseconds>
+delay_since(model::timestamp event_time) {
+    if (event_time.is_missing() || event_time == model::timestamp::min()) {
+        return std::nullopt;
+    }
+    auto now = model::timestamp::now();
+    if (now < event_time) {
+        return std::nullopt;
+    }
+    return std::chrono::milliseconds(now.value() - event_time.value());
+}
+
+} // namespace
 
 void probe::setup_metrics(const model::transform_metadata& meta) {
     wasm::transform_probe::setup_metrics(meta.name());
@@ -40,6 +69,29 @@ void probe::setup_metrics(const model::transform_metadata& meta) {
         [this] { return _failures; },
         sm::description("The number of transform failures"),
         labels)
+        .aggregate({sm::shard_label}));
+    metric_defs.emplace_back(
+      sm::make_histogram(
+        "input_delay_seconds",
+        sm::description(
+          "A histogram of how old a record batch was, in seconds, when the "
+          "transform began processing it. For a caught-up transform this is "
+          "the delay before it noticed the record; for one working through a "
+          "backlog it is how old those records already were, so read it "
+          "alongside lag"),
+        labels,
+        [this] { return _input_delay.public_histogram_logform(); })
+        .aggregate({sm::shard_label}));
+    metric_defs.emplace_back(
+      sm::make_histogram(
+        "e2e_latency_seconds",
+        sm::description(
+          "A histogram of the total time in seconds from a record batch being "
+          "appended to the input topic to the resulting output being written "
+          "and its progress committed. Unlike transform_execution_latency_sec "
+          "this includes input delay, queueing, and the write path"),
+        labels,
+        [this] { return _e2e_latency.public_histogram_logform(); })
         .aggregate({sm::shard_label}));
 
     auto output_topic_label = sm::label("output_topic");
@@ -102,6 +154,16 @@ void probe::state_change(processor_state_change change) {
 }
 void probe::report_lag(model::output_topic_index idx, int64_t delta) {
     _lag.at(idx()) += delta;
+}
+void probe::record_input_delay(model::timestamp source_batch_timestamp) {
+    if (auto delay = delay_since(source_batch_timestamp); delay.has_value()) {
+        _input_delay.record(*delay);
+    }
+}
+void probe::record_e2e_latency(model::timestamp source_batch_timestamp) {
+    if (auto delay = delay_since(source_batch_timestamp); delay.has_value()) {
+        _e2e_latency.record(*delay);
+    }
 }
 
 } // namespace transform
