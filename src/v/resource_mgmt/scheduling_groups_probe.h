@@ -19,6 +19,8 @@
 class scheduling_groups_probe {
 public:
     void start(const scheduling_groups& scheduling_groups) {
+        watch_transforms_shares(scheduling_groups);
+
         if (config::shard_local_cfg().disable_public_metrics()) {
             return;
         }
@@ -48,5 +50,22 @@ public:
     }
 
 private:
+    // Scheduling group shares are shard-local (per Seastar's own
+    // documentation on `scheduling_group::set_shares`), so this relies on
+    // `start()` already being invoked on every shard rather than fanning out
+    // itself.
+    void watch_transforms_shares(const scheduling_groups& scheduling_groups) {
+        auto transforms_sg = scheduling_groups.transforms_sg();
+        auto apply = [transforms_sg, this]() mutable {
+            transforms_sg.set_shares(
+              static_cast<float>(_transforms_shares_binding()));
+        };
+        apply();
+        _transforms_shares_binding.watch(apply);
+    }
+
+    config::binding<int16_t> _transforms_shares_binding
+      = config::shard_local_cfg()
+          .data_transforms_scheduling_group_shares.bind();
     metrics::public_metric_groups _public_metrics;
 };
