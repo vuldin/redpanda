@@ -146,14 +146,16 @@ fmt::iterator transform_metadata::format_to(fmt::iterator it) const {
     return fmt::format_to(
       it,
       "{{name: \"{}\", input: {}, outputs: {}, "
-      "env: <redacted>, uuid: {}, source_ptr: {}, is_paused: {} }}",
+      "env: <redacted>, uuid: {}, source_ptr: {}, is_paused: {}, "
+      "binary_sha256: {} }}",
       name,
       input_topic,
       output_topics,
       // skip env because of pii
       uuid,
       source_ptr,
-      paused);
+      paused,
+      binary_sha256);
 }
 
 void transform_metadata::serde_write(iobuf& out) const {
@@ -174,6 +176,7 @@ void transform_metadata::serde_write(iobuf& out) const {
       [this, &out](auto) { serde::write(out, offset_options); });
     serde::write(out, paused);
     serde::write(out, compression_mode);
+    serde::write(out, binary_sha256);
 }
 
 void transform_metadata::serde_read(iobuf_parser& in, const serde::header& h) {
@@ -194,6 +197,10 @@ void transform_metadata::serde_read(iobuf_parser& in, const serde::header& h) {
     if (h._version >= 2) {
         paused = read_nested<decltype(paused)>(in, h._bytes_left_limit);
         compression_mode = read_nested<decltype(compression_mode)>(
+          in, h._bytes_left_limit);
+    }
+    if (h._version >= 3) {
+        binary_sha256 = read_nested<decltype(binary_sha256)>(
           in, h._bytes_left_limit);
     }
 }
