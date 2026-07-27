@@ -17,7 +17,6 @@
 #include "model/transform.h"
 #include "wasm/engine.h"
 #include "wasm/ffi.h"
-#include "wasm/wasi.h"
 
 #include <seastar/core/condition-variable.hh>
 #include <seastar/util/noncopyable_function.hh>
@@ -112,8 +111,7 @@ public:
     // write to (from `model::transform_metadata::output_topics`), used to
     // synchronously validate an explicit output topic in write_record_with_
     // options without needing the real (async) emit() to run first.
-    explicit transform_module(
-      wasi::preview1_module*, std::vector<model::topic> valid_output_topics);
+    explicit transform_module(std::vector<model::topic> valid_output_topics);
     transform_module(const transform_module&) = delete;
     transform_module(transform_module&&) = delete;
     transform_module& operator=(const transform_module&) = delete;
@@ -214,7 +212,6 @@ private:
     std::optional<ss::condition_variable> _host_cond_var;
 
     std::optional<batch_transform_context> _call_ctx;
-    wasi::preview1_module* _wasi_module;
     std::vector<model::topic> _valid_output_topics;
 };
 } // namespace wasm

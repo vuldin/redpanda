@@ -18,6 +18,7 @@
 #include "logger.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
 #include <seastar/core/print.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/later.hh>
@@ -33,20 +34,28 @@
 
 namespace wasm::wasi {
 
-using unix_millis = std::chrono::milliseconds;
+// A genuine wall clock, not model::timestamp - that type deliberately
+// truncates to whole milliseconds (it mirrors Kafka's own on-wire record
+// timestamp field, see model/timestamp.h), which was fine for the
+// REALTIME clock's original purpose (giving a guest a rough notion of
+// wall-clock "now") but is needlessly coarse for a general-purpose
+// clock: std::chrono::system_clock is already the thing model::timestamp
+// itself is built from before truncating it, so this loses nothing and
+// gains the resolution back. No new determinism concern versus the
+// existing millisecond version - see the comment on REALTIME_CLOCK_ID
+// below on why a real, not-necessarily-identical-across-replicas wall
+// clock was already accepted here.
+using wall_clock = std::chrono::system_clock;
 
 namespace {
-// Return our clock resolution (1ms) in nanoseconds.
-constexpr std::chrono::milliseconds clock_resolution() {
-    // We only have millisecond resolution because we're using record
-    // timestamps as the clock value, and they only have millisecond
-    // resolution themselves.
-    return std::chrono::milliseconds(1);
+constexpr timestamp_t to_timestamp(wall_clock::duration d) {
+    return timestamp_t(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
 }
 
-constexpr timestamp_t to_timestamp(unix_millis ts) {
-    using namespace std::chrono_literals;
-    return timestamp_t(ts / 1ns);
+constexpr timestamp_t to_timestamp(ss::steady_clock_type::duration d) {
+    return timestamp_t(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
 }
 } // namespace
 
@@ -71,20 +80,25 @@ preview1_module::preview1_module(
     }
 }
 
-void preview1_module::set_walltime(model::timestamp ts) {
-    _wall_time = unix_millis(ts.value());
-}
-
 // We don't have control over this API, so there will be some redundant
 // wrappers. NOLINTBEGIN(bugprone-easily-swappable-parameters)
 
 errno_t preview1_module::clock_res_get(clock_id_t id, timestamp_t* out) {
     switch (id) {
-    case REALTIME_CLOCK_ID:
+    case REALTIME_CLOCK_ID: {
+        // Report the native resolution of the underlying wall clock rather
+        // than a made-up value - see clock_time_get's REALTIME_CLOCK_ID
+        // comment for why this is no longer the millisecond-truncated
+        // model::timestamp.
+        *out = to_timestamp(wall_clock::duration(1));
+        return ERRNO_SUCCESS;
+    }
     case MONOTONIC_CLOCK_ID:
     case PROCESS_CPUTIME_CLOCK_ID:
     case THREAD_CPUTIME_CLOCK_ID: {
-        *out = to_timestamp(clock_resolution());
+        // Report the native resolution of the underlying steady clock rather
+        // than a made-up value, now that we're backed by a real clock.
+        *out = to_timestamp(ss::steady_clock_type::duration(1));
         return ERRNO_SUCCESS;
     }
     default:
@@ -96,16 +110,31 @@ errno_t
 preview1_module::clock_time_get(clock_id_t id, timestamp_t, timestamp_t* out) {
     switch (id) {
     case REALTIME_CLOCK_ID: {
-        *out = to_timestamp(_wall_time);
+        // A genuine broker wall clock reading. This used to be derived from
+        // the timestamp of the record being processed, which a producer
+        // fully controls and can use to move the guest's notion of "now"
+        // forward, backward, or make it repeat. There's no cross-node
+        // deterministic-replay reliance on transform execution, so a real,
+        // not-necessarily-identical-across-replicas wall clock
+        // introduces no new determinism risk. Sourced directly from
+        // wall_clock (std::chrono::system_clock), not model::timestamp -
+        // that type deliberately truncates to whole milliseconds to match
+        // Kafka's own on-wire record timestamp field, which made every
+        // guest-observed REALTIME reading (and anything a guest computed
+        // from two of them) needlessly coarse for no determinism reason.
+        *out = to_timestamp(wall_clock::now().time_since_epoch());
         return ERRNO_SUCCESS;
     }
     case MONOTONIC_CLOCK_ID:
     case PROCESS_CPUTIME_CLOCK_ID:
     case THREAD_CPUTIME_CLOCK_ID: {
-        *out = to_timestamp(_monotonic_time);
-        // Increment by our minimal resolution here so that busy sleep loops
-        // used by languages by reading from the monotonic clock don't hang.
-        _monotonic_time += clock_resolution();
+        // A genuine monotonic clock reading. PROCESS_CPUTIME/THREAD_CPUTIME
+        // are approximated with the same wall-derived monotonic clock as
+        // MONOTONIC rather than real CPU-time accounting, same as the fake
+        // implementation this replaces did; that's an existing simplification
+        // this change doesn't attempt to fix, since nothing in-tree relies on
+        // genuine CPU-time semantics.
+        *out = to_timestamp(ss::steady_clock_type::now().time_since_epoch());
         return ERRNO_SUCCESS;
     }
     default:

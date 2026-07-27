@@ -60,9 +60,8 @@ struct write_options {
 } // namespace
 
 transform_module::transform_module(
-  wasi::preview1_module* m, std::vector<model::topic> valid_output_topics)
-  : _wasi_module(m)
-  , _valid_output_topics(std::move(valid_output_topics)) {}
+  std::vector<model::topic> valid_output_topics)
+  : _valid_output_topics(std::move(valid_output_topics)) {}
 
 ss::future<> transform_module::for_each_record_async(
   model::record_batch input, record_callback* cb) {
@@ -172,11 +171,6 @@ ss::future<int32_t> transform_module::read_batch_header(
     *producer_epoch = header.producer_epoch;
     *base_sequence = header.base_sequence;
 
-    _wasi_module->set_walltime(
-      header.attrs.timestamp_type() == model::timestamp_type::create_time
-        ? header.first_timestamp
-        : header.max_timestamp);
-
     co_return _call_ctx->max_input_record_size;
 }
 
@@ -208,8 +202,6 @@ int32_t transform_module::read_next_record(
         return INVALID_BUFFER;
     }
     _call_ctx->records.pop_front();
-
-    _wasi_module->set_walltime(record.timestamp);
 
     // Pass back the record's metadata
     *attributes = record.attributes.value();

@@ -518,7 +518,7 @@ public:
       , _sr_module(sr)
       , _wasi_module(
           {_meta.name()}, make_environment_vars(_meta), _logger.get())
-      , _transform_module(&_wasi_module, extract_output_topics(_meta)) {}
+      , _transform_module(extract_output_topics(_meta)) {}
     wasmtime_engine(const wasmtime_engine&) = delete;
     wasmtime_engine& operator=(const wasmtime_engine&) = delete;
     wasmtime_engine(wasmtime_engine&&) = delete;
@@ -716,8 +716,6 @@ private:
           /*finalizer=*/nullptr);
 
         reset_deadline(context, _runtime->per_invocation_timeout());
-
-        _wasi_module.set_walltime(model::timestamp::min());
 
         auto requested = _preinitialized->mem_limits();
 
