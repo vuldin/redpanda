@@ -83,6 +83,10 @@ public:
     kafka::offset start_offset() const override;
     ss::future<model::record_batch_reader>
     read_batch(kafka::offset offset, ss::abort_source* as) override;
+    ss::future<> wait_for_offset(
+      kafka::offset offset,
+      model::timeout_clock::time_point deadline,
+      ss::abort_source* as) override;
 
     ss::future<> push_batch(model::record_batch batch);
 
@@ -93,10 +97,10 @@ public:
      *
      * This mirrors the real `partition_source`, which short circuits to an
      * empty reader once it has caught up to the end of the log. The default
-     * blocking behaviour hides `processor::poll_sleep` completely: `read_batch`
-     * never returns empty, so the processor never sleeps, and no test can
-     * observe how long the processor actually takes to pick up a newly appended
-     * record.
+     * blocking behaviour hides `processor::run_consumer_loop`'s wait for new
+     * data completely: `read_batch` never returns empty, so the processor
+     * never has to wait, and no test can observe how long the processor
+     * actually takes to pick up a newly appended record.
      */
     void set_empty_reads_when_caught_up(bool);
 

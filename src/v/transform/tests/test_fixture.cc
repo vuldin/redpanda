@@ -110,6 +110,29 @@ void fake_source::set_empty_reads_when_caught_up(bool enabled) {
     _empty_reads_when_caught_up = enabled;
 }
 
+ss::future<> fake_source::wait_for_offset(
+  kafka::offset offset,
+  model::timeout_clock::time_point deadline,
+  ss::abort_source* as) {
+    if (!_empty_reads_when_caught_up) {
+        // read_batch itself blocks until a matching batch exists in this
+        // mode, so there's never anything for the caller to wait on here.
+        co_return;
+    }
+    auto sub = as->subscribe([this]() noexcept { _cond_var.broadcast(); });
+    co_await _cond_var
+      .wait(
+        deadline,
+        [this, as, offset] {
+            if (as->abort_requested()) {
+                return true;
+            }
+            auto it = _batches.lower_bound(offset);
+            return it != _batches.end();
+        })
+      .handle_exception([](const std::exception_ptr&) {});
+}
+
 ss::future<model::record_batch_reader>
 fake_source::read_batch(kafka::offset offset, ss::abort_source* as) {
     if (_empty_reads_when_caught_up) {

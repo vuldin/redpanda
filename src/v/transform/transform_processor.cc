@@ -17,7 +17,6 @@
 #include "model/timeout_clock.h"
 #include "model/timestamp.h"
 #include "model/transform.h"
-#include "random/simple_time_jitter.h"
 #include "ssx/abort_source.h"
 #include "ssx/future-util.h"
 #include "wasm/engine.h"
@@ -26,8 +25,6 @@
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
-#include <seastar/core/lowres_clock.hh>
-#include <seastar/core/sleep.hh>
 #include <seastar/util/variant_utils.hh>
 
 #include <boost/range/irange.hpp>
@@ -38,6 +35,15 @@
 namespace transform {
 
 namespace {
+
+// Upper bound on how long run_consumer_loop waits for wait_for_offset to
+// notice new data before retrying on its own. This is a safety net, not the
+// primary mechanism: the common case resolves as soon as the source's
+// underlying offset_monitor is notified, which is typically sub-millisecond.
+// Kept at the same order of magnitude as the old fixed poll interval so a
+// missed or delayed notification degrades to roughly today's behavior rather
+// than stalling indefinitely.
+constexpr auto fallback_wait_interval = std::chrono::seconds(1);
 
 class queue_output_consumer {
     static constexpr size_t buffer_chunk_size = 8;
@@ -189,18 +195,6 @@ ss::future<> processor::stop() {
     }
 }
 
-ss::future<> processor::poll_sleep() {
-    constexpr auto fallback_poll_interval = std::chrono::seconds(1);
-    simple_time_jitter<ss::lowres_clock> jitter(fallback_poll_interval);
-    try {
-        co_await ss::sleep_abortable<ss::lowres_clock>(
-          jitter.next_duration(), _as);
-    } catch (const ss::sleep_aborted& ex) {
-        // do nothing, the caller will handle exiting properly.
-        std::ignore = ex;
-    }
-}
-
 ss::future<absl::flat_hash_map<model::output_topic_index, kafka::offset>>
 processor::load_latest_committed() {
     co_await _offset_tracker->wait_for_previous_flushes(&_as);
@@ -297,9 +291,18 @@ ss::future<> processor::run_consumer_loop(kafka::offset offset) {
         if (!last_offset) {
             vlog(
               _logger.trace,
-              "received no results, sleeping before polling at offset {}",
+              "received no results, waiting for offset {} to become "
+              "available",
               offset);
-            co_await poll_sleep();
+            // Bounded so a missed or delayed notification (e.g. no local
+            // Raft group, or a Kafka LSO that lags Raft's visible offset
+            // under an open transaction) still self-heals within roughly
+            // today's old fixed poll interval, rather than waiting
+            // indefinitely.
+            co_await _source->wait_for_offset(
+              offset,
+              model::timeout_clock::now() + fallback_wait_interval,
+              &_as);
             continue;
         }
         offset = kafka::next_offset(*last_offset);

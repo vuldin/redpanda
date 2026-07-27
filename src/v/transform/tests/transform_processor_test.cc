@@ -477,27 +477,32 @@ TEST_P(ProcessorTestFixture, RecoversFromProduceFailureViaRestart) {
 }
 
 // Measures how long a record appended to an idle transform waits before its
-// output appears.
+// output appears, and guards against regressing back to polling.
 //
 // Every other test in this file reads through a source that blocks until data
 // arrives, so the processor is always handed a batch the moment one exists and
-// `processor::poll_sleep` is never reached. The real partition_source instead
-// returns an empty read once it has caught up, which sends the processor to
-// sleep for a jittered interval, and a record appended during that sleep waits
-// it out. `report_caught_up_reads` reproduces that so the delay is observable.
+// this idle path is never exercised. The real partition_source instead returns
+// an empty read once it has caught up, and previously that sent the processor
+// to sleep for a jittered ~1-1.5s interval regardless of how soon the next
+// record actually arrived - a record appended during that sleep simply waited
+// it out. `report_caught_up_reads` reproduces the empty-read behavior so this
+// path is exercised at all; `fake_source::wait_for_offset` mirrors the fix
+// (notify on push instead of sleeping), so this test's bound is a real
+// regression guard, not just an observation.
 //
-// This deliberately asserts only that the record arrives, and reports the delay
-// rather than pinning it to a target: the point is that the number moves
-// visibly when the polling loop is replaced with a notification. Tighten the
-// bound at that point.
+// The bound is generous relative to the sub-millisecond common case
+// specifically to absorb CI scheduling noise without becoming flaky - it only
+// needs to be tight enough to fail if this ever regresses back to a fixed
+// polling interval.
 TEST_P(ProcessorTestFixture, MeasuresIdlePollingDelay) {
     using namespace std::chrono_literals;
     constexpr auto generous_timeout = 30s;
+    constexpr auto regression_guard_bound = 500ms;
 
     report_caught_up_reads();
 
     // Push one record through so the processor reaches its caught-up state and
-    // starts polling.
+    // starts waiting on the next one.
     auto warmup = make_records(1);
     push_batch(warmup);
     EXPECT_FALSE(read_records_within({}, 1, generous_timeout).empty());
@@ -512,6 +517,9 @@ TEST_P(ProcessorTestFixture, MeasuresIdlePollingDelay) {
 
     EXPECT_THAT(returned, SameRecords(batch));
     EXPECT_EQ(error_count(), 0);
+    EXPECT_LT(delay, regression_guard_bound)
+      << "idle-path delay of " << delay.count()
+      << "ms looks like a regression back to fixed-interval polling";
     GTEST_LOG_(INFO) << "idle-path delay: " << delay.count() << "ms";
 }
 

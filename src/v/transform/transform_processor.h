@@ -132,7 +132,6 @@ private:
       sink*,
       kafka::offset,
       ss::abort_source&);
-    ss::future<> poll_sleep();
     ss::future<absl::flat_hash_map<model::output_topic_index, kafka::offset>>
     load_latest_committed();
     void report_lag(model::output_topic_index, int64_t);

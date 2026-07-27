@@ -13,6 +13,7 @@
 
 #include "model/record.h"
 #include "model/record_batch_reader.h"
+#include "model/timeout_clock.h"
 #include "model/transform.h"
 
 namespace transform {
@@ -77,6 +78,24 @@ public:
      */
     virtual ss::future<model::record_batch_reader>
     read_batch(kafka::offset, ss::abort_source*) = 0;
+
+    /**
+     * Wait until `offset` is likely to have become visible, up until
+     * `deadline`, or until aborted.
+     *
+     * This is a hint, not a guarantee: implementations may return before
+     * `offset` is actually visible - for example on timeout, or if they have
+     * no better signal to offer than that - so callers must always re-check
+     * via `read_batch` after this resolves rather than assuming data is
+     * present. It exists so that a source backed by local Raft replication
+     * can notify promptly when new data commits, instead of forcing every
+     * caller to poll on a fixed interval regardless of how idle the source
+     * actually is.
+     */
+    virtual ss::future<> wait_for_offset(
+      kafka::offset offset,
+      model::timeout_clock::time_point deadline,
+      ss::abort_source*) = 0;
 };
 
 /**
