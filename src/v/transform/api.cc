@@ -12,6 +12,7 @@
 #include "transform/api.h"
 
 #include "absl/container/flat_hash_map.h"
+#include "bytes/bytes.h"
 #include "cluster/errc.h"
 #include "cluster/partition_manager.h"
 #include "cluster/plugin_frontend.h"
@@ -19,6 +20,7 @@
 #include "cluster/types.h"
 #include "commit_batcher.h"
 #include "config/configuration.h"
+#include "crypto/crypto.h"
 #include "features/feature_table.h"
 #include "io.h"
 #include "kafka/data/partition_proxy.h"
@@ -64,6 +66,18 @@ namespace transform {
 namespace {
 constexpr auto wasm_binary_timeout = std::chrono::seconds(3);
 constexpr auto metadata_timeout = std::chrono::seconds(1);
+
+// Lowercase hex-encoded SHA-256 digest of the exact wasm binary bytes,
+// checked at wasm engine construction time against
+// config::wasm_trusted_modules to decide whether this specific binary - not
+// this transform's name - is granted any elevated capabilities. Computed
+// once here, at deploy time, rather than recomputed from the stored binary
+// on every engine instantiation.
+ss::sstring wasm_binary_sha256_hex(const model::wasm_binary_iobuf& binary) {
+    auto digest = crypto::digest(
+      crypto::digest_type::SHA256, bytes_view(iobuf_to_bytes(*binary())));
+    return to_hex(digest);
+}
 
 class rpc_client_sink final : public sink {
 public:
@@ -706,10 +720,12 @@ ss::future<std::error_code> service::deploy_transform(
           meta.name);
         co_return wasm::make_error_code(ex.error_code());
     }
+    meta.binary_sha256 = wasm_binary_sha256_hex(binary);
     vlog(
       tlog.info,
-      "deploying wasm binary (size={}) for transform {}",
+      "deploying wasm binary (size={}, sha256={}) for transform {}",
       binary()->size_bytes(),
+      meta.binary_sha256,
       meta.name);
     auto result = co_await _rpc_client->local().store_wasm_binary(
       std::move(binary), wasm_binary_timeout);

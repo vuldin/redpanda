@@ -24,6 +24,7 @@
 #include "config/throughput_control_group.h"
 #include "config/tls_config.h"
 #include "config/types.h"
+#include "config/wasm_trusted_module.h"
 #include "model/compression.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -678,6 +679,12 @@ struct configuration final : public config_store {
     // security controls
     property<bool> legacy_permit_unsafe_log_operation;
     property<std::chrono::seconds> legacy_unsafe_log_warning_interval_sec;
+
+    // Admin-only allowlist of specific wasm binaries (keyed by their own
+    // SHA-256 digest, not by transform name) granted elevated capabilities
+    // beyond the default wasm transform sandbox. See
+    // config::wasm_trusted_module for what a "capability" can mean.
+    property<std::vector<wasm_trusted_module>> wasm_trusted_modules;
 
     // schema id validation
     enterprise<

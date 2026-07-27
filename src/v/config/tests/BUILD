@@ -210,6 +210,23 @@ redpanda_cc_btest(
 )
 
 redpanda_cc_btest(
+    name = "wasm_trusted_module_test",
+    timeout = "short",
+    srcs = [
+        "wasm_trusted_module_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/config",
+        "//src/v/json",
+        "//src/v/test_utils:seastar_boost",
+        "@seastar",
+        "@seastar//:testing",
+        "@yaml-cpp",
+    ],
+)
+
+redpanda_cc_btest(
     name = "leaders_preference_test",
     timeout = "short",
     srcs = [

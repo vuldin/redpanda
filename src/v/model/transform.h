@@ -200,7 +200,7 @@ struct transform_offset_options
 struct transform_metadata
   : serde::envelope<
       transform_metadata,
-      serde::version<2>,
+      serde::version<3>,
       serde::compat_version<0>> {
     // The user specified name of the transform.
     transform_name name;
@@ -224,6 +224,16 @@ struct transform_metadata
     model::is_transform_paused paused{false};
 
     model::compression compression_mode{model::compression::none};
+
+    // Lowercase hex-encoded SHA-256 digest of this revision's wasm binary,
+    // computed once at deploy time (see service::deploy_transform). This is
+    // the identity checked against config::wasm_trusted_modules to decide
+    // whether this exact binary - not this transform name - gets elevated
+    // wasm capabilities. Unlike `uuid`, which is a fresh random value per
+    // deploy regardless of content, this is derived from the binary itself,
+    // so redeploying different code under the same transform name changes
+    // this value and does not inherit any trust granted to the old one.
+    ss::sstring binary_sha256;
 
     friend bool
     operator==(const transform_metadata&, const transform_metadata&) = default;

@@ -17,6 +17,7 @@ redpanda_cc_library(
         "tls_config.cc",
         "types.cc",
         "validators.cc",
+        "wasm_trusted_module.cc",
     ],
     hdrs = [
         "base_property.h",
@@ -45,6 +46,7 @@ redpanda_cc_library(
         "types.h",
         "validation_error.h",
         "validators.h",
+        "wasm_trusted_module.h",
     ],
     implementation_deps = [
         "//src/v/cluster:topic_memory_per_partition_default",
