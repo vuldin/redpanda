@@ -25,6 +25,7 @@
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/util/noncopyable_function.hh>
 
+#include <concepts>
 #include <type_traits>
 
 namespace cluster {
@@ -79,6 +80,24 @@ concept SerdeSerializable = requires(T t, iobuf buf, iobuf_parser parser) {
     serde::read_async<T>(parser);
     serde::from_iobuf<T>(std::move(buf));
     serde::to_iobuf(t);
+};
+
+/**
+ * Opt-in customization point: a Value type may define should_replace() to
+ * decide, deterministically, whether a newly-applied value should overwrite
+ * an existing one for the same key - e.g. to fence a stale write from a
+ * superseded owner rather than always letting the most-recently-applied
+ * write win regardless of provenance. Value types that don't define this
+ * keep today's behavior (always replace).
+ *
+ * Safe to evaluate from do_apply_kvs specifically because that runs inside
+ * the state machine's own serialized log-apply path: every replica applies
+ * the same sequence of writes in the same order, so this decision is
+ * reproduced identically everywhere rather than racing on timing.
+ */
+template<class T>
+concept HasReplacementPolicy = requires(const T& newer, const T& older) {
+    { newer.should_replace(older) } -> std::convertible_to<bool>;
 };
 
 template<
@@ -386,6 +405,14 @@ private:
         auto val_data = serde::from_iobuf<kv_data_value<Value>>(
           std::move(value));
         if (val_data.value) {
+            if constexpr (HasReplacementPolicy<Value>) {
+                auto it = _kvs.find(key_data.key);
+                if (
+                  it != _kvs.end()
+                  && !val_data.value->should_replace(it->second)) {
+                    return;
+                }
+            }
             _kvs[key_data.key] = *val_data.value;
             return;
         }

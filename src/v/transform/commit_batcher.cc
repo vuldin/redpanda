@@ -15,7 +15,6 @@
 #include "config/property.h"
 #include "logger.h"
 #include "ssx/future-util.h"
-#include "ssx/sleep_abortable.h"
 #include "utils/backoff_policy.h"
 
 #include <seastar/core/abort_source.hh>
@@ -124,16 +123,6 @@ ss::future<> commit_batcher<ClockType>::stop() {
     _unbatched_cond_var.signal();
     co_await _gate.close();
     co_await flush();
-}
-
-template<typename ClockType>
-ss::future<> commit_batcher<ClockType>::wait_for_previous_flushes(
-  model::transform_offsets_key, ss::abort_source* as) {
-    try {
-        co_await ssx::sleep_abortable<ClockType>(_commit_interval(), *as, _as);
-    } catch (const ss::sleep_aborted&) {
-        // do nothing as we're shutting down, callers will do the right thing
-    }
 }
 
 template<typename ClockType>
