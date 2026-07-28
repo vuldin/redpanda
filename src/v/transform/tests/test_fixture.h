@@ -74,10 +74,18 @@ public:
      * Simulate whether this engine has a guest-registered shared-memory
      * region available (i.e. it was granted the shared_memory capability
      * and the guest has called register_region) - for exercising guest
-     * state checkpoint/restore (PR-16). Defaults to false, matching a
+     * state checkpoint/restore. Defaults to false, matching a
      * binary that never opted in.
      */
     void set_shared_memory_region_registered(bool);
+
+    /**
+     * Make every subsequent emitted record carry this guest-chosen output
+     * partition key, simulating a guest calling write_record_with_options
+     * with a partition key set.
+     * Pass std::nullopt (the default) to go back to unkeyed emits.
+     */
+    void set_partition_key_to_emit(std::optional<iobuf> key);
 
     bool write_shared_memory(bytes_view data) override;
     std::optional<iobuf> read_shared_memory() override;
@@ -91,6 +99,7 @@ private:
     uint32_t _failures_remaining = 0;
     bool _shared_memory_region_registered = false;
     iobuf _shared_memory_content;
+    std::optional<iobuf> _partition_key_to_emit;
 };
 
 /**
@@ -168,7 +177,15 @@ private:
 
 class fake_sink : public sink {
 public:
-    ss::future<> write(ss::chunked_fifo<model::record_batch> batches) override;
+    ss::future<> write(
+      ss::chunked_fifo<model::record_batch> batches,
+      std::optional<iobuf> partition_key) override;
+
+    // The most recent partition_key passed to write(), for tests that
+    // exercise guest-controlled output partitioning.
+    const std::optional<iobuf>& last_partition_key() const {
+        return _last_partition_key;
+    }
 
     /**
      * Read one record, waiting up to `timeout` for one to arrive.
@@ -209,6 +226,7 @@ private:
     ss::condition_variable _cond_var;
     ssx::semaphore _cork = {ssx::semaphore::max_counter(), "fake_sink"};
     bool _fail = false;
+    std::optional<iobuf> _last_partition_key;
 };
 
 class fake_offset_tracker : public offset_tracker {

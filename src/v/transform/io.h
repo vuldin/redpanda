@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "bytes/iobuf.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
 #include "model/timeout_clock.h"
@@ -30,7 +31,15 @@ public:
     sink& operator=(sink&&) = delete;
     virtual ~sink() = default;
 
-    virtual ss::future<> write(ss::chunked_fifo<model::record_batch>) = 0;
+    /**
+     * `partition_key`, if set, is a guest-chosen key that this write should
+     * be routed by, consistent with normal Kafka key-based partitioning -
+     * instead of this sink's default routing (today,
+     * same-index-as-input-partition).
+     */
+    virtual ss::future<> write(
+      ss::chunked_fifo<model::record_batch>,
+      std::optional<iobuf> partition_key) = 0;
 };
 
 /**
@@ -133,8 +142,8 @@ public:
 /**
  * Durable storage for a transform guest's own state (e.g. an order book),
  * used to survive restarts, leadership moves, and redeploys without
- * silently running with wrong or zeroed state (PR-16 in the wasm roadmap
- * doc, addressing G12). Backed by transform::transform_state_stm, attached
+ * silently running with wrong or zeroed state. Backed by
+ * transform::transform_state_stm, attached
  * directly to this same partition's own raft group - see that class's own
  * doc comment for why.
  */

@@ -34,9 +34,16 @@ using write_success = ss::bool_class<struct write_success_t>;
  *
  * The topic is optional, and if omitted, then the "default" output topic should
  * be assumed.
+ *
+ * The partition key is optional; if set,
+ * the record should be routed to whatever output partition that key hashes
+ * to, consistent with normal Kafka key-based partitioning, instead of the
+ * default same-index-as-input-partition routing.
  */
 using transform_callback = ss::noncopyable_function<ss::future<write_success>(
-  std::optional<model::topic_view>, model::transformed_data)>;
+  std::optional<model::topic_view>,
+  std::optional<iobuf> partition_key,
+  model::transformed_data)>;
 
 /**
  * A wasm engine is a running VM loaded with a user module and capable of
@@ -53,8 +60,8 @@ public:
     virtual ss::future<> stop() = 0;
 
     // Writes into the shared-memory region a trusted guest has registered
-    // (config::wasm_capability::shared_memory - see PR-13 in the wasm
-    // roadmap doc), if any. Returns false, harmlessly, if this engine
+    // (config::wasm_capability::shared_memory), if any. Returns false,
+    // harmlessly, if this engine
     // wasn't granted that capability or the guest hasn't registered a
     // region yet - callers don't need to distinguish those cases, since
     // both just mean "there's nothing to write into right now."
@@ -63,7 +70,7 @@ public:
     // Reads back the trusted guest's registered shared-memory region, if
     // any - the capture-side counterpart to write_shared_memory, used to
     // checkpoint a guest's own state (e.g. an order book) for durable
-    // recovery (PR-16 in the wasm roadmap doc). Returns std::nullopt under
+    // recovery. Returns std::nullopt under
     // the same conditions write_shared_memory returns false for: no
     // capability grant, or no region registered yet. The guest is
     // responsible for laying out whatever it wants recovered within that

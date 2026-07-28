@@ -23,13 +23,16 @@
 using namespace std::chrono_literals;
 
 namespace transform::testing {
-ss::future<> fake_sink::write(ss::chunked_fifo<model::record_batch> batches) {
+ss::future<> fake_sink::write(
+  ss::chunked_fifo<model::record_batch> batches,
+  std::optional<iobuf> partition_key) {
     co_await _cork.wait();
     if (_fail) {
         throw std::runtime_error(
           "failure to produce transform data: Current node is not a leader "
           "for partition");
     }
+    _last_partition_key = std::move(partition_key);
     for (auto& batch : batches) {
         for (auto& r : batch.copy_records()) {
             _records.push_back(std::move(r));
@@ -169,8 +172,8 @@ ss::future<> fake_wasm_engine::start() {
     }
     _started = true;
     // A fresh VM instance means fresh (zeroed) guest memory - mirrors the
-    // real engine's heap_allocator::deallocate on every restart (see G12).
-    // Whether a region gets registered again is a separate, stable fact
+    // real engine's heap_allocator::deallocate on every restart. Whether a
+    // region gets registered again is a separate, stable fact
     // about this guest's own code (set once via
     // set_shared_memory_region_registered), not reset here.
     _shared_memory_content.clear();
@@ -205,6 +208,10 @@ void fake_wasm_engine::set_shared_memory_region_registered(bool registered) {
     _shared_memory_region_registered = registered;
 }
 
+void fake_wasm_engine::set_partition_key_to_emit(std::optional<iobuf> key) {
+    _partition_key_to_emit = std::move(key);
+}
+
 bool fake_wasm_engine::write_shared_memory(bytes_view data) {
     if (!_shared_memory_region_registered) {
         return false;
@@ -232,14 +239,21 @@ ss::future<> fake_wasm_engine::transform(
     auto it = model::record_batch_copy_iterator::create(batch);
     while (it.has_next()) {
         auto transformed = model::transformed_data::from_record(it.next());
+        auto key_copy = [this] {
+            return _partition_key_to_emit
+                     ? std::optional<iobuf>(_partition_key_to_emit->copy())
+                     : std::nullopt;
+        };
         if (!_output_topics.has_value()) {
-            auto success = co_await cb(std::nullopt, std::move(transformed));
+            auto success = co_await cb(
+              std::nullopt, key_copy(), std::move(transformed));
             if (!success) {
                 throw std::runtime_error("transform write failed!");
             }
         } else {
             for (const auto& topic : _output_topics.value()) {
-                auto success = co_await cb(topic, transformed.copy());
+                auto success = co_await cb(
+                  topic, key_copy(), transformed.copy());
                 if (!success) {
                     throw std::runtime_error("transform write failed!");
                 }

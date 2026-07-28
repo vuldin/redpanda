@@ -81,7 +81,7 @@ struct fixture_param {
     bool autostart = true;
     // Wires a testing::fake_state_store into the processor, standing in
     // for transform::transform_state_stm - see the guest-state-recovery
-    // tests (PR-16).
+    // tests below.
     bool with_state_store = false;
 };
 
@@ -293,6 +293,9 @@ public:
     std::optional<iobuf> current_shared_memory() {
         return _engine->read_shared_memory();
     }
+    void set_partition_key_to_emit(std::optional<iobuf> key) {
+        _engine->set_partition_key_to_emit(std::move(key));
+    }
     void prime_persisted_state(iobuf state) {
         _state_store->prime_state(std::move(state));
     }
@@ -310,6 +313,10 @@ public:
     }
     void recover_sink(model::output_topic_index idx) {
         _sinks[idx()]->resume_writes();
+    }
+    const std::optional<iobuf>&
+    last_partition_key(model::output_topic_index idx = {}) const {
+        return _sinks[idx()]->last_partition_key();
     }
     bool processor_running() const { return _p->is_running(); }
 
@@ -730,16 +737,40 @@ INSTANTIATE_TEST_SUITE_P(
   StateRecoveryProcessorTest,
   ProcessorStateRecoveryTestFixture,
   ::testing::Values(
-    fixture_param{.meta = testing::my_single_output_metadata,
-                  .with_state_store = true}));
+    fixture_param{
+      .meta = testing::my_single_output_metadata, .with_state_store = true}));
 
 INSTANTIATE_TEST_SUITE_P(
   RequiredStateRecoveryProcessorTest,
   ProcessorRequiredStateRecoveryTestFixture,
   ::testing::Values(
-    fixture_param{.meta = with_required_state_recovery(),
-                  .autostart = false,
-                  .with_state_store = true}));
+    fixture_param{
+      .meta = with_required_state_recovery(),
+      .autostart = false,
+      .with_state_store = true}));
+
+using ProcessorPartitionKeyTestFixture = ProcessorTestFixture;
+
+TEST_P(ProcessorPartitionKeyTestFixture, PartitionKeyReachesTheSink) {
+    // This fixture drives the processor against a fake_sink, not the real
+    // rpc_client_sink - so this test can only prove the key survives the
+    // callback/queue/sink plumbing end to end, not that rpc_client_sink's
+    // murmur2 hash-to-partition routing itself is correct (that's real
+    // production code in api.cc with no unit coverage here).
+    auto key = tests::random_iobuf();
+    set_partition_key_to_emit(key.copy());
+    push_batch(make_records(1));
+    tests::drain_task_queue().get();
+    ASSERT_TRUE(wait_for_all_committed());
+    const auto& observed = last_partition_key();
+    ASSERT_TRUE(observed.has_value());
+    EXPECT_EQ(*observed, key);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  PartitionKeyProcessorTest,
+  ProcessorPartitionKeyTestFixture,
+  ::testing::Values(fixture_param{.meta = testing::my_single_output_metadata}));
 
 // Alias the test name so that we can write specialized tests for multiple
 // output topics.

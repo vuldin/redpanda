@@ -116,7 +116,7 @@ public:
           ->transform(
             std::move(batch),
             &_probe,
-            [output](auto, auto data) {
+            [output](auto, auto, auto data) {
                 output->push_back(std::move(data));
                 return ssx::now(wasm::write_success::yes);
             })

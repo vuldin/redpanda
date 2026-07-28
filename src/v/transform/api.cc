@@ -22,6 +22,7 @@
 #include "config/configuration.h"
 #include "crypto/crypto.h"
 #include "features/feature_table.h"
+#include "hashing/murmur.h"
 #include "io.h"
 #include "kafka/data/partition_proxy.h"
 #include "kafka/utils/txn_reader.h"
@@ -92,8 +93,11 @@ public:
       , _topic_table(topic_table)
       , _client(client) {}
 
-    ss::future<> write(ss::chunked_fifo<model::record_batch> batches) override {
-        model::partition_id partition = compute_output_partition();
+    ss::future<> write(
+      ss::chunked_fifo<model::record_batch> batches,
+      std::optional<iobuf> partition_key) override {
+        model::partition_id partition = compute_output_partition(
+          partition_key);
         auto ec = co_await _client->produce(
           {_topic, partition}, std::move(batches));
         if (ec != cluster::errc::success) {
@@ -106,7 +110,8 @@ public:
     }
 
 private:
-    model::partition_id compute_output_partition() {
+    model::partition_id
+    compute_output_partition(const std::optional<iobuf>& partition_key) {
         model::topic_namespace_view ns_tp{model::kafka_namespace, _topic};
         const auto& config = _topic_table->get_topic_cfg(ns_tp);
         if (!config) {
@@ -116,6 +121,27 @@ private:
         }
 
         const auto* disabled_set = _topic_table->get_topic_disabled_set(ns_tp);
+        if (partition_key) {
+            // Key-based routing (PR-17(b) in the wasm roadmap doc): the same
+            // key must always resolve to the same partition for downstream
+            // co-partitioning to mean anything, so - unlike the unkeyed path
+            // below - a disabled target partition is a hard error here, not
+            // something to silently route around.
+            auto key_bytes = iobuf_to_bytes(*partition_key);
+            auto hash = murmur2(key_bytes.data(), key_bytes.size());
+            model::partition_id target(
+              hash % uint32_t(config->partition_count));
+            if (disabled_set && disabled_set->is_disabled(target)) {
+                throw std::runtime_error(
+                  ss::format(
+                    "output partition {} for topic {} (resolved from a "
+                    "guest-chosen key) is disabled",
+                    target,
+                    _topic));
+            }
+            return target;
+        }
+
         if (!(disabled_set && disabled_set->is_fully_disabled())) {
             // Do linear probing to find a non-disabled partition. The
             // expectation is that most of the times we'll need just a few
