@@ -27,6 +27,7 @@
 #include "model/transform.h"
 #include "network_module.h"
 #include "schema_registry_module.h"
+#include "shared_memory_module.h"
 #include "ssx/thread_worker.h"
 #include "transform_module.h"
 #include "utils/human.h"
@@ -55,6 +56,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -489,6 +491,12 @@ public:
         return _network_allowed_targets;
     }
 
+    // Same reasoning as network_allowed_targets, for the `shared_memory`
+    // capability - decided once here, read directly rather than re-derived.
+    bool shared_memory_granted() const noexcept {
+        return _shared_memory_granted;
+    }
+
 private:
     friend class wasmtime_runtime;
     handle<wasmtime_instance_pre_t, wasmtime_instance_pre_delete> _underlying
@@ -497,6 +505,7 @@ private:
     ss::noncopyable_function<void() noexcept> _cleanup_fn;
     std::optional<std::vector<net::unresolved_address>>
       _network_allowed_targets;
+    bool _shared_memory_granted{false};
 };
 
 absl::flat_hash_map<ss::sstring, ss::sstring>
@@ -562,7 +571,12 @@ public:
         if (
           const auto& targets = _preinitialized->network_allowed_targets();
           targets) {
-            _network_module.emplace(*targets);
+            _network_module.emplace(*targets, [this](bytes_view data) {
+                return write_shared_memory(data);
+            });
+        }
+        if (_preinitialized->shared_memory_granted()) {
+            _shared_memory_module.emplace();
         }
     }
     wasmtime_engine(const wasmtime_engine&) = delete;
@@ -599,6 +613,47 @@ public:
         _probe.report_memory_usage(0);
     }
 
+    bool write_shared_memory(bytes_view data) final {
+        if (
+          !_shared_memory_module || !_shared_memory_module->region()
+          || !_store) {
+            return false;
+        }
+        const auto& region = *_shared_memory_module->region();
+        auto* ctx = wasmtime_store_context(_store.get());
+        std::string_view memory_export_name = "memory";
+        wasmtime_extern_t memory_extern;
+        bool ok = wasmtime_instance_export_get(
+          ctx,
+          &_instance,
+          memory_export_name.data(),
+          memory_export_name.size(),
+          &memory_extern);
+        if (!ok || memory_extern.kind != WASMTIME_EXTERN_MEMORY) {
+            return false;
+        }
+        // Fetched fresh, not cached across calls: a grow between one call
+        // to write_shared_memory and the next can relocate the underlying
+        // buffer, exactly the reason class memory::translate_raw above
+        // re-fetches on every host-function ABI call too.
+        size_t mem_size = wasmtime_memory_data_size(
+          ctx, &memory_extern.of.memory);
+        size_t region_end = size_t(region.ptr) + size_t(region.len);
+        if (region_end > mem_size) {
+            // The guest registered a region that isn't (or never was)
+            // actually in bounds - register_region deliberately doesn't
+            // bounds-check at registration time, see its comment for why;
+            // this is the one real check, right before the one place an
+            // out-of-range offset would matter.
+            return false;
+        }
+        size_t to_write = std::min(size_t(region.len), data.size());
+        uint8_t* dst = wasmtime_memory_data(ctx, &memory_extern.of.memory)
+                       + region.ptr;
+        std::memcpy(dst, data.data(), to_write);
+        return true;
+    }
+
     ss::future<> transform(
       model::record_batch batch,
       transform_probe* probe,
@@ -629,6 +684,8 @@ public:
             return &_sr_module;
         } else if constexpr (std::is_same_v<T, network_module>) {
             return &_network_module.value();
+        } else if constexpr (std::is_same_v<T, shared_memory_module>) {
+            return &_shared_memory_module.value();
         } else {
             static_assert(
               base::unsupported_type<T>::value, "unsupported module");
@@ -968,6 +1025,8 @@ private:
     // when this is engaged, so get_module<network_module>() below is only
     // ever reached for an engine that actually has one.
     std::optional<network_module> _network_module;
+    // Same reasoning as _network_module, for the `shared_memory` capability.
+    std::optional<shared_memory_module> _shared_memory_module;
 
     // The following state is only valid if there is a non-null store.
     handle<wasmtime_store_t, wasmtime_store_delete> _store;
@@ -1413,6 +1472,25 @@ void register_network_module(
 #undef REG_HOST_FN
 }
 
+// Registered separately from register_network_module, and only when
+// `shared_memory` is granted in addition to `network` - see the call site
+// in make_factory. Still under network_module::name, the same wasm import
+// module a guest already sees connect/send/recv/close under.
+void register_network_bulk_load_function(
+  wasmtime_linker_t* linker, const strict_stack_config& ssc) {
+    host_function<&network_module::bulk_load>::reg(linker, "bulk_load", ssc);
+}
+
+void register_shared_memory_module(
+  wasmtime_linker_t* linker, const strict_stack_config& ssc) {
+    // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define REG_HOST_FN(name)                                                      \
+    host_function<&shared_memory_module::name>::reg(linker, #name, ssc)
+    REG_HOST_FN(check_abi_version_0);
+    REG_HOST_FN(register_region);
+#undef REG_HOST_FN
+}
+
 class wasmtime_engine_factory : public factory {
 public:
     wasmtime_engine_factory(
@@ -1635,8 +1713,17 @@ ss::future<ss::shared_ptr<factory>> wasmtime_runtime::make_factory(
     if (grant_network) {
         preinitialized->_network_allowed_targets = trusted->allowed_targets;
     }
+    preinitialized->_shared_memory_granted
+      = trusted
+        && trusted->has_capability(::config::wasm_capability::shared_memory);
     size_t memory_usage_size = co_await _alien_thread.submit(
-      [this, &meta, buf = buf().get(), &preinitialized, &ssc, grant_network] {
+      [this,
+       &meta,
+       buf = buf().get(),
+       &preinitialized,
+       &ssc,
+       grant_network,
+       grant_shared_memory = preinitialized->_shared_memory_granted] {
           vlog(wasm_log.debug, "compiling wasm module {}", meta.name);
           // This can be a large contiguous allocation, however it happens
           // on an alien thread so it bypasses the seastar allocator.
@@ -1665,6 +1752,18 @@ ss::future<ss::shared_ptr<factory>> wasmtime_runtime::make_factory(
           // to import it, let alone call it.
           if (grant_network) {
               register_network_module(linker.get(), ssc);
+              // bulk_load delivers through the shared_memory region, so it
+              // only makes sense - and is only actually linked in - when
+              // both capabilities are granted to this exact binary. This is
+              // a link-time AND, not a runtime check: a binary with only
+              // `network` cannot even import bulk_load, the same
+              // enforcement PR-13 already relies on elsewhere.
+              if (grant_shared_memory) {
+                  register_network_bulk_load_function(linker.get(), ssc);
+              }
+          }
+          if (grant_shared_memory) {
+              register_shared_memory_module(linker.get(), ssc);
           }
 
           error.reset(wasmtime_linker_instantiate_pre(
