@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "bytes/bytes.h"
+#include "bytes/iobuf.h"
 #include "model/record.h"
 #include "model/tests/randoms.h"
 #include "model/timestamp.h"
@@ -68,6 +70,18 @@ public:
      */
     void set_failures_remaining(uint32_t n);
 
+    /**
+     * Simulate whether this engine has a guest-registered shared-memory
+     * region available (i.e. it was granted the shared_memory capability
+     * and the guest has called register_region) - for exercising guest
+     * state checkpoint/restore (PR-16). Defaults to false, matching a
+     * binary that never opted in.
+     */
+    void set_shared_memory_region_registered(bool);
+
+    bool write_shared_memory(bytes_view data) override;
+    std::optional<iobuf> read_shared_memory() override;
+
     ss::future<> start() override;
     ss::future<> stop() override;
 
@@ -75,6 +89,40 @@ private:
     bool _started = false;
     std::optional<std::vector<model::topic>> _output_topics;
     uint32_t _failures_remaining = 0;
+    bool _shared_memory_region_registered = false;
+    iobuf _shared_memory_content;
+};
+
+/**
+ * A fake transform::state_store, standing in for
+ * transform::transform_state_stm for tests that don't need a real raft
+ * group - see transform_processor_test.cc's guest-state-recovery tests.
+ */
+class fake_state_store : public state_store {
+public:
+    ss::future<> start() override { return ss::now(); }
+    ss::future<> stop() override { return ss::now(); }
+
+    ss::future<std::optional<iobuf>> load_latest_state() override {
+        co_return _state ? std::optional<iobuf>(_state->copy()) : std::nullopt;
+    }
+
+    ss::future<> save_state(iobuf state) override {
+        _state = std::move(state);
+        ++_save_count;
+        return ss::now();
+    }
+
+    // Simulates a snapshot already persisted from a previous run, e.g.
+    // before a simulated restart.
+    void prime_state(iobuf state) { _state = std::move(state); }
+    bool has_state() const { return _state.has_value(); }
+    const iobuf& state() const { return *_state; }
+    uint64_t save_count() const { return _save_count; }
+
+private:
+    std::optional<iobuf> _state;
+    uint64_t _save_count = 0;
 };
 
 class fake_source : public source {

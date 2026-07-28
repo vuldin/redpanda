@@ -209,6 +209,15 @@ void validate_transform_deploy_document(const json::Document& doc) {
                 }
             },
             "additionalProperties": false
+        },
+        "state_options": {
+            "type": "object",
+            "properties": {
+                "require_state_recovery": {
+                    "type": "boolean"
+                }
+            },
+            "additionalProperties": false
         }
     },
     "required": ["name", "input_topic", "output_topics"],
@@ -328,6 +337,15 @@ admin_server::deploy_transform(std::unique_ptr<ss::http::request> req) {
         }
     }
 
+    model::transform_state_options state_options{};
+    if (doc.HasMember("state_options")) {
+        auto so = doc["state_options"].GetObject();
+        if (so.HasMember("require_state_recovery")) {
+            state_options.require_state_recovery
+              = so["require_state_recovery"].GetBool();
+        }
+    }
+
     // Now do the deploy!
     std::error_code ec = co_await _transform_service->local().deploy_transform(
       {
@@ -338,6 +356,7 @@ admin_server::deploy_transform(std::unique_ptr<ss::http::request> req) {
         .offset_options = offset_opts,
         .compression_mode = compression,
         .failure_policy = failure_policy,
+        .state_options = state_options,
       },
       model::wasm_binary_iobuf(std::make_unique<iobuf>(std::move(body))));
 

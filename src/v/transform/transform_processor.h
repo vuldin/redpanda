@@ -25,6 +25,7 @@
 #include "wasm/fwd.h"
 
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/util/noncopyable_function.hh>
 
@@ -107,7 +108,8 @@ public:
       std::unique_ptr<offset_tracker>,
       probe*,
       memory_limits*,
-      std::unique_ptr<sink> dead_letter_sink = nullptr);
+      std::unique_ptr<sink> dead_letter_sink = nullptr,
+      std::unique_ptr<state_store> state_store = nullptr);
     processor(const processor&) = delete;
     processor(processor&&) = delete;
     processor& operator=(const processor&) = delete;
@@ -136,6 +138,25 @@ private:
     ss::future<absl::flat_hash_map<model::output_topic_index, kafka::offset>>
     load_latest_committed();
     void report_lag(model::output_topic_index, int64_t);
+
+    // Restores a persisted guest-state snapshot (if any) into the guest's
+    // registered shared-memory region before the transform/consumer loops
+    // start, so the guest resumes from its own last checkpoint instead of
+    // silently starting from zeroed memory. Throws - a hard start()
+    // failure, going through the same restart/backoff path as any other -
+    // if _meta.state_options.require_state_recovery is set and a
+    // persisted snapshot exists but can't be delivered into the guest's
+    // memory. See model::transform_state_options for why that's opt-in.
+    ss::future<> restore_guest_state();
+    // Best-effort periodic checkpoint of the guest's own state, called
+    // after every successful transform() call. A no-op unless the engine
+    // actually has bytes to offer (i.e. the binary was granted the
+    // shared_memory capability and the guest has registered a region) -
+    // see wasm::engine::read_shared_memory. Paced by checkpoint_interval
+    // rather than every batch: this is a coarse, occasional durability
+    // improvement, not something that should add a raft round trip to
+    // this transform's hot path.
+    ss::future<> maybe_checkpoint_state();
 
     template<typename... Future>
     ss::future<> when_all_shutdown(Future&&...);
@@ -177,6 +198,15 @@ private:
     // calling start() again on this same processor object, not by
     // constructing a new one (see transform_manager.cc's start_processor).
     uint32_t _consecutive_transform_failures{0};
+
+    // Only engaged when transform::transform_state_stm is reachable for
+    // this ntp (see transform/api.cc's create_processor) - null is a
+    // legitimate "state persistence unavailable right now" state, not an
+    // error; restore_guest_state/maybe_checkpoint_state both treat it as
+    // a no-op.
+    std::unique_ptr<state_store> _state_store;
+    ss::lowres_clock::time_point _last_checkpoint_at
+      = ss::lowres_clock::time_point::min();
 
     ss::abort_source _as;
     ss::future<> _task;
