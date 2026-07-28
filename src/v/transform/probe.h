@@ -38,6 +38,13 @@ public:
     // attempt: this is the rarer, worse outcome of a batch never
     // succeeding after every attempt this policy allowed.
     void increment_given_up();
+    // A persisted guest-state snapshot existed on this partition but
+    // couldn't be delivered into the guest's memory on start (see
+    // processor::restore_guest_state) - the guest may now be running
+    // without state it should have recovered. See
+    // model::transform_state_options::require_state_recovery for what
+    // happens next.
+    void increment_state_recovery_failure();
     void state_change(processor_state_change);
     void report_lag(model::output_topic_index, int64_t delta);
 
@@ -74,6 +81,7 @@ private:
     std::vector<uint64_t> _write_bytes;
     uint64_t _failures = 0;
     uint64_t _given_up = 0;
+    uint64_t _state_recovery_failures = 0;
     std::vector<uint64_t> _lag;
     absl::flat_hash_map<model::transform_report::processor::state, uint64_t>
       _processor_state;

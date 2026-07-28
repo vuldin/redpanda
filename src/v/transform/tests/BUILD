@@ -71,6 +71,8 @@ redpanda_test_cc_library(
     ],
     deps = [
         "//src/v/base",
+        "//src/v/bytes",
+        "//src/v/bytes:iobuf",
         "//src/v/model",
         "//src/v/model/tests:random",
         "//src/v/ssx:semaphore",

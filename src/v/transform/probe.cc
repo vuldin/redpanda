@@ -82,6 +82,16 @@ void probe::setup_metrics(const model::transform_metadata& meta) {
         labels)
         .aggregate({sm::shard_label}));
     metric_defs.emplace_back(
+      sm::make_counter(
+        "state_recovery_failures",
+        [this] { return _state_recovery_failures; },
+        sm::description(
+          "The number of times this transform had a persisted guest-state "
+          "snapshot on this partition that could not be delivered into the "
+          "guest's memory on start"),
+        labels)
+        .aggregate({sm::shard_label}));
+    metric_defs.emplace_back(
       sm::make_histogram(
         "input_delay_seconds",
         sm::description(
@@ -156,6 +166,7 @@ void probe::increment_write_bytes(
 void probe::increment_read_bytes(uint64_t bytes) { _read_bytes += bytes; }
 void probe::increment_failure() { ++_failures; }
 void probe::increment_given_up() { ++_given_up; }
+void probe::increment_state_recovery_failure() { ++_state_recovery_failures; }
 void probe::state_change(processor_state_change change) {
     if (change.from) {
         _processor_state[*change.from] -= 1;

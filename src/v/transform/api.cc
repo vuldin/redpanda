@@ -38,6 +38,7 @@
 #include "transform/logging/rpc_client.h"
 #include "transform/rpc/client.h"
 #include "transform/rpc/deps.h"
+#include "transform/stm/transform_state_stm.h"
 #include "transform_logger.h"
 #include "transform_manager.h"
 #include "transform_processor.h"
@@ -327,6 +328,70 @@ private:
     cluster::partition_manager* _manager;
 };
 
+class state_store_impl : public state_store {
+public:
+    state_store_impl(
+      model::transform_id id, ss::lw_shared_ptr<cluster::partition> partition)
+      : _id(id)
+      , _partition(std::move(partition)) {}
+
+    ss::future<> start() override { return ss::now(); }
+    ss::future<> stop() override { return ss::now(); }
+
+    ss::future<std::optional<iobuf>> load_latest_state() override {
+        auto stm = get_stm();
+        if (!stm) {
+            // No local raft group to ask right now (e.g. a benign race
+            // with the partition being removed) - treat like "nothing
+            // persisted" rather than failing the whole processor start
+            // over a transient lookup miss.
+            co_return std::nullopt;
+        }
+        auto res = co_await stm->sync_latest_state(_id, load_timeout);
+        if (res.has_error()) {
+            throw std::runtime_error(
+              ss::format(
+                "error loading guest-state snapshot: {}",
+                cluster::error_category().message(int(res.error()))));
+        }
+        co_return std::move(res).value();
+    }
+
+    ss::future<> save_state(iobuf state) override {
+        auto stm = get_stm();
+        if (!stm) {
+            co_return;
+        }
+        auto res = co_await stm->put_state(
+          _id, std::move(state), save_timeout);
+        if (res.has_error()) {
+            vlog(
+              tlog.warn,
+              "failed to checkpoint guest state for transform {}: {}",
+              _id,
+              cluster::error_category().message(int(res.error())));
+        }
+    }
+
+private:
+    static constexpr auto load_timeout = std::chrono::seconds(5);
+    static constexpr auto save_timeout = std::chrono::seconds(10);
+
+    ss::shared_ptr<transform::transform_state_stm> get_stm() const {
+        if (!_partition) {
+            return nullptr;
+        }
+        auto raft = _partition->raft();
+        if (!raft || !raft->stm_manager()) {
+            return nullptr;
+        }
+        return raft->stm_manager()->get<transform::transform_state_stm>();
+    }
+
+    model::transform_id _id;
+    ss::lw_shared_ptr<cluster::partition> _partition;
+};
+
 class offset_tracker_impl : public offset_tracker {
 public:
     offset_tracker_impl(
@@ -453,9 +518,18 @@ public:
         // handler does for long-poll. May be null (e.g. a benign race with
         // the partition being removed) - partition_source falls back to its
         // deadline in that case.
+        //
+        // Copied (not moved) into partition_source below: offset_tracker_impl
+        // and state_store_impl also need it, for epoch-fencing and state
+        // persistence respectively, and it's a plain refcounted handle - a
+        // copy is one atomic increment, once per processor creation, not a
+        // hot-path cost. Moving it here instead would silently leave both
+        // of those with a null partition on every single processor create,
+        // not just the rare benign race the comment above describes -
+        // found while wiring up state_store_impl for PR-16.
         auto partition_for_wait = _partition_manager->get(ntp);
         auto src = std::make_unique<partition_source>(
-          *std::move(partition), std::move(partition_for_wait));
+          *std::move(partition), partition_for_wait);
 
         std::vector<std::unique_ptr<sink>> sinks;
         sinks.reserve(meta.output_topics.size());
@@ -482,6 +556,9 @@ public:
           _batcher,
           partition_for_wait);
 
+        auto state_store = std::make_unique<state_store_impl>(
+          id, std::move(partition_for_wait));
+
         co_return std::make_unique<processor>(
           id,
           ntp,
@@ -493,7 +570,8 @@ public:
           std::move(offset_tracker),
           p,
           ml,
-          std::move(dead_letter_sink));
+          std::move(dead_letter_sink),
+          std::move(state_store));
     }
 
 private:

@@ -79,6 +79,10 @@ struct stats_snapshot {
 struct fixture_param {
     model::transform_metadata meta;
     bool autostart = true;
+    // Wires a testing::fake_state_store into the processor, standing in
+    // for transform::transform_state_stm - see the guest-state-recovery
+    // tests (PR-16).
+    bool with_state_store = false;
 };
 
 model::transform_metadata with_max_retries(uint32_t max_retries) {
@@ -90,6 +94,12 @@ model::transform_metadata with_max_retries(uint32_t max_retries) {
 model::transform_metadata with_dead_letter(uint32_t max_retries) {
     auto meta = with_max_retries(max_retries);
     meta.failure_policy.dead_letter_topic = model::random_topic_namespace();
+    return meta;
+}
+
+model::transform_metadata with_required_state_recovery() {
+    auto meta = testing::my_single_output_metadata;
+    meta.state_options.require_state_recovery = true;
     return meta;
 }
 
@@ -117,6 +127,12 @@ public:
             _dead_letter_sink = dl_sink.get();
             dead_letter_sink = std::move(dl_sink);
         }
+        std::unique_ptr<transform::state_store> state_store;
+        if (param.with_state_store) {
+            auto ss_impl = std::make_unique<testing::fake_state_store>();
+            _state_store = ss_impl.get();
+            state_store = std::move(ss_impl);
+        }
         _probe.setup_metrics(param.meta);
         _p = std::make_unique<transform::processor>(
           testing::my_transform_id,
@@ -133,7 +149,8 @@ public:
           std::move(offset_tracker),
           &_probe,
           &_memory_limits,
-          std::move(dead_letter_sink));
+          std::move(dead_letter_sink),
+          std::move(state_store));
         if (param.autostart) {
             _p->start().get();
             // Wait for the initial offset to be committed so we know that the
@@ -267,6 +284,25 @@ public:
         return !_dead_letter_sink || _dead_letter_sink->empty();
     }
 
+    void set_shared_memory_registered(bool registered) {
+        _engine->set_shared_memory_region_registered(registered);
+    }
+    bool write_shared_memory(const iobuf& data) {
+        return _engine->write_shared_memory(iobuf_to_bytes(data));
+    }
+    std::optional<iobuf> current_shared_memory() {
+        return _engine->read_shared_memory();
+    }
+    void prime_persisted_state(iobuf state) {
+        _state_store->prime_state(std::move(state));
+    }
+    uint64_t state_store_save_count() const {
+        return _state_store ? _state_store->save_count() : 0;
+    }
+    uint64_t state_recovery_failure_count() const {
+        return _probe._state_recovery_failures;
+    }
+
     void cork_sink(model::output_topic_index idx) { _sinks[idx()]->cork(); }
     void uncork_sink(model::output_topic_index idx) { _sinks[idx()]->uncork(); }
     void fail_sink(model::output_topic_index idx) {
@@ -317,6 +353,7 @@ private:
     testing::fake_offset_tracker* _offset_tracker = nullptr;
     std::vector<testing::fake_sink*> _sinks;
     testing::fake_sink* _dead_letter_sink = nullptr;
+    testing::fake_state_store* _state_store = nullptr;
     uint64_t _error_count = 0;
     probe _probe;
 };
@@ -640,6 +677,69 @@ INSTANTIATE_TEST_SUITE_P(
   DeadLetterPolicyProcessorTest,
   ProcessorDeadLetterPolicyTestFixture,
   ::testing::Values(fixture_param{with_dead_letter(2)}));
+
+using ProcessorStateRecoveryTestFixture = ProcessorTestFixture;
+using ProcessorRequiredStateRecoveryTestFixture = ProcessorTestFixture;
+
+TEST_P(
+  ProcessorStateRecoveryTestFixture, RestoresCheckpointedStateAfterRestart) {
+    set_shared_memory_registered(true);
+    auto state = tests::random_iobuf();
+    ASSERT_TRUE(write_shared_memory(state));
+
+    // The very first successful batch triggers a checkpoint - see
+    // processor's _last_checkpoint_at, which starts at time_point::min().
+    push_batch(make_records(1));
+    tests::drain_task_queue().get();
+    ASSERT_EQ(state_store_save_count(), 1u);
+
+    // Simulate a restart: the same transform_state_stm-backed store
+    // persists across it, but the engine's own linear memory does not -
+    // see fake_wasm_engine::start().
+    restart();
+    tests::drain_task_queue().get();
+
+    auto restored = current_shared_memory();
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(*restored, state);
+}
+
+TEST_P(
+  ProcessorRequiredStateRecoveryTestFixture,
+  FailsLoudlyWhenRequiredStateCannotBeRestored) {
+    // A snapshot exists from "before", but the engine's shared-memory
+    // region is not registered this time (the fixture default) -
+    // simulates the binary losing its capability grant, or the guest
+    // simply not registering a region on this particular start - so the
+    // persisted snapshot can't be delivered into guest memory.
+    prime_persisted_state(tests::random_iobuf());
+
+    start();
+    tests::drain_task_queue().get();
+
+    EXPECT_EQ(error_count(), 1u);
+    EXPECT_EQ(state_recovery_failure_count(), 1u);
+    // Matches every other processor error in this suite (e.g.
+    // GivesUpAndDeadLetters above): an error alone doesn't mark the
+    // processor as stopped - only transform_manager's restart loop (not
+    // exercised by this fixture) or an explicit stop() does that.
+    EXPECT_TRUE(processor_running());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  StateRecoveryProcessorTest,
+  ProcessorStateRecoveryTestFixture,
+  ::testing::Values(
+    fixture_param{.meta = testing::my_single_output_metadata,
+                  .with_state_store = true}));
+
+INSTANTIATE_TEST_SUITE_P(
+  RequiredStateRecoveryProcessorTest,
+  ProcessorRequiredStateRecoveryTestFixture,
+  ::testing::Values(
+    fixture_param{.meta = with_required_state_recovery(),
+                  .autostart = false,
+                  .with_state_store = true}));
 
 // Alias the test name so that we can write specialized tests for multiple
 // output topics.

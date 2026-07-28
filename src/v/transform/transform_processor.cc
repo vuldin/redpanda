@@ -10,6 +10,7 @@
  */
 #include "transform_processor.h"
 
+#include "bytes/bytes.h"
 #include "logger.h"
 #include "model/batch_compression.h"
 #include "model/fundamental.h"
@@ -44,6 +45,14 @@ namespace {
 // missed or delayed notification degrades to roughly today's behavior rather
 // than stalling indefinitely.
 constexpr auto fallback_wait_interval = std::chrono::seconds(1);
+
+// Minimum time between guest-state checkpoints (see
+// processor::maybe_checkpoint_state). A checkpoint replicates through this
+// partition's own raft group, so pacing it well below batch-processing
+// frequency keeps it a coarse, occasional durability improvement rather
+// than a per-record cost on the hot path this whole roadmap exists to keep
+// fast.
+constexpr auto checkpoint_interval = std::chrono::seconds(5);
 
 class queue_output_consumer {
     static constexpr size_t buffer_chunk_size = 8;
@@ -104,7 +113,8 @@ processor::processor(
   std::unique_ptr<offset_tracker> offset_tracker,
   probe* p,
   memory_limits* mem_limits,
-  std::unique_ptr<sink> dead_letter_sink)
+  std::unique_ptr<sink> dead_letter_sink,
+  std::unique_ptr<state_store> state_store)
   : _id(id)
   , _ntp(std::move(ntp))
   , _meta(std::move(meta))
@@ -116,6 +126,7 @@ processor::processor(
   , _consumer_transform_pipe(&mem_limits->read_buffer_semaphore)
   , _outputs()
   , _dead_letter_sink(std::move(dead_letter_sink))
+  , _state_store(std::move(state_store))
   , _task(ss::now())
   , _logger(tlog, ss::format("{}/{}", _meta.name(), _ntp.tp.partition())) {
     const auto& outputs = _meta.output_topics;
@@ -150,8 +161,12 @@ ss::future<> processor::start() {
     _as = {};
     co_await _source->start();
     co_await _offset_tracker->start();
+    if (_state_store) {
+        co_await _state_store->start();
+    }
     _task = handle_processor_task(
       _engine->start()
+        .then([this] { return restore_guest_state(); })
         .then([this] { return load_latest_committed(); })
         .then([this](
                 absl::flat_hash_map<model::output_topic_index, kafka::offset>
@@ -190,11 +205,83 @@ ss::future<> processor::stop() {
     }
     co_await _source->stop();
     co_await _offset_tracker->stop();
+    if (_state_store) {
+        co_await _state_store->stop();
+    }
     co_await _engine->stop();
     // reset lag now that we've stopped
     for (const auto& [_, output] : _outputs) {
         report_lag(output.index, 0);
     }
+}
+
+ss::future<> processor::restore_guest_state() {
+    if (!_state_store) {
+        co_return;
+    }
+    auto state = co_await _state_store->load_latest_state();
+    if (!state) {
+        // Nothing persisted yet - the expected, correct state for a
+        // brand-new deploy, or for a transform that's never opted into
+        // checkpointing (never registered a shared-memory region). Not
+        // distinguishable from "a snapshot existed and was lost" at this
+        // layer alone - that's exactly why require_state_recovery is an
+        // explicit, transform-owned deploy-time choice rather than
+        // something inferred here.
+        co_return;
+    }
+    if (_engine->write_shared_memory(iobuf_to_bytes(*state))) {
+        vlog(
+          _logger.info,
+          "restored a persisted guest-state snapshot ({} bytes)",
+          state->size_bytes());
+        co_return;
+    }
+    // We have a persisted snapshot but couldn't deliver it into the
+    // guest's memory - the binary may have lost its shared_memory
+    // capability grant since the snapshot was taken, or this instance's
+    // guest hasn't registered a region (yet, or at all). Silently
+    // continuing would run the guest against wrong or zeroed state while
+    // a perfectly good snapshot sits unused - exactly the G12 failure
+    // mode this PR exists to eliminate.
+    _probe->increment_state_recovery_failure();
+    vlog(
+      _logger.error,
+      "failed to restore a persisted guest-state snapshot ({} bytes) into "
+      "this transform's guest memory",
+      state->size_bytes());
+    if (_meta.state_options.require_state_recovery) {
+        throw std::runtime_error(
+          "failed to restore required guest state on start");
+    }
+}
+
+ss::future<> processor::maybe_checkpoint_state() {
+    if (!_state_store) {
+        co_return;
+    }
+    auto now = ss::lowres_clock::now();
+    // _last_checkpoint_at starts at time_point::min() so the very first
+    // successful batch always checkpoints - checked explicitly rather
+    // than via `now - _last_checkpoint_at`, which overflows the
+    // underlying duration when subtracting from min() and would
+    // otherwise wrap around to a value that looks smaller than
+    // checkpoint_interval, silently skipping that first checkpoint.
+    if (
+      _last_checkpoint_at != ss::lowres_clock::time_point::min()
+      && now - _last_checkpoint_at < checkpoint_interval) {
+        co_return;
+    }
+    auto state = _engine->read_shared_memory();
+    if (!state) {
+        // No shared_memory capability grant, or no region registered -
+        // this transform hasn't opted into state persistence at all.
+        // Still counts as "checked", so we don't retry every batch.
+        _last_checkpoint_at = now;
+        co_return;
+    }
+    co_await _state_store->save_state(std::move(*state));
+    _last_checkpoint_at = now;
 }
 
 ss::future<absl::flat_hash_map<model::output_topic_index, kafka::offset>>
@@ -354,6 +441,7 @@ ss::future<> processor::run_transform_loop() {
                     .then([] { return wasm::write_success::yes; });
               });
             _consecutive_transform_failures = 0;
+            co_await maybe_checkpoint_state();
         } catch (...) {
             // co_await isn't usable inside a catch handler, so this only
             // decides whether to give up - the actual dead-letter write (if

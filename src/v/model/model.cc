@@ -397,6 +397,8 @@ fmt::iterator format_to(record_batch_type bt, fmt::iterator out) {
         return fmt::format_to(out, "l1_stm");
     case record_batch_type::ct_read_replica_stm:
         return fmt::format_to(out, "ct_read_replica_stm");
+    case record_batch_type::transform_state_update:
+        return fmt::format_to(out, "batch_type::transform_state_update");
     }
     return fmt::format_to(
       out, "batch_type::unknown{{{}}}", static_cast<int>(bt));

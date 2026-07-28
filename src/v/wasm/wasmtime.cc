@@ -654,6 +654,39 @@ public:
         return true;
     }
 
+    std::optional<iobuf> read_shared_memory() final {
+        if (
+          !_shared_memory_module || !_shared_memory_module->region()
+          || !_store) {
+            return std::nullopt;
+        }
+        const auto& region = *_shared_memory_module->region();
+        auto* ctx = wasmtime_store_context(_store.get());
+        std::string_view memory_export_name = "memory";
+        wasmtime_extern_t memory_extern;
+        bool ok = wasmtime_instance_export_get(
+          ctx,
+          &_instance,
+          memory_export_name.data(),
+          memory_export_name.size(),
+          &memory_extern);
+        if (!ok || memory_extern.kind != WASMTIME_EXTERN_MEMORY) {
+            return std::nullopt;
+        }
+        // Fetched fresh, not cached - same reasoning as write_shared_memory.
+        size_t mem_size = wasmtime_memory_data_size(
+          ctx, &memory_extern.of.memory);
+        size_t region_end = size_t(region.ptr) + size_t(region.len);
+        if (region_end > mem_size) {
+            return std::nullopt;
+        }
+        const uint8_t* src = wasmtime_memory_data(ctx, &memory_extern.of.memory)
+                             + region.ptr;
+        iobuf out;
+        out.append(src, region.len);
+        return out;
+    }
+
     ss::future<> transform(
       model::record_batch batch,
       transform_probe* probe,

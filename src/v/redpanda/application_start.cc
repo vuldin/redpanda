@@ -52,6 +52,7 @@
 #include "storage/compaction_controller.h"
 #include "syschecks/syschecks.h"
 #include "transform/stm/transform_offsets_stm.h"
+#include "transform/stm/transform_state_stm.h"
 
 #include <seastar/core/condition-variable.hh>
 
@@ -66,6 +67,10 @@ void application::start_runtime_services(
           pm.register_factory<cluster::tm_stm_factory>();
           pm.register_factory<cluster::id_allocator_stm_factory>();
           pm.register_factory<transform::transform_offsets_stm_factory>();
+          pm.register_factory<transform::transform_state_stm_factory>(
+            storage.local().kvs(),
+            config::shard_local_cfg()
+              .data_transforms_state_snapshot_max_size.bind());
           pm.register_factory<cluster::rm_stm_factory>(
             config::shard_local_cfg().enable_transactions.value(),
             config::shard_local_cfg().enable_idempotence.value(),
