@@ -12,6 +12,7 @@
 #pragma once
 
 #include "base/seastarx.h"
+#include "bytes/bytes.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/transform.h"
@@ -50,6 +51,14 @@ public:
 
     virtual ss::future<> start() = 0;
     virtual ss::future<> stop() = 0;
+
+    // Writes into the shared-memory region a trusted guest has registered
+    // (config::wasm_capability::shared_memory - see PR-13 in the wasm
+    // roadmap doc), if any. Returns false, harmlessly, if this engine
+    // wasn't granted that capability or the guest hasn't registered a
+    // region yet - callers don't need to distinguish those cases, since
+    // both just mean "there's nothing to write into right now."
+    virtual bool write_shared_memory(bytes_view) { return false; }
 
     engine() = default;
     virtual ~engine() = default;

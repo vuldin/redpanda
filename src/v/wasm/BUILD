@@ -204,10 +204,21 @@ redpanda_cc_library(
         ":transform_probe",
         ":wasi_logger",
         "//src/v/base",
+        "//src/v/bytes",
         "//src/v/model",
         "//src/v/pandaproxy/schema_registry:server",
         "@fmt",
         "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "shared_memory_module",
+    srcs = [
+        "shared_memory_module.cc",
+    ],
+    hdrs = [
+        "shared_memory_module.h",
     ],
 )
 
@@ -226,6 +237,7 @@ redpanda_cc_library(
         ":logger",
         ":network_module",
         ":schema_registry_module",
+        ":shared_memory_module",
         ":transform_module",
         ":transform_probe",
         ":wasi",

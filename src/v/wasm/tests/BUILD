@@ -18,6 +18,7 @@ redpanda_test_cc_library(
         ":logger",
         "//src/v/base",
         "//src/v/bytes",
+        "//src/v/crypto",
         "//src/v/model",
         "//src/v/model/tests:random",
         "//src/v/pandaproxy/schema_registry:types",
@@ -82,6 +83,7 @@ filegroup(
         "//src/transform-sdk/go/transform/internal/testdata/dynamic",
         "//src/transform-sdk/go/transform/internal/testdata/identity",
         "//src/transform-sdk/go/transform/internal/testdata/schema-registry",
+        "//src/transform-sdk/go/transform/internal/testdata/shared-memory",
         "//src/transform-sdk/go/transform/internal/testdata/setup-panic",
         "//src/transform-sdk/go/transform/internal/testdata/transform-error",
         "//src/transform-sdk/go/transform/internal/testdata/transform-panic",
@@ -108,6 +110,27 @@ redpanda_cc_gtest(
         "//src/v/test_utils:gtest",
         "//src/v/wasm:wasi",
         "@abseil-cpp//absl/container:flat_hash_set",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "wasm_shared_memory_test",
+    timeout = "moderate",
+    srcs = [
+        "wasm_shared_memory_test.cc",
+    ],
+    cpu = 1,
+    data = [":wasm_test_assets"],
+    memory = "128MiB",
+    deps = [
+        ":wasm_fixture",
+        "//src/v/base",
+        "//src/v/bytes",
+        "//src/v/config",
+        "//src/v/test_utils:gtest",
+        "//src/v/wasm:api",
         "@googletest//:gtest",
         "@seastar",
     ],
