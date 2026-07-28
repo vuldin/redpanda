@@ -108,6 +108,31 @@ TEST(RecordBatchBuilderTest, empty_builder) {
     }
 }
 
+TEST(RecordBatchBuilderTest, producer_identity_and_base_sequence) {
+    // Defaults preserve today's non-idempotent behavior for any caller
+    // that doesn't opt in.
+    {
+        storage::record_batch_builder rbb(
+          model::record_batch_type::raft_data, model::offset(0));
+        rbb.add_raw_kv(std::nullopt, std::nullopt);
+        auto rb = std::move(rbb).build();
+        EXPECT_EQ(rb.header().producer_id, -1);
+        EXPECT_EQ(rb.header().producer_epoch, -1);
+        EXPECT_EQ(rb.header().base_sequence, -1);
+    }
+    {
+        storage::record_batch_builder rbb(
+          model::record_batch_type::raft_data, model::offset(0));
+        rbb.set_producer_identity(42, 7);
+        rbb.set_base_sequence(123);
+        rbb.add_raw_kv(std::nullopt, std::nullopt);
+        auto rb = std::move(rbb).build();
+        EXPECT_EQ(rb.header().producer_id, 42);
+        EXPECT_EQ(rb.header().producer_epoch, 7);
+        EXPECT_EQ(rb.header().base_sequence, 123);
+    }
+}
+
 TEST(RecordBatchBuilderTest, serialize_deserialize_then_cmp) {
     /// 1. Build working set for test
     const std::size_t total = random_generators::get_int(50, 100);

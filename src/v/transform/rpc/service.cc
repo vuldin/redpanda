@@ -167,23 +167,41 @@ ss::future<result<model::offset, cluster::errc>> local_service::produce(
         }
     }
     // TODO: schema validation
+    //
+    // Replicated one batch at a time via the batch_identity-aware
+    // overload rather than the plain bulk replicate() this used before,
+    // so a batch carrying a real producer_id (every transform output
+    // batch does) actually gets rm_stm's existing (producer_id, epoch,
+    // sequence) dedup fencing instead of silently bypassing it. batch_identity::
+    // from() derives cleanly from whatever the batch's own header
+    // already carries - a batch without a real producer_id (is_idempotent()
+    // false) takes the exact same code path partition::replicate_in_stages
+    // already used for a non-idempotent batch, so this is not a behavior
+    // change for any caller that doesn't set one. Requires
+    // enable_idempotence (on by default) - a cluster with it off will see
+    // "doesn't support idempotent requests" instead of a silent
+    // dedup-free fallback, which is the more honest failure mode.
     co_return co_await _partition_manager->invoke_on_shard(
       *shard,
       ntp,
       [timeout,
        batches = chunked_vector<model::record_batch>(
          std::from_range, std::move(batches) | std::views::as_rvalue)](
-        kafka::partition_proxy* partition) mutable {
-          return partition
-            ->replicate(std::move(batches), make_replicate_options(timeout))
-            .then(
-              [](result<model::offset> r)
-                -> result<model::offset, cluster::errc> {
-                  if (r.has_error()) {
-                      return map_errc(r.assume_error());
-                  }
-                  return r.value();
-              });
+        kafka::partition_proxy* partition) mutable
+        -> ss::future<result<model::offset, cluster::errc>> {
+          result<model::offset, cluster::errc> last_result
+            = cluster::errc::success;
+          for (auto& batch : batches) {
+              auto bid = model::batch_identity::from(batch.header());
+              auto stages = partition->replicate(
+                bid, std::move(batch), make_replicate_options(timeout));
+              auto r = co_await std::move(stages.replicate_finished);
+              if (r.has_error()) {
+                  co_return map_errc(r.assume_error());
+              }
+              last_result = r.value().last_offset;
+          }
+          co_return last_result;
       });
 }
 
