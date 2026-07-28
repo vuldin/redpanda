@@ -81,6 +81,18 @@ struct fixture_param {
     bool autostart = true;
 };
 
+model::transform_metadata with_max_retries(uint32_t max_retries) {
+    auto meta = testing::my_single_output_metadata;
+    meta.failure_policy.max_retries = max_retries;
+    return meta;
+}
+
+model::transform_metadata with_dead_letter(uint32_t max_retries) {
+    auto meta = with_max_retries(max_retries);
+    meta.failure_policy.dead_letter_topic = model::random_topic_namespace();
+    return meta;
+}
+
 } // namespace
 
 class ProcessorTestFixture : public ::testing::TestWithParam<fixture_param> {
@@ -99,6 +111,12 @@ public:
         }
         auto offset_tracker = std::make_unique<testing::fake_offset_tracker>();
         _offset_tracker = offset_tracker.get();
+        std::unique_ptr<transform::sink> dead_letter_sink;
+        if (param.meta.failure_policy.dead_letter_topic) {
+            auto dl_sink = std::make_unique<testing::fake_sink>();
+            _dead_letter_sink = dl_sink.get();
+            dead_letter_sink = std::move(dl_sink);
+        }
         _probe.setup_metrics(param.meta);
         _p = std::make_unique<transform::processor>(
           testing::my_transform_id,
@@ -114,7 +132,8 @@ public:
           std::move(sinks),
           std::move(offset_tracker),
           &_probe,
-          &_memory_limits);
+          &_memory_limits,
+          std::move(dead_letter_sink));
         if (param.autostart) {
             _p->start().get();
             // Wait for the initial offset to be committed so we know that the
@@ -234,7 +253,19 @@ public:
         return _sinks[idx()]->empty();
     }
     uint64_t error_count() const { return _error_count; }
+    uint64_t given_up_count() const { return _probe._given_up; }
     int64_t lag() const { return _p->current_lag(); }
+
+    void fail_next_transforms(uint32_t n) {
+        _engine->set_failures_remaining(n);
+    }
+    model::record read_dead_letter(
+      std::chrono::milliseconds timeout = std::chrono::seconds(1)) {
+        return _dead_letter_sink->read(timeout).get();
+    }
+    bool dead_letter_empty() const {
+        return !_dead_letter_sink || _dead_letter_sink->empty();
+    }
 
     void cork_sink(model::output_topic_index idx) { _sinks[idx()]->cork(); }
     void uncork_sink(model::output_topic_index idx) { _sinks[idx()]->uncork(); }
@@ -285,6 +316,7 @@ private:
     testing::fake_source* _src = nullptr;
     testing::fake_offset_tracker* _offset_tracker = nullptr;
     std::vector<testing::fake_sink*> _sinks;
+    testing::fake_sink* _dead_letter_sink = nullptr;
     uint64_t _error_count = 0;
     probe _probe;
 };
@@ -529,6 +561,85 @@ INSTANTIATE_TEST_SUITE_P(
   ::testing::Values(
     fixture_param{testing::my_single_output_metadata},
     fixture_param{testing::my_multiple_output_metadata}));
+
+// Two separate aliases, each with its own single-value instantiation below
+// (the same shape ProcessorTimequeryTestFixture already uses) - not one
+// shared alias, since these two scenarios need different metadata
+// (dead_letter_topic set or not) and asserting the wrong one against the
+// other's param would be a real, not just cosmetic, mismatch.
+using ProcessorSkipPolicyTestFixture = ProcessorTestFixture;
+using ProcessorDeadLetterPolicyTestFixture = ProcessorTestFixture;
+
+// max_retries=2 allows 3 total attempts (the original, plus 2 retries)
+// before the processor gives up on a batch. The first 2 failures each go
+// through a full stop/restart cycle, identical to any other transform
+// failure today (RecoversFromProduceFailureViaRestart exercises that same
+// cycle) - only the 3rd is new behavior.
+TEST_P(ProcessorSkipPolicyTestFixture, GivesUpAfterMaxRetriesAndSkips) {
+    fail_next_transforms(100);
+    push_batch(make_records(1));
+    for (uint64_t attempt = 1; attempt <= 2; ++attempt) {
+        tests::drain_task_queue().get();
+        ASSERT_EQ(error_count(), attempt)
+          << "attempt " << attempt << " is still within max_retries, so it "
+          << "should error out and get restarted exactly like any other "
+             "transform failure";
+        restart();
+    }
+    // The 3rd attempt exceeds max_retries=2 - the processor gives up on
+    // this batch internally instead of erroring out a 3rd time.
+    tests::drain_task_queue().get();
+    EXPECT_EQ(error_count(), 2u)
+      << "giving up must not report a new error - the manager never needs "
+         "to restart the processor for this outcome";
+    EXPECT_TRUE(processor_running());
+    EXPECT_EQ(given_up_count(), 1u);
+    EXPECT_TRUE(dead_letter_empty())
+      << "no dead_letter_topic was configured, so the batch is just "
+         "skipped, not preserved anywhere";
+
+    // The poison batch is gone - a healthy batch now flows normally.
+    fail_next_transforms(0);
+    auto healthy = make_records(1);
+    push_batch(healthy);
+    EXPECT_THAT(read_records(1), SameRecords(healthy));
+}
+
+TEST_P(ProcessorDeadLetterPolicyTestFixture, GivesUpAndDeadLetters) {
+    fail_next_transforms(100);
+    auto poison = make_records(1);
+    push_batch(poison);
+    for (uint64_t attempt = 1; attempt <= 2; ++attempt) {
+        tests::drain_task_queue().get();
+        ASSERT_EQ(error_count(), attempt);
+        restart();
+    }
+    tests::drain_task_queue().get();
+    EXPECT_EQ(error_count(), 2u);
+    EXPECT_TRUE(processor_running());
+    EXPECT_EQ(given_up_count(), 1u);
+
+    // The raw, untransformed poison batch was produced to the dead-letter
+    // topic before the processor advanced past it.
+    std::vector<model::record> dead_lettered;
+    dead_lettered.push_back(read_dead_letter());
+    EXPECT_THAT(dead_lettered, SameRecords(poison));
+
+    fail_next_transforms(0);
+    auto healthy = make_records(1);
+    push_batch(healthy);
+    EXPECT_THAT(read_records(1), SameRecords(healthy));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  SkipPolicyProcessorTest,
+  ProcessorSkipPolicyTestFixture,
+  ::testing::Values(fixture_param{with_max_retries(2)}));
+
+INSTANTIATE_TEST_SUITE_P(
+  DeadLetterPolicyProcessorTest,
+  ProcessorDeadLetterPolicyTestFixture,
+  ::testing::Values(fixture_param{with_dead_letter(2)}));
 
 // Alias the test name so that we can write specialized tests for multiple
 // output topics.

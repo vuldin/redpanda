@@ -106,7 +106,8 @@ public:
       std::vector<std::unique_ptr<sink>>,
       std::unique_ptr<offset_tracker>,
       probe*,
-      memory_limits*);
+      memory_limits*,
+      std::unique_ptr<sink> dead_letter_sink = nullptr);
     processor(const processor&) = delete;
     processor(processor&&) = delete;
     processor& operator=(const processor&) = delete;
@@ -161,6 +162,21 @@ private:
     };
     absl::flat_hash_map<model::topic, output> _outputs;
     output* _default_output = nullptr;
+
+    // Only engaged if _meta.failure_policy.dead_letter_topic is set (see
+    // transform/api.cc's create_processor). Written directly, inline, from
+    // run_transform_loop's failure-policy branch - unlike _outputs, which
+    // goes through its own transfer_queue/producer-loop pair for ordinary
+    // backpressure-aware output, this is the rare, exceptional path and
+    // doesn't need that machinery.
+    std::unique_ptr<sink> _dead_letter_sink;
+    // Consecutive failures processing the batch currently at the front of
+    // _consumer_transform_pipe. Resets to 0 on any success, or once a
+    // batch is given up on and the loop moves to the next one. Survives a
+    // transform_manager-driven restart because the manager restarts by
+    // calling start() again on this same processor object, not by
+    // constructing a new one (see transform_manager.cc's start_processor).
+    uint32_t _consecutive_transform_failures{0};
 
     ss::abort_source _as;
     ss::future<> _task;

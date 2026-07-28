@@ -103,7 +103,8 @@ processor::processor(
   std::vector<std::unique_ptr<sink>> sinks,
   std::unique_ptr<offset_tracker> offset_tracker,
   probe* p,
-  memory_limits* mem_limits)
+  memory_limits* mem_limits,
+  std::unique_ptr<sink> dead_letter_sink)
   : _id(id)
   , _ntp(std::move(ntp))
   , _meta(std::move(meta))
@@ -114,6 +115,7 @@ processor::processor(
   , _probe(p)
   , _consumer_transform_pipe(&mem_limits->read_buffer_semaphore)
   , _outputs()
+  , _dead_letter_sink(std::move(dead_letter_sink))
   , _task(ss::now())
   , _logger(tlog, ss::format("{}/{}", _meta.name(), _ntp.tp.partition())) {
     const auto& outputs = _meta.output_topics;
@@ -322,24 +324,74 @@ ss::future<> processor::run_transform_loop() {
         auto source_timestamp = batch->header().max_timestamp;
         ss::chunked_fifo<model::transformed_data> transformed;
         vlog(_logger.trace, "transforming offset {}", offset);
-        co_await _engine->transform(
-          std::move(*batch),
-          _probe,
-          [this](
-            std::optional<model::topic_view> topic,
-            model::transformed_data data) {
-              if (!topic) {
-                  return _default_output->queue.push({std::move(data)}, &_as)
+        // Only copied when dead-lettering is actually configured - the one
+        // extra cost of that specific opt-in, not something every transform
+        // pays. batch is moved into _engine->transform() below regardless,
+        // so this is the only chance to keep the original bytes around for
+        // a possible dead-letter write below.
+        std::optional<model::record_batch> batch_for_dead_letter;
+        if (_dead_letter_sink) {
+            batch_for_dead_letter = batch->copy();
+        }
+        bool gave_up_on_batch = false;
+        try {
+            co_await _engine->transform(
+              std::move(*batch),
+              _probe,
+              [this](
+                std::optional<model::topic_view> topic,
+                model::transformed_data data) {
+                  if (!topic) {
+                      return _default_output->queue
+                        .push({std::move(data)}, &_as)
+                        .then([] { return wasm::write_success::yes; });
+                  }
+                  auto it = _outputs.find(topic.value());
+                  if (it == _outputs.end()) {
+                      return ssx::now(wasm::write_success::no);
+                  }
+                  return it->second.queue.push({std::move(data)}, &_as)
                     .then([] { return wasm::write_success::yes; });
-              }
-              auto it = _outputs.find(topic.value());
-              if (it == _outputs.end()) {
-                  return ssx::now(wasm::write_success::no);
-              }
-              return it->second.queue.push({std::move(data)}, &_as).then([] {
-                  return wasm::write_success::yes;
               });
-          });
+            _consecutive_transform_failures = 0;
+        } catch (...) {
+            // co_await isn't usable inside a catch handler, so this only
+            // decides whether to give up - the actual dead-letter write (if
+            // any) happens just below, once we're back in normal flow.
+            if (_as.abort_requested()) {
+                // Shutting down, not a genuine transform failure - propagate
+                // as before so the loop exits cleanly, uncounted.
+                throw;
+            }
+            ++_consecutive_transform_failures;
+            auto max_retries = _meta.failure_policy.max_retries;
+            if (
+              !max_retries || _consecutive_transform_failures <= *max_retries) {
+                // Preserves the original behavior exactly: propagates to
+                // handle_processor_task, which stops this processor and
+                // reports state::errored - transform_manager's existing
+                // exponential backoff (and its own increment_failure()
+                // call) restarts it from here, unchanged.
+                throw;
+            }
+            vlog(
+              _logger.error,
+              "giving up on offset {} after {} consecutive failures ({}): "
+              "{}",
+              offset,
+              _consecutive_transform_failures,
+              _dead_letter_sink ? "dead-lettering" : "skipping",
+              std::current_exception());
+            _probe->increment_failure();
+            _probe->increment_given_up();
+            _consecutive_transform_failures = 0;
+            gave_up_on_batch = true;
+        }
+        if (gave_up_on_batch && _dead_letter_sink) {
+            ss::chunked_fifo<model::record_batch> batches;
+            batches.push_back(std::move(*batch_for_dead_letter));
+            co_await _dead_letter_sink->write(std::move(batches));
+        }
         vlog(_logger.trace, "transformed offset {}", offset);
         // Mark all queues as processsed up to this point.
         for (auto& [_, output] : _outputs) {
