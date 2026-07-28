@@ -59,6 +59,27 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "network_module",
+    srcs = [
+        "network_module.cc",
+    ],
+    hdrs = [
+        "network_module.h",
+    ],
+    implementation_deps = [
+        ":logger",
+        "//src/v/base",
+        "//src/v/net",
+    ],
+    deps = [
+        ":ffi",
+        "//src/v/utils:unresolved_address",
+        "@abseil-cpp//absl/container:flat_hash_map",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "schema_registry_module",
     srcs = [
         "schema_registry_module.cc",
@@ -203,11 +224,13 @@ redpanda_cc_library(
         ":engine_probe",
         ":ffi",
         ":logger",
+        ":network_module",
         ":schema_registry_module",
         ":transform_module",
         ":transform_probe",
         ":wasi",
         ":wasi_logger",
+        "//src/v/config",
         "//src/v/metrics",
         "//src/v/model",
         "//src/v/model:batch_compression",

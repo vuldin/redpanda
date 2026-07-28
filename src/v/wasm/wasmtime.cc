@@ -15,6 +15,7 @@
 #include "base/type_traits.h"
 #include "base/vassert.h"
 #include "base/vlog.h"
+#include "config/configuration.h"
 #include "engine_probe.h"
 #include "ffi.h"
 #include "logger.h"
@@ -24,6 +25,7 @@
 #include "model/record.h"
 #include "model/timestamp.h"
 #include "model/transform.h"
+#include "network_module.h"
 #include "schema_registry_module.h"
 #include "ssx/thread_worker.h"
 #include "transform_module.h"
@@ -471,12 +473,30 @@ public:
 
     memory_limits mem_limits() const { return _memory_limits; }
 
+    // The targets the `network` capability was linked against, decided
+    // once in make_factory from the trust config at compile time, or
+    // nullopt if that capability wasn't granted. wasmtime_engine's
+    // constructor reads this directly - rather than re-querying config
+    // itself - so an engine instance's runtime state always matches
+    // exactly what was actually linked in, with no possibility of drift if
+    // the trust config changes in between: a since-revoked binary keeps
+    // working with the access it already had baked in, rather than hitting
+    // an inconsistency the moment a guest calls into it. A newly-recompiled
+    // instance (new deploy, or engine cache eviction) picks up a
+    // revocation on its next compile.
+    const std::optional<std::vector<net::unresolved_address>>&
+    network_allowed_targets() const noexcept {
+        return _network_allowed_targets;
+    }
+
 private:
     friend class wasmtime_runtime;
     handle<wasmtime_instance_pre_t, wasmtime_instance_pre_delete> _underlying
       = nullptr;
     memory_limits _memory_limits;
     ss::noncopyable_function<void() noexcept> _cleanup_fn;
+    std::optional<std::vector<net::unresolved_address>>
+      _network_allowed_targets;
 };
 
 absl::flat_hash_map<ss::sstring, ss::sstring>
@@ -501,6 +521,23 @@ extract_output_topics(const model::transform_metadata& meta) {
     return topics;
 }
 
+// Looks up whether this exact wasm binary - identified by its own content
+// hash, not by transform name, see PR-13 in the wasm roadmap doc - has been
+// granted any elevated capabilities by a cluster admin. Only ever called
+// synchronously (from wasmtime_engine's constructor), so the returned
+// pointer is never held across a suspension point and can't be invalidated
+// by a concurrent config update.
+const config::wasm_trusted_module*
+find_trusted_module(const model::transform_metadata& meta) {
+    if (meta.binary_sha256.empty()) {
+        return nullptr;
+    }
+    const auto& trusted = config::shard_local_cfg().wasm_trusted_modules();
+    auto it = std::ranges::find(
+      trusted, meta.binary_sha256, &config::wasm_trusted_module::sha256_hex);
+    return it != trusted.end() ? &*it : nullptr;
+}
+
 class wasmtime_engine : public engine {
 public:
     wasmtime_engine(
@@ -518,7 +555,16 @@ public:
       , _sr_module(sr)
       , _wasi_module(
           {_meta.name()}, make_environment_vars(_meta), _logger.get())
-      , _transform_module(extract_output_topics(_meta)) {}
+      , _transform_module(extract_output_topics(_meta)) {
+        // Reads what was actually linked into this precompiled module
+        // (decided once, in make_factory), not a fresh config lookup - see
+        // preinitialized_instance::network_allowed_targets for why.
+        if (
+          const auto& targets = _preinitialized->network_allowed_targets();
+          targets) {
+            _network_module.emplace(*targets);
+        }
+    }
     wasmtime_engine(const wasmtime_engine&) = delete;
     wasmtime_engine& operator=(const wasmtime_engine&) = delete;
     wasmtime_engine(wasmtime_engine&&) = delete;
@@ -539,6 +585,9 @@ public:
           std::make_exception_ptr(
             wasm_exception("vm was shutdown", errc::engine_shutdown)));
         co_await std::move(main);
+        if (_network_module) {
+            co_await _network_module->stop();
+        }
         // Deleting the store invalidates the instance and actually frees the
         // memory for the underlying instance.
         _store = nullptr;
@@ -578,6 +627,8 @@ public:
             return &_transform_module;
         } else if constexpr (std::is_same_v<T, schema_registry_module>) {
             return &_sr_module;
+        } else if constexpr (std::is_same_v<T, network_module>) {
+            return &_network_module.value();
         } else {
             static_assert(
               base::unsupported_type<T>::value, "unsupported module");
@@ -911,6 +962,12 @@ private:
     schema_registry_module _sr_module;
     wasi::preview1_module _wasi_module;
     transform_module _transform_module;
+    // Only engaged for a binary specifically granted the `network`
+    // capability in config::wasm_trusted_modules (see find_trusted_module
+    // and the constructor) - register_network_module is only ever called
+    // when this is engaged, so get_module<network_module>() below is only
+    // ever reached for an engine that actually has one.
+    std::optional<network_module> _network_module;
 
     // The following state is only valid if there is a non-null store.
     handle<wasmtime_store_t, wasmtime_store_delete> _store;
@@ -1343,6 +1400,19 @@ void register_sr_module(
 #undef REG_HOST_FN
 }
 
+void register_network_module(
+  wasmtime_linker_t* linker, const strict_stack_config& ssc) {
+    // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define REG_HOST_FN(name)                                                      \
+    host_function<&network_module::name>::reg(linker, #name, ssc)
+    REG_HOST_FN(check_abi_version_0);
+    REG_HOST_FN(connect);
+    REG_HOST_FN(send);
+    REG_HOST_FN(recv);
+    REG_HOST_FN(close);
+#undef REG_HOST_FN
+}
+
 class wasmtime_engine_factory : public factory {
 public:
     wasmtime_engine_factory(
@@ -1554,8 +1624,19 @@ ss::future<ss::shared_ptr<factory>> wasmtime_runtime::make_factory(
                      ? &_stack_allocator
                      : nullptr,
     };
+    // Looked up here, on the reactor thread, rather than inside the alien-
+    // thread lambda below: config::shard_local_cfg() is only safe to read
+    // from the reactor thread on this shard, not from an arbitrary OS
+    // thread that could run concurrently with a live config update.
+    const auto* trusted = find_trusted_module(meta);
+    bool grant_network = trusted
+                         && trusted->has_capability(
+                           ::config::wasm_capability::network);
+    if (grant_network) {
+        preinitialized->_network_allowed_targets = trusted->allowed_targets;
+    }
     size_t memory_usage_size = co_await _alien_thread.submit(
-      [this, &meta, buf = buf().get(), &preinitialized, &ssc] {
+      [this, &meta, buf = buf().get(), &preinitialized, &ssc, grant_network] {
           vlog(wasm_log.debug, "compiling wasm module {}", meta.name);
           // This can be a large contiguous allocation, however it happens
           // on an alien thread so it bypasses the seastar allocator.
@@ -1575,6 +1656,16 @@ ss::future<ss::shared_ptr<factory>> wasmtime_runtime::make_factory(
           register_transform_module(linker.get(), ssc);
           register_sr_module(linker.get(), ssc);
           register_wasi_module(linker.get(), ssc);
+          // Trust is a property of this exact binary (meta.binary_sha256),
+          // decided once (on the reactor thread, above) at compile+link
+          // time and then shared by every wasmtime_engine instance that
+          // reuses this cached, pre-linked module (see PR-05's
+          // (deploy_offset, ntp) cache key) - an untrusted binary never has
+          // this host module linked in at all, so it cannot even attempt
+          // to import it, let alone call it.
+          if (grant_network) {
+              register_network_module(linker.get(), ssc);
+          }
 
           error.reset(wasmtime_linker_instantiate_pre(
             linker.get(),
