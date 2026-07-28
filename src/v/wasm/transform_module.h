@@ -68,16 +68,26 @@ public:
 
     // Called before surfacing a record to the VM.
     virtual void pre_record() = 0;
+    // Called when a new batch becomes available after the guest was
+    // blocked waiting for one (transform_module::guest_wait_for_batch).
+    // That wait can be arbitrarily long for a caught-up, idle transform
+    // (it only resolves once new data actually arrives) and must never
+    // count against the per-invocation deadline the way active guest
+    // execution does -
+    // this resets the clock for the batch that's about to be surfaced,
+    // the same way pre_record() does per record, without also touching
+    // pre_record()'s per-record latency measurement (a wait for new
+    // data isn't itself a record being processed).
+    virtual void reset_deadline() = 0;
     // Called for each record output from the VM. `partition_key`, if set,
-    // is guest-chosen (PR-17(b) in the wasm roadmap doc) and should route
-    // this record to whatever output partition that key hashes to,
-    // consistent with normal Kafka key-based partitioning - instead of
-    // the default same-index-as-input-partition routing.
+    // is guest-chosen and should route this record to whatever output
+    // partition that key hashes to, consistent with normal Kafka
+    // key-based partitioning - instead of the default
+    // same-index-as-input-partition routing.
     virtual ss::future<write_success> emit(
       std::optional<model::topic_view>,
       std::optional<iobuf> partition_key,
-      model::transformed_data)
-      = 0;
+      model::transformed_data) = 0;
     // Called after a VM specifies it's done with a record.
     virtual void post_record() = 0;
 };
@@ -104,12 +114,12 @@ struct batch_transform_context {
     // Records written by the guest via write_record/write_record_with_options,
     // buffered here (synchronously, non-blocking) rather than emitted
     // immediately. Drained - with the real, backpressure-capable emit() -
-    // once per batch. See the PR-08 finding in the wasm roadmap doc: this is
-    // what lets write_record avoid Wasmtime's async host-call path on every
-    // record while still applying real backpressure, just at a coarser
-    // granularity. The topic and partition key are owned (not views)
-    // because the guest memory backing write_record_with_options's options
-    // buffer is only valid for the duration of that one call.
+    // once per batch: this is what lets write_record avoid Wasmtime's async
+    // host-call path on every record while still applying real
+    // backpressure, just at a coarser granularity. The topic and partition
+    // key are owned (not views) because the guest memory backing
+    // write_record_with_options's options buffer is only valid for the
+    // duration of that one call.
     ss::chunked_fifo<pending_write> pending_writes;
 };
 
@@ -179,9 +189,9 @@ public:
     // Synchronous: unlike read_batch_header, this never needs to suspend.
     // The whole batch's bytes are already resident in host memory (parsed
     // by for_each_record_async before the guest is woken), so there is
-    // nothing to wait on here. See the PR-08 finding in the wasm roadmap
-    // doc for why this matters: an `ss::future<T>` return type forces
-    // Wasmtime's heavier async host-call path on every single record.
+    // nothing to wait on here, which matters because an `ss::future<T>`
+    // return type forces Wasmtime's heavier async host-call path on every
+    // single record.
     int32_t read_next_record(
       uint8_t* attributes,
       int64_t* timestamp_delta,

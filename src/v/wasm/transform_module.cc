@@ -38,9 +38,8 @@ constexpr int32_t INVALID_WRITE = -3;
 
 struct write_options {
     std::optional<model::topic_view> topic;
-    // Guest-chosen output partition key (PR-17(b) in the wasm roadmap
-    // doc) - a view into options_buf, so callers must copy it out before
-    // that guest memory becomes invalid.
+    // Guest-chosen output partition key - a view into options_buf, so
+    // callers must copy it out before that guest memory becomes invalid.
     std::optional<std::string_view> partition_key;
 
     static std::optional<write_options> parse(ffi::array<uint8_t> buffer) {
@@ -126,8 +125,8 @@ ss::future<> transform_module::for_each_record_async(
     // Draining is only attempted on the success path: a failure here means
     // the engine is stopping or restarting (transform_module::stop() breaks
     // the condition variables), and anything still buffered is lost exactly
-    // like any other in-flight state on error/restart (see G12 in the wasm
-    // roadmap doc) - not a new loss mode introduced by buffering writes.
+    // like any other in-flight state on error/restart - not a new loss mode
+    // introduced by buffering writes.
     try {
         co_await host_wait_for_proccessing();
         co_await drain_pending_writes();
@@ -173,6 +172,17 @@ ss::future<int32_t> transform_module::read_batch_header(
     if (!_call_ctx) {
         co_return NO_ACTIVE_TRANSFORM;
     }
+    // The wait above can be arbitrarily long for a caught-up, idle
+    // transform (it only resolves once new data actually arrives) -
+    // without this, the deadline set by the last pre_record() (or, for
+    // the very first batch, VM start) is still whatever it was before
+    // the wait began, so an idle gap longer than the configured
+    // per-invocation timeout guarantees this batch's first record traps
+    // immediately, regardless of how fast it would actually process.
+    // Found via a real ~1s tail-latency outlier that traced back to a
+    // restart firing within 1ms of VM start, i.e. an idle-then-busy
+    // transform poisoning its own first record on wakeup.
+    _call_ctx->callback->reset_deadline();
     const model::record_batch_header& header = _call_ctx->batch_header;
     *base_offset = header.base_offset();
     *record_count = header.record_count;
