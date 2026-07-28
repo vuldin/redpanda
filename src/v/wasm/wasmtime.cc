@@ -571,7 +571,9 @@ public:
         if (
           const auto& targets = _preinitialized->network_allowed_targets();
           targets) {
-            _network_module.emplace(*targets);
+            _network_module.emplace(*targets, [this](bytes_view data) {
+                return write_shared_memory(data);
+            });
         }
         if (_preinitialized->shared_memory_granted()) {
             _shared_memory_module.emplace();
@@ -1470,6 +1472,15 @@ void register_network_module(
 #undef REG_HOST_FN
 }
 
+// Registered separately from register_network_module, and only when
+// `shared_memory` is granted in addition to `network` - see the call site
+// in make_factory. Still under network_module::name, the same wasm import
+// module a guest already sees connect/send/recv/close under.
+void register_network_bulk_load_function(
+  wasmtime_linker_t* linker, const strict_stack_config& ssc) {
+    host_function<&network_module::bulk_load>::reg(linker, "bulk_load", ssc);
+}
+
 void register_shared_memory_module(
   wasmtime_linker_t* linker, const strict_stack_config& ssc) {
     // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
@@ -1741,6 +1752,15 @@ ss::future<ss::shared_ptr<factory>> wasmtime_runtime::make_factory(
           // to import it, let alone call it.
           if (grant_network) {
               register_network_module(linker.get(), ssc);
+              // bulk_load delivers through the shared_memory region, so it
+              // only makes sense - and is only actually linked in - when
+              // both capabilities are granted to this exact binary. This is
+              // a link-time AND, not a runtime check: a binary with only
+              // `network` cannot even import bulk_load, the same
+              // enforcement PR-13 already relies on elsewhere.
+              if (grant_shared_memory) {
+                  register_network_bulk_load_function(linker.get(), ssc);
+              }
           }
           if (grant_shared_memory) {
               register_shared_memory_module(linker.get(), ssc);

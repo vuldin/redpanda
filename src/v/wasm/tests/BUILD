@@ -80,8 +80,10 @@ redpanda_cc_gtest(
 filegroup(
     name = "wasm_test_assets",
     srcs = [
+        "//src/transform-sdk/go/transform/internal/testdata/bulk-load",
         "//src/transform-sdk/go/transform/internal/testdata/dynamic",
         "//src/transform-sdk/go/transform/internal/testdata/identity",
+        "//src/transform-sdk/go/transform/internal/testdata/network-echo",
         "//src/transform-sdk/go/transform/internal/testdata/schema-registry",
         "//src/transform-sdk/go/transform/internal/testdata/shared-memory",
         "//src/transform-sdk/go/transform/internal/testdata/setup-panic",
@@ -130,6 +132,28 @@ redpanda_cc_gtest(
         "//src/v/bytes",
         "//src/v/config",
         "//src/v/test_utils:gtest",
+        "//src/v/wasm:api",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "wasm_network_test",
+    timeout = "moderate",
+    srcs = [
+        "wasm_network_test.cc",
+    ],
+    cpu = 1,
+    data = [":wasm_test_assets"],
+    memory = "128MiB",
+    deps = [
+        ":wasm_fixture",
+        "//src/v/base",
+        "//src/v/bytes",
+        "//src/v/config",
+        "//src/v/test_utils:gtest",
+        "//src/v/utils:unresolved_address",
         "//src/v/wasm:api",
         "@googletest//:gtest",
         "@seastar",

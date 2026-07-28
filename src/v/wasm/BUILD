@@ -73,6 +73,7 @@ redpanda_cc_library(
     ],
     deps = [
         ":ffi",
+        "//src/v/bytes",
         "//src/v/utils:unresolved_address",
         "@abseil-cpp//absl/container:flat_hash_map",
         "@seastar",
