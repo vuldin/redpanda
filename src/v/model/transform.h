@@ -195,12 +195,50 @@ struct transform_offset_options
 };
 
 /**
+ * The policy for what happens when a transform's guest code repeatedly
+ * fails to process the same batch.
+ *
+ * The default - max_retries unset - is the original behavior: retry
+ * forever, via transform_manager's existing exponential backoff. Once
+ * max_retries is set and a batch has failed that many consecutive times,
+ * the processor gives up on it - advancing past it instead of stalling the
+ * partition indefinitely on one poison batch - and, if dead_letter_topic is
+ * also set, produces the raw (untransformed) batch there first.
+ */
+struct transform_failure_policy
+  : serde::envelope<
+      transform_failure_policy,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    std::optional<uint32_t> max_retries;
+    // Only meaningful when max_retries is set. A batch that exhausts its
+    // retries is produced here, as-is, before the processor advances past
+    // it. If unset, an exhausted batch is just skipped - counted and
+    // logged, but not preserved anywhere.
+    std::optional<model::topic_namespace> dead_letter_topic;
+
+    auto serde_fields() { return std::tie(max_retries, dead_letter_topic); }
+
+    bool operator==(const transform_failure_policy&) const = default;
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        it = fmt::format_to(it, "{{ max_retries: ");
+        it = max_retries ? fmt::format_to(it, "{}", *max_retries)
+                         : fmt::format_to(it, "unlimited");
+        it = fmt::format_to(it, ", dead_letter_topic: ");
+        it = dead_letter_topic ? fmt::format_to(it, "{}", *dead_letter_topic)
+                               : fmt::format_to(it, "none");
+        return fmt::format_to(it, " }}");
+    }
+};
+
+/**
  * Metadata for a WebAssembly powered data transforms.
  */
 struct transform_metadata
   : serde::envelope<
       transform_metadata,
-      serde::version<3>,
+      serde::version<4>,
       serde::compat_version<0>> {
     // The user specified name of the transform.
     transform_name name;
@@ -234,6 +272,12 @@ struct transform_metadata
     // so redeploying different code under the same transform name changes
     // this value and does not inherit any trust granted to the old one.
     ss::sstring binary_sha256;
+
+    // What to do when this transform's guest code repeatedly fails to
+    // process the same batch. Defaults to unlimited retry (see
+    // transform_failure_policy), i.e. byte-identical behavior to before
+    // this field existed for any transform that doesn't set it.
+    transform_failure_policy failure_policy;
 
     friend bool
     operator==(const transform_metadata&, const transform_metadata&) = default;

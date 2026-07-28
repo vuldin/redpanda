@@ -147,7 +147,7 @@ fmt::iterator transform_metadata::format_to(fmt::iterator it) const {
       it,
       "{{name: \"{}\", input: {}, outputs: {}, "
       "env: <redacted>, uuid: {}, source_ptr: {}, is_paused: {}, "
-      "binary_sha256: {} }}",
+      "binary_sha256: {}, failure_policy: {} }}",
       name,
       input_topic,
       output_topics,
@@ -155,7 +155,8 @@ fmt::iterator transform_metadata::format_to(fmt::iterator it) const {
       uuid,
       source_ptr,
       paused,
-      binary_sha256);
+      binary_sha256,
+      failure_policy);
 }
 
 void transform_metadata::serde_write(iobuf& out) const {
@@ -177,6 +178,7 @@ void transform_metadata::serde_write(iobuf& out) const {
     serde::write(out, paused);
     serde::write(out, compression_mode);
     serde::write(out, binary_sha256);
+    serde::write(out, failure_policy);
 }
 
 void transform_metadata::serde_read(iobuf_parser& in, const serde::header& h) {
@@ -201,6 +203,10 @@ void transform_metadata::serde_read(iobuf_parser& in, const serde::header& h) {
     }
     if (h._version >= 3) {
         binary_sha256 = read_nested<decltype(binary_sha256)>(
+          in, h._bytes_left_limit);
+    }
+    if (h._version >= 4) {
+        failure_policy = read_nested<decltype(failure_policy)>(
           in, h._bytes_left_limit);
     }
 }

@@ -465,6 +465,15 @@ public:
             sinks.push_back(std::move(sink));
         }
 
+        std::unique_ptr<sink> dead_letter_sink;
+        if (meta.failure_policy.dead_letter_topic) {
+            dead_letter_sink = std::make_unique<rpc_client_sink>(
+              meta.failure_policy.dead_letter_topic->tp,
+              ntp.tp.partition,
+              _topic_table,
+              _client);
+        }
+
         auto offset_tracker = std::make_unique<offset_tracker_impl>(
           id,
           ntp.tp.partition,
@@ -483,7 +492,8 @@ public:
           std::move(sinks),
           std::move(offset_tracker),
           p,
-          ml);
+          ml,
+          std::move(dead_letter_sink));
     }
 
 private:

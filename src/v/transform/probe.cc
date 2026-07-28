@@ -71,6 +71,17 @@ void probe::setup_metrics(const model::transform_metadata& meta) {
         labels)
         .aggregate({sm::shard_label}));
     metric_defs.emplace_back(
+      sm::make_counter(
+        "batches_given_up",
+        [this] { return _given_up; },
+        sm::description(
+          "The number of batches this transform gave up on after "
+          "exhausting transform_failure_policy::max_retries - each was "
+          "either skipped or dead-lettered, then the processor advanced "
+          "past it instead of stalling the partition"),
+        labels)
+        .aggregate({sm::shard_label}));
+    metric_defs.emplace_back(
       sm::make_histogram(
         "input_delay_seconds",
         sm::description(
@@ -144,6 +155,7 @@ void probe::increment_write_bytes(
 }
 void probe::increment_read_bytes(uint64_t bytes) { _read_bytes += bytes; }
 void probe::increment_failure() { ++_failures; }
+void probe::increment_given_up() { ++_given_up; }
 void probe::state_change(processor_state_change change) {
     if (change.from) {
         _processor_state[*change.from] -= 1;

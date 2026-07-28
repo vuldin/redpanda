@@ -196,6 +196,19 @@ void validate_transform_deploy_document(const json::Document& doc) {
             },
             "required": ["format", "value"],
             "additionalProperties": false
+        },
+        "failure_policy": {
+            "type": "object",
+            "properties": {
+                "max_retries": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "dead_letter_topic": {
+                    "type": "string"
+                }
+            },
+            "additionalProperties": false
         }
     },
     "required": ["name", "input_topic", "output_topics"],
@@ -302,6 +315,19 @@ admin_server::deploy_transform(std::unique_ptr<ss::http::request> req) {
         }
     }
 
+    model::transform_failure_policy failure_policy{};
+    if (doc.HasMember("failure_policy")) {
+        auto fp = doc["failure_policy"].GetObject();
+        if (fp.HasMember("max_retries")) {
+            failure_policy.max_retries = fp["max_retries"].GetUint();
+        }
+        if (fp.HasMember("dead_letter_topic")) {
+            failure_policy.dead_letter_topic = model::topic_namespace(
+              model::kafka_namespace,
+              model::topic(fp["dead_letter_topic"].GetString()));
+        }
+    }
+
     // Now do the deploy!
     std::error_code ec = co_await _transform_service->local().deploy_transform(
       {
@@ -311,6 +337,7 @@ admin_server::deploy_transform(std::unique_ptr<ss::http::request> req) {
         .environment = std::move(env),
         .offset_options = offset_opts,
         .compression_mode = compression,
+        .failure_policy = failure_policy,
       },
       model::wasm_binary_iobuf(std::make_unique<iobuf>(std::move(body))));
 

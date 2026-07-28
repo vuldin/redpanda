@@ -61,12 +61,20 @@ public:
     void set_output_topics(std::vector<model::topic> topics);
     void set_use_default_output_topic();
 
+    /**
+     * Make the next `n` calls to transform() throw, simulating guest code
+     * (or the engine itself) repeatedly failing - for exercising
+     * transform_failure_policy. Calls past the nth succeed normally again.
+     */
+    void set_failures_remaining(uint32_t n);
+
     ss::future<> start() override;
     ss::future<> stop() override;
 
 private:
     bool _started = false;
     std::optional<std::vector<model::topic>> _output_topics;
+    uint32_t _failures_remaining = 0;
 };
 
 class fake_source : public source {

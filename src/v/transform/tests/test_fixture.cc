@@ -191,10 +191,18 @@ void fake_wasm_engine::set_use_default_output_topic() {
     _output_topics = std::nullopt;
 }
 
+void fake_wasm_engine::set_failures_remaining(uint32_t n) {
+    _failures_remaining = n;
+}
+
 ss::future<> fake_wasm_engine::transform(
   model::record_batch batch,
   wasm::transform_probe*,
   wasm::transform_callback cb) {
+    if (_failures_remaining > 0) {
+        --_failures_remaining;
+        throw std::runtime_error("simulated transform failure");
+    }
     auto it = model::record_batch_copy_iterator::create(batch);
     while (it.has_next()) {
         auto transformed = model::transformed_data::from_record(it.next());
