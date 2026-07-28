@@ -167,11 +167,26 @@ public:
         co_return _produced_batches->back().batch.last_offset();
     }
 
+    // The batch_identity-aware overload, which the transform produce path
+    // uses so that a batch carrying a producer_id gets rm_stm's dedup
+    // fencing. There is no stm here, so the identity is ignored and the batch
+    // is recorded exactly as the bulk overload above records it - a test that
+    // needs real dedup semantics needs a real partition, not this fake.
     raft::replicate_stages replicate(
       model::batch_identity,
-      model::record_batch,
+      model::record_batch batch,
       raft::replicate_options) final {
-        throw std::runtime_error("unimplemented");
+        batch.header().base_offset = model::next_offset(latest_offset());
+        auto last_offset = batch.last_offset();
+        _produced_batches->emplace_back(_ntp, std::move(batch));
+        return {
+          ss::now(),
+          ss::make_ready_future<result<raft::replicate_result>>(
+            raft::replicate_result{
+              .last_offset = last_offset,
+              // Nothing reaches raft through this fake, so there is no real
+              // term to report and no caller that reads one.
+              .last_term = model::term_id(1)})};
     }
 
     result<kafka::partition_info> get_partition_info() const override {

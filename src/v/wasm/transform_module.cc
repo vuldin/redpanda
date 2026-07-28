@@ -38,20 +38,34 @@ constexpr int32_t INVALID_WRITE = -3;
 
 struct write_options {
     std::optional<model::topic_view> topic;
+    // Guest-chosen output partition key (PR-17(b) in the wasm roadmap
+    // doc) - a view into options_buf, so callers must copy it out before
+    // that guest memory becomes invalid.
+    std::optional<std::string_view> partition_key;
 
     static std::optional<write_options> parse(ffi::array<uint8_t> buffer) {
         constexpr uint8_t output_topic_key = 0x01;
+        constexpr uint8_t partition_key_key = 0x02;
 
         ffi::reader r(buffer);
         write_options opts;
-        if (r.remaining_bytes() > 0) {
-            if (r.read_byte() != output_topic_key) {
+        while (r.remaining_bytes() > 0) {
+            switch (r.read_byte()) {
+            case output_topic_key:
+                if (opts.topic) {
+                    return std::nullopt;
+                }
+                opts.topic = model::topic_view(r.read_sized_string_view());
+                break;
+            case partition_key_key:
+                if (opts.partition_key) {
+                    return std::nullopt;
+                }
+                opts.partition_key = r.read_sized_string_view();
+                break;
+            default:
                 return std::nullopt;
             }
-            opts.topic = model::topic_view(r.read_sized_string_view());
-        }
-        if (r.remaining_bytes() > 0) {
-            return std::nullopt;
         }
         return opts;
     }
@@ -234,7 +248,11 @@ int32_t transform_module::write_record(ffi::array<uint8_t> buf) {
     if (!d) {
         return INVALID_BUFFER;
     }
-    _call_ctx->pending_writes.emplace_back(std::nullopt, *std::move(d));
+    _call_ctx->pending_writes.push_back(
+      pending_write{
+        .topic = std::nullopt,
+        .partition_key = std::nullopt,
+        .data = *std::move(d)});
     return int32_t(buf.size());
 }
 
@@ -258,14 +276,24 @@ int32_t transform_module::write_record_with_options(
     if (!is_valid_output_topic(options->topic)) {
         return INVALID_WRITE;
     }
-    // Own the topic name: options_buf is guest memory, only valid for the
-    // duration of this call, but pending_writes outlives it.
+    // Own the topic name and partition key: options_buf is guest memory,
+    // only valid for the duration of this call, but pending_writes
+    // outlives it.
     std::optional<model::topic> owned_topic;
     if (options->topic) {
         owned_topic = model::topic(*options->topic);
     }
-    _call_ctx->pending_writes.emplace_back(
-      std::move(owned_topic), *std::move(d));
+    std::optional<iobuf> owned_partition_key;
+    if (options->partition_key) {
+        owned_partition_key = iobuf();
+        owned_partition_key->append(
+          options->partition_key->data(), options->partition_key->size());
+    }
+    _call_ctx->pending_writes.push_back(
+      pending_write{
+        .topic = std::move(owned_topic),
+        .partition_key = std::move(owned_partition_key),
+        .data = *std::move(d)});
     return int32_t(buf.size());
 }
 
@@ -286,14 +314,14 @@ ss::future<> transform_module::drain_pending_writes() {
     }
     auto pending = std::exchange(_call_ctx->pending_writes, {});
     while (!pending.empty()) {
-        auto [topic, data] = std::move(pending.front());
+        auto w = std::move(pending.front());
         pending.pop_front();
         std::optional<model::topic_view> topic_view;
-        if (topic) {
-            topic_view = model::topic_view(*topic);
+        if (w.topic) {
+            topic_view = model::topic_view(*w.topic);
         }
         auto success = co_await _call_ctx->callback->emit(
-          topic_view, std::move(data));
+          topic_view, std::move(w.partition_key), std::move(w.data));
         if (success == write_success::no) {
             // Should be unreachable: write_record_with_options already
             // validated the topic synchronously via is_valid_output_topic.
@@ -301,7 +329,7 @@ ss::future<> transform_module::drain_pending_writes() {
               wasm_log.error,
               "dropped a buffered transform write to output topic {} that "
               "passed synchronous validation",
-              topic);
+              w.topic);
         }
     }
 }

@@ -75,11 +75,21 @@ struct progress_marker {
 };
 
 /**
+ * A single piece of transformed output, plus the guest-chosen output
+ * partition key, if any - nullopt means the default
+ * same-index-as-input-partition routing.
+ */
+struct keyed_transformed_data {
+    std::optional<iobuf> partition_key;
+    model::transformed_data data;
+};
+
+/**
  * A holder of the result of a transform, which is either a batch of data or a
  * marker recording progress through the input.
  */
 struct transformed_output {
-    std::variant<model::transformed_data, progress_marker> data;
+    std::variant<keyed_transformed_data, progress_marker> data;
 
     // How much memory this object is using.
     size_t memory_usage() const;

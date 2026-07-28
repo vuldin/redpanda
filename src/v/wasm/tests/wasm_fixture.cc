@@ -149,7 +149,7 @@ model::record_batch WasmTestFixture::transform(const model::record_batch& b) {
       ->transform(
         b.copy(),
         _probe.get(),
-        [&transformed](auto, model::transformed_data data) {
+        [&transformed](auto, auto, model::transformed_data data) {
             transformed.push_back(std::move(data));
             return ss::make_ready_future<wasm::write_success>(
               wasm::write_success::yes);
