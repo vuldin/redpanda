@@ -11,6 +11,7 @@
 
 #include "wasm/tests/wasm_fixture.h"
 
+#include "crypto/crypto.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/record_batch_types.h"
@@ -120,6 +121,12 @@ void WasmTestFixture::load_wasm(std::string_view filename) {
     for (auto& chunk : wasm_file) {
         buf()->append(std::move(chunk));
     }
+    // Mirrors service::deploy_transform's real computation (transform/
+    // api.cc) so tests that grant config::wasm_trusted_modules capabilities
+    // (keyed on this hash) see the same value production would - see
+    // wasm_shared_memory_test.cc for a real usage.
+    _meta.binary_sha256 = to_hex(
+      crypto::digest(crypto::digest_type::SHA256, iobuf_to_bytes(*buf())));
 
     _runtime->validate(model::share_wasm_binary(buf)).get();
     _factory = _runtime->make_factory(_meta, std::move(buf)).get();

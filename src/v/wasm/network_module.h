@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "bytes/bytes.h"
 #include "utils/unresolved_address.h"
 #include "wasm/ffi.h"
 
@@ -22,6 +23,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace wasm {
@@ -41,8 +43,17 @@ namespace wasm {
  */
 class network_module {
 public:
-    explicit network_module(
-      std::vector<net::unresolved_address> allowed_targets);
+    // shared_memory_sink delivers bytes into whatever region the guest has
+    // registered via shared_memory_module (PR-13c), if any - used only by
+    // bulk_load, and only ever actually linked into a guest's imports when
+    // both the `network` and `shared_memory` capabilities are granted (see
+    // wasmtime.cc). Always real (never null) when a network_module exists
+    // at all: wasmtime_engine::write_shared_memory already returns false,
+    // harmlessly, if shared_memory wasn't granted or no region is
+    // registered yet, so there is nothing extra to gate here.
+    network_module(
+      std::vector<net::unresolved_address> allowed_targets,
+      std::function<bool(bytes_view)> shared_memory_sink);
     network_module(const network_module&) = delete;
     network_module& operator=(const network_module&) = delete;
     network_module(network_module&&) = default;
@@ -74,6 +85,19 @@ public:
     // whether it already closed something.
     ss::future<int32_t> close(int32_t handle);
 
+    // One-shot bulk pull: dials allowed_targets[target_index], sends
+    // request, then reads the full response - looping host-side, not via
+    // N guest ABI calls - until the peer closes the connection or a
+    // size/time bound is hit, and delivers the result through the
+    // shared_memory_sink rather than back through this call directly, so
+    // an arbitrarily large response never needs to fit in a single ffi
+    // buffer. Returns the number of bytes delivered on success. This is
+    // for EP3-style one-shot rehydration pulls (e.g. SnapshotAPI.
+    // GetSnapshot) - the ongoing streaming subscriptions (ListenInstruments
+    // / StreamState / StreamTrades) still use plain connect/send/recv, kept
+    // open across transform() calls.
+    ss::future<int32_t>
+    bulk_load(uint32_t target_index, ffi::array<uint8_t> request);
     // End ABI exports
 
     // Aborts any in-flight connect and closes every open connection. Called
@@ -99,10 +123,19 @@ private:
         ss::output_stream<char> out;
     };
 
+    // Shared by connect() and bulk_load() - resolves and dials target,
+    // honoring _as so an in-flight dial gets aborted on stop(). Throws on
+    // a dial failure; callers translate that into the appropriate error
+    // code. Callers are responsible for validating target_index against
+    // _allowed_targets before calling this.
+    ss::future<ss::connected_socket>
+    dial(const net::unresolved_address& target);
+
     std::vector<net::unresolved_address> _allowed_targets;
     absl::flat_hash_map<int32_t, open_connection> _connections;
     int32_t _next_handle{0};
     ss::abort_source _as;
+    std::function<bool(bytes_view)> _shared_memory_sink;
 };
 
 } // namespace wasm
