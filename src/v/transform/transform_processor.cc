@@ -598,8 +598,15 @@ ss::future<> processor::run_producer_loop(
                 batch_records.push_back(std::move(next));
                 records.pop_front();
             }
+            // Preserves the original event's timestamp (G14) rather than
+            // stamping with this node's write-time wall clock - important
+            // for anything downstream that orders or windows by event
+            // time, not ingestion time. Falls back to now() only for the
+            // priming marker case, where no source batch has been seen
+            // yet in this flush cycle (progress_marker's own doc comment).
             auto batch = model::transformed_data::make_batch(
-              model::timestamp::now(), std::move(batch_records));
+              latest_source_timestamp.value_or(model::timestamp::now()),
+              std::move(batch_records));
             if (_meta.compression_mode != model::compression::none) {
                 batch = co_await model::compress_batch(
                   _meta.compression_mode, std::move(batch));
