@@ -1016,6 +1016,10 @@ private:
                 _measurement = _probe->latency_measurement();
             }
 
+            void reset_deadline() final {
+                _engine->reset_deadline(_context, _timeout);
+            }
+
             ss::future<write_success> emit(
               std::optional<model::topic_view> topic,
               std::optional<iobuf> partition_key,
