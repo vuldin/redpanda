@@ -10,6 +10,7 @@
  */
 
 #include "json/document.h"
+#include "model/timestamp.h"
 #include "wasm/tests/wasm_fixture.h"
 
 #include <algorithm>
@@ -17,7 +18,15 @@
 TEST_F(WasmTestFixture, Wasi) {
     load_wasm("wasi.wasm");
     auto batch = make_tiny_batch();
+    // Brackets the actual wall-clock call transform() makes into the
+    // guest. REALTIME_CLOCK_ID is a genuine broker wall-clock reading - it
+    // no longer echoes the record's own timestamp, which a producer fully
+    // controls, so this can only assert a real-time bound, not exact
+    // equality against batch.header().first_timestamp() the way it used
+    // to.
+    model::timestamp before = model::timestamp::now();
     auto result = transform(batch);
+    model::timestamp after = model::timestamp::now();
     const auto& result_records = result.copy_records();
     ASSERT_EQ(result_records.size(), 1);
     const auto& value = result_records.front().value().linearize_to_string();
@@ -48,9 +57,12 @@ TEST_F(WasmTestFixture, Wasi) {
     ASSERT_EQ(environment_variables, expected_env);
 
     using namespace std::chrono;
-    milliseconds now_ms = milliseconds(batch.header().first_timestamp());
-    nanoseconds now_ns = duration_cast<nanoseconds>(now_ms);
-    ASSERT_EQ(doc["NowNanos"].GetInt64(), now_ns.count());
+    nanoseconds before_ns = duration_cast<nanoseconds>(
+      milliseconds(before.value()));
+    nanoseconds after_ns = duration_cast<nanoseconds>(
+      milliseconds(after.value()));
+    ASSERT_GE(doc["NowNanos"].GetInt64(), before_ns.count());
+    ASSERT_LE(doc["NowNanos"].GetInt64(), after_ns.count());
 
     // The random number computed in wasm is dependent on how go computes
     // it's initial seed for it's random number generator.
