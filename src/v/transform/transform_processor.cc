@@ -242,8 +242,8 @@ ss::future<> processor::restore_guest_state() {
     // capability grant since the snapshot was taken, or this instance's
     // guest hasn't registered a region (yet, or at all). Silently
     // continuing would run the guest against wrong or zeroed state while
-    // a perfectly good snapshot sits unused - exactly the G12 failure
-    // mode this PR exists to eliminate.
+    // a perfectly good snapshot sits unused - exactly the failure mode
+    // durable state recovery exists to eliminate.
     _probe->increment_state_recovery_failure();
     vlog(
       _logger.error,
@@ -427,17 +427,21 @@ ss::future<> processor::run_transform_loop() {
               _probe,
               [this](
                 std::optional<model::topic_view> topic,
+                std::optional<iobuf> partition_key,
                 model::transformed_data data) {
+                  keyed_transformed_data keyed{
+                    .partition_key = std::move(partition_key),
+                    .data = std::move(data)};
                   if (!topic) {
                       return _default_output->queue
-                        .push({std::move(data)}, &_as)
+                        .push({std::move(keyed)}, &_as)
                         .then([] { return wasm::write_success::yes; });
                   }
                   auto it = _outputs.find(topic.value());
                   if (it == _outputs.end()) {
                       return ssx::now(wasm::write_success::no);
                   }
-                  return it->second.queue.push({std::move(data)}, &_as)
+                  return it->second.queue.push({std::move(keyed)}, &_as)
                     .then([] { return wasm::write_success::yes; });
               });
             _consecutive_transform_failures = 0;
@@ -478,7 +482,7 @@ ss::future<> processor::run_transform_loop() {
         if (gave_up_on_batch && _dead_letter_sink) {
             ss::chunked_fifo<model::record_batch> batches;
             batches.push_back(std::move(*batch_for_dead_letter));
-            co_await _dead_letter_sink->write(std::move(batches));
+            co_await _dead_letter_sink->write(std::move(batches), std::nullopt);
         }
         vlog(_logger.trace, "transformed offset {}", offset);
         // Mark all queues as processsed up to this point.
@@ -554,15 +558,38 @@ ss::future<> processor::run_producer_loop(
         }
         kafka::offset latest_offset = last_committed;
         std::optional<model::timestamp> latest_source_timestamp;
-        ss::chunked_fifo<model::transformed_data> records;
+        // Grouped by output partition key so records with different
+        // keys - and therefore different
+        // target partitions - never get merged into the same output
+        // batch. Insertion order preserved; a linear scan to find-or-
+        // create a group is fine since a single flush cycle is expected
+        // to touch a small number of distinct keys, not because this is
+        // a hot path (it very much is - see the roadmap's latency ledger
+        // for the rest of this loop).
+        std::vector<std::pair<
+          std::optional<iobuf>,
+          ss::chunked_fifo<model::transformed_data>>>
+          grouped_records;
         for (auto& entry : popped) {
             ss::visit(
               entry.data,
-              [&records, &suppress](model::transformed_data& d) {
+              [&grouped_records, &suppress](keyed_transformed_data& kd) {
                   if (suppress) {
                       return;
                   }
-                  records.push_back(std::move(d));
+                  auto it = std::ranges::find_if(
+                    grouped_records, [&kd](const auto& group) {
+                        return group.first == kd.partition_key;
+                    });
+                  if (it == grouped_records.end()) {
+                      grouped_records.emplace_back(
+                        kd.partition_key.has_value()
+                          ? std::optional<iobuf>(kd.partition_key->copy())
+                          : std::nullopt,
+                        ss::chunked_fifo<model::transformed_data>());
+                      it = std::prev(grouped_records.end());
+                  }
+                  it->second.push_back(std::move(kd.data));
               },
               [&latest_offset,
                &latest_source_timestamp,
@@ -579,35 +606,51 @@ ss::future<> processor::run_producer_loop(
                   }
               });
         }
-        while (!records.empty()) {
-            // TODO(rockwood): Lookup the output topic size instead of
-            // hardcoding the default value.
-            static constexpr size_t default_batch_size_limit = 1_MiB;
-            size_t current_size = 0;
-            ss::chunked_fifo<model::transformed_data> batch_records;
+        for (auto& [partition_key, records] : grouped_records) {
             while (!records.empty()) {
-                auto& next = records.front();
-                size_t next_size = current_size
-                                   + next.estimated_serialized_size();
-                if (
-                  !batch_records.empty()
-                  && next_size > default_batch_size_limit) {
-                    break;
+                // TODO: Look up the output topic's actual max batch size
+                // instead of hardcoding the default value.
+                static constexpr size_t default_batch_size_limit = 1_MiB;
+                size_t current_size = 0;
+                ss::chunked_fifo<model::transformed_data> batch_records;
+                while (!records.empty()) {
+                    auto& next = records.front();
+                    size_t next_size = current_size
+                                       + next.estimated_serialized_size();
+                    if (
+                      !batch_records.empty()
+                      && next_size > default_batch_size_limit) {
+                        break;
+                    }
+                    current_size = next_size;
+                    batch_records.push_back(std::move(next));
+                    records.pop_front();
                 }
-                current_size = next_size;
-                batch_records.push_back(std::move(next));
-                records.pop_front();
+                // Preserves the original event's timestamp rather
+                // than stamping with this node's write-time wall clock -
+                // important for anything downstream that orders or
+                // windows by event time, not ingestion time. Falls back
+                // to now() only for the priming marker case, where no
+                // source batch has been seen yet in this flush cycle
+                // (progress_marker's own doc comment).
+                auto batch = model::transformed_data::make_batch(
+                  latest_source_timestamp.value_or(model::timestamp::now()),
+                  std::move(batch_records));
+                if (_meta.compression_mode != model::compression::none) {
+                    batch = co_await model::compress_batch(
+                      _meta.compression_mode, std::move(batch));
+                }
+                _probe->increment_write_bytes(index, batch.size_bytes());
+                ss::chunked_fifo<model::record_batch> batches;
+                batches.push_back(std::move(batch));
+                // Copied (not moved) so the key survives for any further
+                // size-bounded sub-batches of this same group - iobuf has
+                // no copy constructor, only an explicit copy().
+                co_await sink->write(
+                  std::move(batches),
+                  partition_key ? std::optional<iobuf>(partition_key->copy())
+                                : std::nullopt);
             }
-            auto batch = model::transformed_data::make_batch(
-              model::timestamp::now(), std::move(batch_records));
-            if (_meta.compression_mode != model::compression::none) {
-                batch = co_await model::compress_batch(
-                  _meta.compression_mode, std::move(batch));
-            }
-            _probe->increment_write_bytes(index, batch.size_bytes());
-            ss::chunked_fifo<model::record_batch> batches;
-            batches.push_back(std::move(batch));
-            co_await sink->write(std::move(batches));
         }
         if (latest_offset > last_committed) {
             vlog(
@@ -668,11 +711,15 @@ size_t transformed_output::memory_usage() const {
     return sizeof(transformed_output)
            + ss::visit(
              data,
-             [](const model::transformed_data& d) {
-                 // Account for the size of this struct, but don't double count
-                 // sizeof(model::transformed_data), which d.memory_usage()
-                 // accounts for.
-                 return d.memory_usage() - sizeof(model::transformed_data);
+             [](const keyed_transformed_data& d) {
+                 // Account for the size of this struct, but don't double
+                 // count sizeof(model::transformed_data), which
+                 // d.data.memory_usage() accounts for.
+                 size_t key_size = d.partition_key
+                                     ? d.partition_key->size_bytes()
+                                     : 0;
+                 return d.data.memory_usage() - sizeof(model::transformed_data)
+                        + key_size;
              },
              [](const progress_marker&) { return size_t(0); });
 }

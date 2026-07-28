@@ -1018,8 +1018,9 @@ private:
 
             ss::future<write_success> emit(
               std::optional<model::topic_view> topic,
+              std::optional<iobuf> partition_key,
               model::transformed_data data) final {
-                return _cb(topic, std::move(data));
+                return _cb(topic, std::move(partition_key), std::move(data));
             }
 
             void post_record() final { _measurement = nullptr; }

@@ -68,11 +68,27 @@ public:
 
     // Called before surfacing a record to the VM.
     virtual void pre_record() = 0;
-    // Called for each record output from the VM.
-    virtual ss::future<write_success>
-      emit(std::optional<model::topic_view>, model::transformed_data) = 0;
+    // Called for each record output from the VM. `partition_key`, if set,
+    // is guest-chosen (PR-17(b) in the wasm roadmap doc) and should route
+    // this record to whatever output partition that key hashes to,
+    // consistent with normal Kafka key-based partitioning - instead of
+    // the default same-index-as-input-partition routing.
+    virtual ss::future<write_success> emit(
+      std::optional<model::topic_view>,
+      std::optional<iobuf> partition_key,
+      model::transformed_data)
+      = 0;
     // Called after a VM specifies it's done with a record.
     virtual void post_record() = 0;
+};
+
+// One buffered guest write: which output topic (nullopt = default), which
+// partition key (nullopt = default input-partition-based routing), and the
+// transformed record itself.
+struct pending_write {
+    std::optional<model::topic> topic;
+    std::optional<iobuf> partition_key;
+    model::transformed_data data;
 };
 
 // The data needed during a single transformation of a record_batch
@@ -91,12 +107,10 @@ struct batch_transform_context {
     // once per batch. See the PR-08 finding in the wasm roadmap doc: this is
     // what lets write_record avoid Wasmtime's async host-call path on every
     // record while still applying real backpressure, just at a coarser
-    // granularity. The topic is owned (not a view) because the guest memory
-    // backing write_record_with_options's options buffer is only valid for
-    // the duration of that one call.
-    ss::chunked_fifo<
-      std::pair<std::optional<model::topic>, model::transformed_data>>
-      pending_writes;
+    // granularity. The topic and partition key are owned (not views)
+    // because the guest memory backing write_record_with_options's options
+    // buffer is only valid for the duration of that one call.
+    ss::chunked_fifo<pending_write> pending_writes;
 };
 
 /**

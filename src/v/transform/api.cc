@@ -14,6 +14,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "bytes/bytes.h"
 #include "cluster/errc.h"
+#include "cluster/id_allocator_frontend.h"
 #include "cluster/partition_manager.h"
 #include "cluster/plugin_frontend.h"
 #include "cluster/topic_table.h"
@@ -22,6 +23,7 @@
 #include "config/configuration.h"
 #include "crypto/crypto.h"
 #include "features/feature_table.h"
+#include "hashing/murmur.h"
 #include "io.h"
 #include "kafka/data/partition_proxy.h"
 #include "kafka/utils/txn_reader.h"
@@ -29,6 +31,7 @@
 #include "model/fundamental.h"
 #include "model/namespace.h"
 #include "model/record_batch_reader.h"
+#include "model/record_utils.h"
 #include "model/timeout_clock.h"
 #include "model/timestamp.h"
 #include "model/transform.h"
@@ -86,14 +89,43 @@ public:
       model::topic topic,
       model::partition_id input_partition_id,
       cluster::topic_table* topic_table,
-      rpc::client* client)
+      rpc::client* client,
+      model::producer_identity producer_pid)
       : _topic(std::move(topic))
       , _input_partition_id(input_partition_id)
       , _topic_table(topic_table)
-      , _client(client) {}
+      , _client(client)
+      , _producer_pid(producer_pid) {}
 
-    ss::future<> write(ss::chunked_fifo<model::record_batch> batches) override {
-        model::partition_id partition = compute_output_partition();
+    ss::future<> write(
+      ss::chunked_fifo<model::record_batch> batches,
+      std::optional<iobuf> partition_key) override {
+        model::partition_id partition = compute_output_partition(partition_key);
+        // Sequence numbers are scoped per (producer_id, epoch,
+        // partition) by the Kafka idempotence protocol - tracked here,
+        // not on processor/transform_processor.cc, precisely because
+        // this is the one place that knows the *resolved* partition a
+        // guest-chosen key mapped to. A counter keyed by
+        // output topic index instead of resolved partition would be
+        // silently wrong whenever different keys route to different
+        // partitions of the same output topic.
+        auto& next_sequence = _next_sequence[partition];
+        for (auto& batch : batches) {
+            batch.header().producer_id = _producer_pid.id();
+            batch.header().producer_epoch = _producer_pid.epoch();
+            batch.header().base_sequence = next_sequence;
+            next_sequence = model::batch_identity::increment_sequence(
+              next_sequence, batch.header().last_offset_delta + 1);
+            // producer_id/epoch/base_sequence are covered by the Kafka
+            // wire-protocol crc, not just redpanda's internal
+            // header_crc - both must be recomputed after mutating them,
+            // or every batch fails crc validation on fetch for any
+            // client that checks it (see model::record_batch::
+            // set_max_timestamp for the same pattern).
+            batch.header().crc = model::crc_record_batch(batch);
+            batch.header().header_crc = model::internal_header_only_crc(
+              batch.header());
+        }
         auto ec = co_await _client->produce(
           {_topic, partition}, std::move(batches));
         if (ec != cluster::errc::success) {
@@ -106,7 +138,8 @@ public:
     }
 
 private:
-    model::partition_id compute_output_partition() {
+    model::partition_id
+    compute_output_partition(const std::optional<iobuf>& partition_key) {
         model::topic_namespace_view ns_tp{model::kafka_namespace, _topic};
         const auto& config = _topic_table->get_topic_cfg(ns_tp);
         if (!config) {
@@ -116,6 +149,27 @@ private:
         }
 
         const auto* disabled_set = _topic_table->get_topic_disabled_set(ns_tp);
+        if (partition_key) {
+            // Key-based routing: the same key must always resolve to the
+            // same partition for downstream co-partitioning to mean
+            // anything, so - unlike the unkeyed path below - a disabled
+            // target partition is a hard error here, not something to
+            // silently route around.
+            auto key_bytes = iobuf_to_bytes(*partition_key);
+            auto hash = murmur2(key_bytes.data(), key_bytes.size());
+            model::partition_id target(
+              hash % uint32_t(config->partition_count));
+            if (disabled_set && disabled_set->is_disabled(target)) {
+                throw std::runtime_error(
+                  ss::format(
+                    "output partition {} for topic {} (resolved from a "
+                    "guest-chosen key) is disabled",
+                    target,
+                    _topic));
+            }
+            return target;
+        }
+
         if (!(disabled_set && disabled_set->is_fully_disabled())) {
             // Do linear probing to find a non-disabled partition. The
             // expectation is that most of the times we'll need just a few
@@ -140,6 +194,10 @@ private:
     model::partition_id _input_partition_id;
     cluster::topic_table* _topic_table;
     rpc::client* _client;
+    model::producer_identity _producer_pid;
+    // Per resolved partition, not per output topic index - see write()'s
+    // own comment for why.
+    absl::flat_hash_map<model::partition_id, int32_t> _next_sequence;
 };
 
 class partition_source final : public source {
@@ -362,8 +420,7 @@ public:
         if (!stm) {
             co_return;
         }
-        auto res = co_await stm->put_state(
-          _id, std::move(state), save_timeout);
+        auto res = co_await stm->put_state(_id, std::move(state), save_timeout);
         if (res.has_error()) {
             vlog(
               tlog.warn,
@@ -462,10 +519,10 @@ public:
         };
         // Fences a stale flush from a superseded owner of this partition
         // against a fresher commit - see distributed_kv_stm's
-        // should_replace() customization point and the PR-06 finding in the
-        // wasm roadmap doc. Falls back to term_id{} (treated as the oldest
-        // possible epoch) if there's no local raft group to ask, e.g. a
-        // benign race with the partition being removed.
+        // should_replace() customization point. Falls back to term_id{}
+        // (treated as the oldest possible epoch) if there's no local raft
+        // group to ask, e.g. a benign race with the partition being
+        // removed.
         model::term_id epoch = _partition_for_term ? _partition_for_term->term()
                                                    : model::term_id{};
         return _batcher->commit_offset(key, {.offset = offset, .epoch = epoch});
@@ -491,12 +548,14 @@ public:
       cluster::topic_table* topic_table,
       cluster::partition_manager* partition_manager,
       rpc::client* client,
-      commit_batcher<>* batcher)
+      commit_batcher<>* batcher,
+      cluster::id_allocator_frontend* id_allocator_frontend)
       : _wasm_engine_factory(std::move(factory))
       , _partition_manager(partition_manager)
       , _client(client)
       , _batcher(batcher)
-      , _topic_table(topic_table) {}
+      , _topic_table(topic_table)
+      , _id_allocator_frontend(id_allocator_frontend) {}
 
     ss::future<std::unique_ptr<processor>> create_processor(
       model::transform_id id,
@@ -509,6 +568,28 @@ public:
         if (!engine) {
             throw std::runtime_error("unable to create wasm engine");
         }
+        // A fresh producer_id every processor start (never persisted or
+        // reused across restarts) - the same posture a plain (non-
+        // transactional) Kafka idempotent producer client already takes
+        // on every new client instance: InitProducerId hands back a new
+        // id with no cross-session memory. Retries *within* this
+        // instance's lifetime - e.g. after a transient produce RPC
+        // failure - dedup correctly via rm_stm's existing (producer_id,
+        // epoch, sequence) fencing; that's the actual "duplicate is a
+        // duplicate trade" case this
+        // exists to close, and reusing an identity across a full restart
+        // buys nothing extra for it, so there's no need to persist
+        // anything durably here.
+        static constexpr auto allocate_id_timeout = std::chrono::seconds(5);
+        auto id_reply = co_await _id_allocator_frontend->allocate_id(
+          allocate_id_timeout);
+        if (id_reply.ec != cluster::errc::success) {
+            throw std::runtime_error(
+              ss::format(
+                "unable to allocate a producer id for transform output: {}",
+                cluster::error_category().message(int(id_reply.ec))));
+        }
+        model::producer_identity producer_pid{id_reply.id, int16_t{0}};
         auto partition = kafka::make_partition_proxy(ntp, *_partition_manager);
         if (!partition) {
             throw std::runtime_error("unable to create transform source");
@@ -525,8 +606,7 @@ public:
         // copy is one atomic increment, once per processor creation, not a
         // hot-path cost. Moving it here instead would silently leave both
         // of those with a null partition on every single processor create,
-        // not just the rare benign race the comment above describes -
-        // found while wiring up state_store_impl for PR-16.
+        // not just the rare benign race the comment above describes.
         auto partition_for_wait = _partition_manager->get(ntp);
         auto src = std::make_unique<partition_source>(
           *std::move(partition), partition_for_wait);
@@ -535,7 +615,11 @@ public:
         sinks.reserve(meta.output_topics.size());
         for (const auto& output_topic : meta.output_topics) {
             auto sink = std::make_unique<rpc_client_sink>(
-              output_topic.tp, ntp.tp.partition, _topic_table, _client);
+              output_topic.tp,
+              ntp.tp.partition,
+              _topic_table,
+              _client,
+              producer_pid);
             sinks.push_back(std::move(sink));
         }
 
@@ -545,7 +629,8 @@ public:
               meta.failure_policy.dead_letter_topic->tp,
               ntp.tp.partition,
               _topic_table,
-              _client);
+              _client,
+              producer_pid);
         }
 
         auto offset_tracker = std::make_unique<offset_tracker_impl>(
@@ -582,6 +667,7 @@ private:
     absl::flat_hash_map<model::offset, std::unique_ptr<wasm::engine>> _cache;
     commit_batcher<>* _batcher;
     cluster::topic_table* _topic_table;
+    cluster::id_allocator_frontend* _id_allocator_frontend;
 };
 
 class rpc_offset_committer : public offset_committer {
@@ -639,6 +725,7 @@ service::service(
   ss::sharded<cluster::partition_manager>* partition_manager,
   ss::sharded<rpc::client>* rpc_client,
   ss::sharded<cluster::metadata_cache>* metadata_cache,
+  ss::sharded<cluster::id_allocator_frontend>* id_allocator_frontend,
   ss::scheduling_group sg,
   size_t memory_limit)
   : _runtime(runtime)
@@ -650,6 +737,7 @@ service::service(
   , _partition_manager(partition_manager)
   , _rpc_client(rpc_client)
   , _metadata_cache(metadata_cache)
+  , _id_allocator_frontend(id_allocator_frontend)
   , _sg(sg)
   , _total_memory_limit(memory_limit) {}
 
@@ -697,7 +785,8 @@ ss::future<> service::start() {
         &_topic_table->local(),
         &_partition_manager->local(),
         &_rpc_client->local(),
-        _batcher.get()),
+        _batcher.get(),
+        &_id_allocator_frontend->local()),
       _sg,
       std::move(mem_limits));
 
