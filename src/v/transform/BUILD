@@ -91,6 +91,7 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":logger",
+        "//src/v/bytes",
         "//src/v/metrics",
         "//src/v/model:batch_compression",
         "//src/v/rpc",
@@ -149,6 +150,7 @@ redpanda_cc_library(
         "//src/v/ssx:future_util",
         "//src/v/ssx:semaphore",
         "//src/v/transform/rpc",
+        "//src/v/transform/stm",
         "//src/v/wasm:cache",
         "@abseil-cpp//absl/container:flat_hash_map",
         "@boost//:range",

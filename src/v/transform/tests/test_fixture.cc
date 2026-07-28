@@ -168,6 +168,12 @@ ss::future<> fake_wasm_engine::start() {
         throw std::logic_error("starting already started wasm engine");
     }
     _started = true;
+    // A fresh VM instance means fresh (zeroed) guest memory - mirrors the
+    // real engine's heap_allocator::deallocate on every restart (see G12).
+    // Whether a region gets registered again is a separate, stable fact
+    // about this guest's own code (set once via
+    // set_shared_memory_region_registered), not reset here.
+    _shared_memory_content.clear();
     co_return;
 }
 
@@ -193,6 +199,26 @@ void fake_wasm_engine::set_use_default_output_topic() {
 
 void fake_wasm_engine::set_failures_remaining(uint32_t n) {
     _failures_remaining = n;
+}
+
+void fake_wasm_engine::set_shared_memory_region_registered(bool registered) {
+    _shared_memory_region_registered = registered;
+}
+
+bool fake_wasm_engine::write_shared_memory(bytes_view data) {
+    if (!_shared_memory_region_registered) {
+        return false;
+    }
+    _shared_memory_content.clear();
+    _shared_memory_content.append(data.data(), data.size());
+    return true;
+}
+
+std::optional<iobuf> fake_wasm_engine::read_shared_memory() {
+    if (!_shared_memory_region_registered) {
+        return std::nullopt;
+    }
+    return _shared_memory_content.copy();
 }
 
 ss::future<> fake_wasm_engine::transform(

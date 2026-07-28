@@ -233,12 +233,53 @@ struct transform_failure_policy
 };
 
 /**
+ * Options controlling durable recovery of a transform guest's own state
+ * (e.g. an in-memory order book) across restarts, leadership moves, and
+ * redeploys - see transform::transform_state_stm and
+ * transform::processor's restore path.
+ *
+ * Restore is attempted opportunistically regardless of this option: if the
+ * guest has ever checkpointed (via wasm::engine::read_shared_memory - only
+ * possible for a binary granted the `shared_memory` capability)
+ * and a snapshot exists, the processor restores it into the guest's
+ * registered region on every start. This option only controls what happens
+ * when that restore is expected but fails - the whole point of a failure
+ * policy like this one is that the caller, not the framework, is in the
+ * best position to know whether running with lost state is worse than not
+ * running at all.
+ */
+struct transform_state_options
+  : serde::envelope<
+      transform_state_options,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    // If true, a restore that fails when this transform is known to have
+    // persisted state before (see transform::state_store::load_latest_state)
+    // is treated as a hard startup error - surfaced through the same
+    // restart/backoff path as any other start() failure, but logged and
+    // counted distinctly - instead of silently proceeding with whatever is
+    // already (or isn't) in the guest's memory. Defaults to false,
+    // preserving today's "state loss is silent" behavior for any transform
+    // that doesn't opt in.
+    bool require_state_recovery = false;
+
+    auto serde_fields() { return std::tie(require_state_recovery); }
+
+    bool operator==(const transform_state_options&) const = default;
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it, "{{ require_state_recovery: {} }}", require_state_recovery);
+    }
+};
+
+/**
  * Metadata for a WebAssembly powered data transforms.
  */
 struct transform_metadata
   : serde::envelope<
       transform_metadata,
-      serde::version<4>,
+      serde::version<5>,
       serde::compat_version<0>> {
     // The user specified name of the transform.
     transform_name name;
@@ -278,6 +319,11 @@ struct transform_metadata
     // transform_failure_policy), i.e. byte-identical behavior to before
     // this field existed for any transform that doesn't set it.
     transform_failure_policy failure_policy;
+
+    // Whether a failed guest-state restore should be treated as fatal. See
+    // transform_state_options - defaults to false, i.e. byte-identical
+    // behavior to before this field existed.
+    transform_state_options state_options;
 
     friend bool
     operator==(const transform_metadata&, const transform_metadata&) = default;
@@ -361,7 +407,8 @@ struct transform_offsets_value
     // Used by cluster::distributed_kv_stm to decide whether this value
     // should overwrite an existing one for the same key, rather than racing
     // a stale flush from a superseded owner against a fresher commit purely
-    // on timing (see the PR-06 finding in the wasm roadmap doc).
+    // on timing - a superseded owner's flush can still land after a newer
+    // owner has already committed, so timing alone can't tell them apart.
     bool should_replace(const transform_offsets_value& older) const {
         return epoch >= older.epoch;
     }

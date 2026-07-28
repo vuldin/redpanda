@@ -130,4 +130,44 @@ public:
       commit_offset(model::output_topic_index, kafka::offset) = 0;
 };
 
+/**
+ * Durable storage for a transform guest's own state (e.g. an order book),
+ * used to survive restarts, leadership moves, and redeploys without
+ * silently running with wrong or zeroed state (PR-16 in the wasm roadmap
+ * doc, addressing G12). Backed by transform::transform_state_stm, attached
+ * directly to this same partition's own raft group - see that class's own
+ * doc comment for why.
+ */
+class state_store {
+public:
+    state_store() = default;
+    state_store(const state_store&) = delete;
+    state_store(state_store&&) = delete;
+    state_store& operator=(const state_store&) = delete;
+    state_store& operator=(state_store&&) = delete;
+    virtual ~state_store() = default;
+
+    virtual ss::future<> start() = 0;
+    virtual ss::future<> stop() = 0;
+
+    /**
+     * The most recently persisted guest-state snapshot, or std::nullopt if
+     * none has ever been persisted - the latter is the normal, expected
+     * answer for a brand-new deploy, not a failure signal. Throws on a
+     * genuine storage-layer error (e.g. this partition's state STM isn't
+     * reachable) - callers should let that propagate the same way any
+     * other processor start() failure does.
+     */
+    virtual ss::future<std::optional<iobuf>> load_latest_state() = 0;
+
+    /**
+     * Durably persist `state`, replacing whatever was stored before.
+     * Resolves once replicated to a quorum. This is a best-effort
+     * background durability improvement, not on the critical path of
+     * processing any one batch - implementations should not throw on
+     * failure, just log and let the next periodic checkpoint retry.
+     */
+    virtual ss::future<> save_state(iobuf state) = 0;
+};
+
 } // namespace transform

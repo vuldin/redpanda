@@ -147,7 +147,7 @@ fmt::iterator transform_metadata::format_to(fmt::iterator it) const {
       it,
       "{{name: \"{}\", input: {}, outputs: {}, "
       "env: <redacted>, uuid: {}, source_ptr: {}, is_paused: {}, "
-      "binary_sha256: {}, failure_policy: {} }}",
+      "binary_sha256: {}, failure_policy: {}, state_options: {} }}",
       name,
       input_topic,
       output_topics,
@@ -156,7 +156,8 @@ fmt::iterator transform_metadata::format_to(fmt::iterator it) const {
       source_ptr,
       paused,
       binary_sha256,
-      failure_policy);
+      failure_policy,
+      state_options);
 }
 
 void transform_metadata::serde_write(iobuf& out) const {
@@ -179,6 +180,7 @@ void transform_metadata::serde_write(iobuf& out) const {
     serde::write(out, compression_mode);
     serde::write(out, binary_sha256);
     serde::write(out, failure_policy);
+    serde::write(out, state_options);
 }
 
 void transform_metadata::serde_read(iobuf_parser& in, const serde::header& h) {
@@ -207,6 +209,10 @@ void transform_metadata::serde_read(iobuf_parser& in, const serde::header& h) {
     }
     if (h._version >= 4) {
         failure_policy = read_nested<decltype(failure_policy)>(
+          in, h._bytes_left_limit);
+    }
+    if (h._version >= 5) {
+        state_options = read_nested<decltype(state_options)>(
           in, h._bytes_left_limit);
     }
 }
@@ -365,8 +371,7 @@ iobuf transformed_data::to_serialized_record(
     // it means _data - the actual guest-produced record - would get a
     // second copy for small payloads. append_fragments shares the
     // underlying fragments (ref-counted, not copied) unconditionally, so
-    // this is one guest-to-host copy total regardless of payload size. See
-    // the PR-11 finding in the wasm roadmap doc.
+    // this is one guest-to-host copy total regardless of payload size.
     out.append_fragments(std::move(_data));
 
     bytes encoded_size = vint::to_bytes(

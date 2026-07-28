@@ -328,6 +328,19 @@ configuration::configuration()
       },
       100,
       {.min = 1, .max = 1000})
+  , data_transforms_state_snapshot_max_size(
+      *this,
+      "data_transforms_state_snapshot_max_size",
+      "The maximum size of a single guest state snapshot a transform may "
+      "persist via the state recovery API. A snapshot larger than this is "
+      "rejected rather than replicated, so a runaway guest can't grow this "
+      "unbounded inside a partition's own raft log.",
+      {
+        .needs_restart = needs_restart::no,
+        .visibility = visibility::tunable,
+      },
+      4_MiB,
+      {.min = 64_KiB, .max = 64_MiB})
   , topic_memory_per_partition(
       *this,
       "topic_memory_per_partition",

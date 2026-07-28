@@ -60,6 +60,17 @@ public:
     // both just mean "there's nothing to write into right now."
     virtual bool write_shared_memory(bytes_view) { return false; }
 
+    // Reads back the trusted guest's registered shared-memory region, if
+    // any - the capture-side counterpart to write_shared_memory, used to
+    // checkpoint a guest's own state (e.g. an order book) for durable
+    // recovery (PR-16 in the wasm roadmap doc). Returns std::nullopt under
+    // the same conditions write_shared_memory returns false for: no
+    // capability grant, or no region registered yet. The guest is
+    // responsible for laying out whatever it wants recovered within that
+    // fixed-size region; this returns exactly the region's declared bytes,
+    // as-is, with no framing imposed here.
+    virtual std::optional<iobuf> read_shared_memory() { return std::nullopt; }
+
     engine() = default;
     virtual ~engine() = default;
     engine(const engine&) = delete;
