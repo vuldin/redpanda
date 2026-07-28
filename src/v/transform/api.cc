@@ -14,6 +14,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "bytes/bytes.h"
 #include "cluster/errc.h"
+#include "cluster/id_allocator_frontend.h"
 #include "cluster/partition_manager.h"
 #include "cluster/plugin_frontend.h"
 #include "cluster/topic_table.h"
@@ -21,7 +22,6 @@
 #include "commit_batcher.h"
 #include "config/configuration.h"
 #include "crypto/crypto.h"
-#include "cluster/id_allocator_frontend.h"
 #include "features/feature_table.h"
 #include "hashing/murmur.h"
 #include "io.h"
@@ -100,13 +100,12 @@ public:
     ss::future<> write(
       ss::chunked_fifo<model::record_batch> batches,
       std::optional<iobuf> partition_key) override {
-        model::partition_id partition = compute_output_partition(
-          partition_key);
+        model::partition_id partition = compute_output_partition(partition_key);
         // Sequence numbers are scoped per (producer_id, epoch,
         // partition) by the Kafka idempotence protocol - tracked here,
         // not on processor/transform_processor.cc, precisely because
         // this is the one place that knows the *resolved* partition a
-        // guest-chosen key (PR-17(b)) mapped to. A counter keyed by
+        // guest-chosen key mapped to. A counter keyed by
         // output topic index instead of resolved partition would be
         // silently wrong whenever different keys route to different
         // partitions of the same output topic.
@@ -117,6 +116,13 @@ public:
             batch.header().base_sequence = next_sequence;
             next_sequence = model::batch_identity::increment_sequence(
               next_sequence, batch.header().last_offset_delta + 1);
+            // producer_id/epoch/base_sequence are covered by the Kafka
+            // wire-protocol crc, not just redpanda's internal
+            // header_crc - both must be recomputed after mutating them,
+            // or every batch fails crc validation on fetch for any
+            // client that checks it (see model::record_batch::
+            // set_max_timestamp for the same pattern).
+            batch.header().crc = model::crc_record_batch(batch);
             batch.header().header_crc = model::internal_header_only_crc(
               batch.header());
         }
@@ -144,11 +150,11 @@ private:
 
         const auto* disabled_set = _topic_table->get_topic_disabled_set(ns_tp);
         if (partition_key) {
-            // Key-based routing (PR-17(b) in the wasm roadmap doc): the same
-            // key must always resolve to the same partition for downstream
-            // co-partitioning to mean anything, so - unlike the unkeyed path
-            // below - a disabled target partition is a hard error here, not
-            // something to silently route around.
+            // Key-based routing: the same key must always resolve to the
+            // same partition for downstream co-partitioning to mean
+            // anything, so - unlike the unkeyed path below - a disabled
+            // target partition is a hard error here, not something to
+            // silently route around.
             auto key_bytes = iobuf_to_bytes(*partition_key);
             auto hash = murmur2(key_bytes.data(), key_bytes.size());
             model::partition_id target(
@@ -414,8 +420,7 @@ public:
         if (!stm) {
             co_return;
         }
-        auto res = co_await stm->put_state(
-          _id, std::move(state), save_timeout);
+        auto res = co_await stm->put_state(_id, std::move(state), save_timeout);
         if (res.has_error()) {
             vlog(
               tlog.warn,
@@ -514,10 +519,10 @@ public:
         };
         // Fences a stale flush from a superseded owner of this partition
         // against a fresher commit - see distributed_kv_stm's
-        // should_replace() customization point and the PR-06 finding in the
-        // wasm roadmap doc. Falls back to term_id{} (treated as the oldest
-        // possible epoch) if there's no local raft group to ask, e.g. a
-        // benign race with the partition being removed.
+        // should_replace() customization point. Falls back to term_id{}
+        // (treated as the oldest possible epoch) if there's no local raft
+        // group to ask, e.g. a benign race with the partition being
+        // removed.
         model::term_id epoch = _partition_for_term ? _partition_for_term->term()
                                                    : model::term_id{};
         return _batcher->commit_offset(key, {.offset = offset, .epoch = epoch});
@@ -570,8 +575,8 @@ public:
         // id with no cross-session memory. Retries *within* this
         // instance's lifetime - e.g. after a transient produce RPC
         // failure - dedup correctly via rm_stm's existing (producer_id,
-        // epoch, sequence) fencing (PR-17(c) in the wasm roadmap doc);
-        // that's the actual "duplicate is a duplicate trade" case this
+        // epoch, sequence) fencing; that's the actual "duplicate is a
+        // duplicate trade" case this
         // exists to close, and reusing an identity across a full restart
         // buys nothing extra for it, so there's no need to persist
         // anything durably here.
@@ -601,8 +606,7 @@ public:
         // copy is one atomic increment, once per processor creation, not a
         // hot-path cost. Moving it here instead would silently leave both
         // of those with a null partition on every single processor create,
-        // not just the rare benign race the comment above describes -
-        // found while wiring up state_store_impl for PR-16.
+        // not just the rare benign race the comment above describes.
         auto partition_for_wait = _partition_manager->get(ntp);
         auto src = std::make_unique<partition_source>(
           *std::move(partition), partition_for_wait);
