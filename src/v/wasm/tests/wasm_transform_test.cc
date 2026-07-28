@@ -14,6 +14,7 @@
 
 #include <seastar/core/internal/cpu_profiler.hh>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/sleep.hh>
 
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
@@ -25,6 +26,21 @@ TEST_F(WasmTestFixture, IdentityFunction) {
     auto batch = make_tiny_batch();
     auto transformed = transform(batch);
     ASSERT_EQ(transformed.copy_records(), batch.copy_records());
+}
+
+// Regression test for a real bug: a transform idle for longer than
+// per_invocation_timeout (3s in this fixture, see wasm_fixture.cc) used
+// to trap on the very next batch, immediately, regardless of how fast
+// that batch would actually process - because the deadline set before
+// the idle wait began was never reset once the wait ended. A caught-up,
+// idle transform reacting to new data after a long gap is a normal case
+// this engine is built to make cheap, not a failure state.
+TEST_F(WasmTestFixture, SurvivesIdleGapLongerThanPerInvocationTimeout) {
+    load_wasm("identity.wasm");
+    auto batch = make_tiny_batch();
+    transform(batch);
+    ss::sleep(4s).get();
+    EXPECT_NO_THROW(transform(batch));
 }
 
 using ::testing::ElementsAre;
