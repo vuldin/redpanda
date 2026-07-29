@@ -15,6 +15,7 @@
 #include "logger.h"
 #include "net/dial.h"
 #include "net/dns.h"
+#include "ssx/future-util.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/units.hh>
@@ -33,33 +34,52 @@ using namespace std::chrono_literals;
 // http::client::dial uses for the same reason - fail fast, let the guest's
 // own retry logic (or lack of one) decide what happens next, rather than
 // have a single slow endpoint hold a wasm engine's one mutex-serialized
-// instance (see G5 in the wasm roadmap doc) hostage for longer than that.
+// instance hostage for longer than that.
 constexpr auto connect_timeout = 1s;
 
 // Bounds the blast radius of a single instance opening connections faster
 // than it closes them. This is a per-instance limit only - it does not by
 // itself bound how many instances of one transform, or how many different
-// trusted transforms, can share one operation's real-world target; that is
-// exactly the amplification question the PR-13 design doc flags as needing
-// a real security review before this ships, not something this constant
-// resolves on its own.
+// trusted transforms, can share one operation's real-world target; that's
+// a real amplification-and-security-review question this constant alone
+// does not resolve, and one this capability's security review still needs
+// to cover before this ships.
 constexpr size_t max_connections_per_instance = 8;
 
 // bulk_load's response is accumulated host-side in one buffer, so it needs
 // its own real ceiling - independent of whatever the guest's own linear
 // memory happens to fit, since the guest never allocates this buffer at
 // all. 16 MiB comfortably covers a single-instrument or small-batch
-// snapshot pull without approaching the wasm roadmap doc's own guest
-// memory ceiling (128 MiB); a genuinely larger rehydration payload should
-// be paginated by the guest into multiple bulk_load calls, not answered by
-// raising this constant.
+// snapshot pull without approaching the guest's own linear memory ceiling
+// (128 MiB); a genuinely larger rehydration payload should be paginated by
+// the guest into multiple bulk_load calls, not answered by raising this
+// constant.
 constexpr size_t max_bulk_load_bytes = 16_MiB;
 constexpr size_t bulk_load_chunk_size = 64_KiB;
 // Bounds total wall-clock time, independently of the byte bound: a peer
 // that trickles data in under the size cap but never finishes is exactly
-// the "slow or hung upstream" partial-failure risk PR-13's design doc
-// flags against G5 - this is the mitigation for it, for this one call.
+// the "slow or hung upstream" partial-failure risk this networking
+// capability carries generally - this bounds it for this one call
+// specifically.
 constexpr auto max_bulk_load_duration = 10s;
+
+// Bounds how much of a slow/unreachable relay's backlog send() will
+// accept before it starts failing closed instead of growing this queue
+// without limit. Deliberately generous relative to a realistic
+// one-push-per-record rate over one batch, not tuned to any specific
+// workload - the queue draining faster than it fills is the normal
+// case; this constant only matters once that stops being true.
+constexpr size_t max_pending_pushes = 4096;
+
+// Bounds one connection's own accumulated-while-busy backlog (see
+// drain_pending_pushes()'s push_in_flight branch) - separate from
+// max_pending_pushes above, which bounds the fifo of pushes not yet
+// handed to any connection at all. Sized well above what ordinary
+// contention between concurrent invocations should ever accumulate
+// (individual pushes are tens of bytes); this only matters once a
+// specific peer is wedged or persistently too slow to drain, at which
+// point falling back to dropping is correct.
+constexpr size_t max_pending_batch_bytes = 256_KiB;
 
 constexpr int32_t SUCCESS = 0;
 constexpr int32_t INVALID_TARGET_INDEX = -1;
@@ -70,6 +90,7 @@ constexpr int32_t IO_ERROR = -5;
 constexpr int32_t RESPONSE_TOO_LARGE = -6;
 constexpr int32_t TIMED_OUT = -7;
 constexpr int32_t NO_SHARED_MEMORY_REGION = -8;
+constexpr int32_t BUFFER_FULL = -9;
 } // namespace
 
 network_module::network_module(
@@ -83,12 +104,19 @@ void network_module::check_abi_version_0() {}
 ss::future<ss::connected_socket>
 network_module::dial(const net::unresolved_address& target) {
     auto addresses = co_await net::resolve_dns_all(target);
-    co_return co_await net::dial_serially(
+    auto socket = co_await net::dial_serially(
       std::move(addresses),
       net::clock_type::now() + connect_timeout,
       net::fixed_timeout_dial_policy{.attempt_timeout = connect_timeout},
       &wasm_log,
       [this] { _as.check(); });
+    // Nagle would otherwise hold a small, latency-sensitive write (this
+    // is the only kind send()/drain_pending_pushes() ever issues) back
+    // waiting on an ACK or more data to coalesce with - disable it here,
+    // same as net::server.cc does for Redpanda's own listener
+    // connections.
+    socket.set_nodelay(true);
+    co_return socket;
 }
 
 ss::future<int32_t>
@@ -116,26 +144,131 @@ network_module::connect(uint32_t target_index, int32_t* out_handle) {
     }
 }
 
-ss::future<int32_t>
-network_module::send(int32_t handle, ffi::array<uint8_t> buf) {
-    auto it = _connections.find(handle);
-    if (it == _connections.end()) {
-        co_return INVALID_HANDLE;
+int32_t network_module::send(int32_t handle, ffi::array<uint8_t> buf) {
+    if (!_connections.contains(handle)) {
+        return INVALID_HANDLE;
     }
-    try {
-        // NOLINTNEXTLINE(*-reinterpret-*)
-        co_await it->second.out.write(
-          reinterpret_cast<const char*>(buf.data()), buf.size());
-        co_await it->second.out.flush();
-        co_return SUCCESS;
-    } catch (...) {
-        vlog(
-          wasm_log.warn,
-          "wasm network send on handle {} failed: {}",
-          handle,
-          std::current_exception());
-        co_return IO_ERROR;
+    if (_pending_pushes.size() >= max_pending_pushes) {
+        return BUFFER_FULL;
     }
+    // Own the data now: buf is guest memory, only valid for the duration
+    // of this call, but _pending_pushes outlives it (same reasoning as
+    // transform_module::write_record_with_options's owned_partition_key).
+    bytes data;
+    data.resize(buf.size());
+    std::copy(buf.begin(), buf.end(), data.begin());
+    _pending_pushes.push_back(
+      pending_push{.handle = handle, .data = std::move(data)});
+    return SUCCESS;
+}
+
+void network_module::drain_pending_pushes() {
+    auto pending = std::exchange(_pending_pushes, {});
+    if (_push_gate.is_closed()) {
+        // Tearing down (stop() already ran) - nothing left to drain into.
+        return;
+    }
+    for (auto& p : pending) {
+        auto it = _connections.find(p.handle);
+        if (it == _connections.end()) {
+            // Closed since enqueue - by the guest, or by an earlier push
+            // to this same handle failing earlier in this same pass.
+            continue;
+        }
+        if (it->second.push_in_flight) {
+            // A previous push to this handle hasn't resolved yet.
+            // Accumulate rather than drop - dispatch_push()'s
+            // completion continuation sends this the moment the
+            // in-flight write finishes, coalesced into one write
+            // instead of one write per push. Only once the
+            // accumulated backlog for this one connection gets
+            // genuinely pathological (a wedged or persistently slow
+            // peer, not ordinary contention) does this fall back to
+            // dropping - unbounded accumulation on a connection
+            // that's never going to drain isn't better than dropping,
+            // it's just a slower way to run out of memory.
+            auto& batch = it->second.pending_batch;
+            if (batch.size() + p.data.size() > max_pending_batch_bytes) {
+                continue;
+            }
+            auto offset = batch.size();
+            batch.resize(offset + p.data.size());
+            std::copy(p.data.begin(), p.data.end(), batch.begin() + offset);
+            continue;
+        }
+        it->second.push_in_flight = true;
+        dispatch_push(p.handle, std::move(p.data));
+    }
+}
+
+void network_module::dispatch_push(int32_t handle, bytes data) {
+    ssx::spawn_with_gate(
+      _push_gate, [this, handle, data = std::move(data)]() mutable {
+          auto it2 = _connections.find(handle);
+          if (it2 == _connections.end()) {
+              return ss::now();
+          }
+          auto& conn = it2->second;
+          // NOLINTNEXTLINE(*-reinterpret-*)
+          return conn.out
+            .write(reinterpret_cast<const char*>(data.data()), data.size())
+            .then([this, handle] {
+                // Re-find rather than close over &conn: _connections is
+                // an absl::flat_hash_map, which gives no reference
+                // stability across an insert-triggered rehash (e.g. a
+                // guest calling connect() again while this write is
+                // still in flight), and the connection may also have
+                // been erased outright (closed) in that same window.
+                auto it = _connections.find(handle);
+                if (it == _connections.end()) {
+                    return ss::now();
+                }
+                return it->second.out.flush();
+            })
+            .then_wrapped([this, handle](ss::future<> fut) {
+                auto it3 = _connections.find(handle);
+                if (it3 == _connections.end()) {
+                    // Closed (by the guest, or by stop()) while this
+                    // write was in flight - nothing left to update.
+                    fut.ignore_ready_future();
+                    return;
+                }
+                if (fut.failed()) {
+                    // Same routine-failure reasoning as everywhere
+                    // else in this module: a slow/dead peer is the
+                    // expected case for a best-effort side-channel,
+                    // not something the transform's own per-batch
+                    // processing loop should ever see or wait on -
+                    // that loop already moved on the moment
+                    // drain_pending_pushes() dispatched this, long
+                    // before this continuation runs.
+                    vlog(
+                      wasm_log.debug,
+                      "wasm network push on handle {} failed, closing "
+                      "connection: {}",
+                      handle,
+                      fut.get_exception());
+                    // Safe now - the write we just observed complete is
+                    // the only thing that could have still been touching
+                    // this connection's output_stream.
+                    _connections.erase(it3);
+                    return;
+                }
+                fut.ignore_ready_future();
+                // Anything that arrived while this write was in flight
+                // is sitting in pending_batch (drain_pending_pushes()
+                // accumulates into it rather than dropping) - send it
+                // now as one combined write instead of waiting for the
+                // next drain_pending_pushes() call to notice it, which
+                // could be a full batch later.
+                if (it3->second.pending_batch.empty()) {
+                    it3->second.push_in_flight = false;
+                    return;
+                }
+                auto next = std::exchange(it3->second.pending_batch, {});
+                dispatch_push(handle, std::move(next));
+            });
+      });
 }
 
 ss::future<int32_t> network_module::recv(
@@ -241,6 +374,13 @@ network_module::bulk_load(uint32_t target_index, ffi::array<uint8_t> request) {
 
 ss::future<> network_module::stop() {
     _as.request_abort();
+    // Must happen before touching _connections below: a background push
+    // dispatched from drain_pending_pushes() may still be running
+    // against one of these connections' output_stream, and that stream
+    // is not safe to close (or do anything else to) concurrently with a
+    // write that hasn't resolved yet. Closing the gate waits for every
+    // in-flight push to actually finish first.
+    co_await _push_gate.close();
     auto connections = std::exchange(_connections, {});
     for (auto& [handle, conn] : connections) {
         try {
