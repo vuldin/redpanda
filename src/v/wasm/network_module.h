@@ -46,7 +46,7 @@ namespace wasm {
 class network_module {
 public:
     // shared_memory_sink delivers bytes into whatever region the guest has
-    // registered via shared_memory_module (PR-13c), if any - used only by
+    // registered via shared_memory_module, if any - used only by
     // bulk_load, and only ever actually linked into a guest's imports when
     // both the `network` and `shared_memory` capabilities are granted (see
     // wasmtime.cc). Always real (never null) when a network_module exists
@@ -105,10 +105,9 @@ public:
     // shared_memory_sink rather than back through this call directly, so
     // an arbitrarily large response never needs to fit in a single ffi
     // buffer. Returns the number of bytes delivered on success. This is
-    // for EP3-style one-shot rehydration pulls (e.g. SnapshotAPI.
-    // GetSnapshot) - the ongoing streaming subscriptions (ListenInstruments
-    // / StreamState / StreamTrades) still use plain connect/send/recv, kept
-    // open across transform() calls.
+    // for one-shot rehydration pulls (fetch a whole snapshot, then close);
+    // an ongoing streaming subscription instead uses plain connect/send/
+    // recv, kept open across transform() calls.
     ss::future<int32_t>
     bulk_load(uint32_t target_index, ffi::array<uint8_t> request);
     // End ABI exports
@@ -161,6 +160,14 @@ private:
         // actually matters here: never call anything on `out` while a
         // previous call on the same `out` hasn't returned yet.
         bool push_in_flight = false;
+        // Pushes that arrived while push_in_flight was already true,
+        // concatenated in arrival order. Drained and sent as one
+        // combined write the moment the in-flight write completes,
+        // rather than dropped - see dispatch_push()'s completion
+        // continuation. Bounded by max_pending_batch_bytes so a
+        // persistently slow/wedged peer still degrades by dropping
+        // eventually instead of accumulating without limit.
+        bytes pending_batch;
     };
 
     // A push enqueued by send(), not yet handed to the connection's
@@ -180,6 +187,15 @@ private:
     // _allowed_targets before calling this.
     ss::future<ss::connected_socket>
     dial(const net::unresolved_address& target);
+
+    // Fire-and-forget dispatch of a single write+flush against handle's
+    // connection, marking it push_in_flight for the duration. Called
+    // both from drain_pending_pushes() (first write to an idle
+    // connection) and from its own completion continuation (draining
+    // whatever accumulated in that connection's pending_batch while
+    // this write was running) - never called on a connection that's
+    // already push_in_flight, same invariant as before.
+    void dispatch_push(int32_t handle, bytes data);
 
     std::vector<net::unresolved_address> _allowed_targets;
     absl::flat_hash_map<int32_t, open_connection> _connections;
