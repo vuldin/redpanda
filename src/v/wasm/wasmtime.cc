@@ -91,7 +91,7 @@ constexpr size_t max_host_function_stack_usage = vm_stack_size
 // async-yield-interval gave, but epoch checks are a cheap counter comparison
 // at function entries/loop backedges rather than a fuel decrement on every
 // relevant instruction, so there's no per-instruction instrumentation tax to
-// pay for it. See the PR-07 finding in the wasm roadmap doc.
+// pay for it.
 constexpr uint64_t epoch_ticks_per_check = 1;
 
 // The reserved memory for an instance of a WebAssembly VM.
@@ -221,7 +221,7 @@ private:
     // work (compiling a module, querying memory usage) - a task that never
     // returns, like this ticker's loop, would permanently occupy that one
     // worker thread and starve every other submission to _alien_thread
-    // forever. See the PR-07 finding in the wasm roadmap doc.
+    // forever.
     std::thread _epoch_ticker_thread;
 };
 
@@ -531,8 +531,8 @@ extract_output_topics(const model::transform_metadata& meta) {
 }
 
 // Looks up whether this exact wasm binary - identified by its own content
-// hash, not by transform name, see PR-13 in the wasm roadmap doc - has been
-// granted any elevated capabilities by a cluster admin. Only ever called
+// hash, not by transform name - has been granted any elevated capabilities
+// by a cluster admin. Only ever called
 // synchronously (from wasmtime_engine's constructor), so the returned
 // pointer is never held across a suspension point and can't be invalidated
 // by a concurrent config update.
@@ -1046,6 +1046,13 @@ private:
 
         co_await _transform_module.for_each_record_async(
           std::move(batch), &callback);
+        // Same per-batch suspension point transform_module's own
+        // drain_pending_writes() uses, immediately after it. Unlike that
+        // call, this one never suspends on network I/O - see
+        // network_module::drain_pending_pushes()'s own comment for why.
+        if (_network_module) {
+            _network_module->drain_pending_pushes();
+        }
     }
 
     wasmtime_runtime* _runtime;
@@ -1074,7 +1081,7 @@ private:
     // The wall-clock deadline for whatever call is currently running on this
     // engine's store (startup, or the current record) - checked by
     // epoch_deadline_reached whenever the epoch-tick callback fires. See
-    // reset_deadline and the PR-07 finding in the wasm roadmap doc.
+    // reset_deadline.
     ss::steady_clock_type::time_point _current_deadline
       = ss::steady_clock_type::time_point::max();
 };
@@ -1784,8 +1791,8 @@ ss::future<ss::shared_ptr<factory>> wasmtime_runtime::make_factory(
           // Trust is a property of this exact binary (meta.binary_sha256),
           // decided once (on the reactor thread, above) at compile+link
           // time and then shared by every wasmtime_engine instance that
-          // reuses this cached, pre-linked module (see PR-05's
-          // (deploy_offset, ntp) cache key) - an untrusted binary never has
+          // reuses this cached, pre-linked module (keyed on
+          // (deploy_offset, ntp)) - an untrusted binary never has
           // this host module linked in at all, so it cannot even attempt
           // to import it, let alone call it.
           if (grant_network) {
@@ -1795,7 +1802,8 @@ ss::future<ss::shared_ptr<factory>> wasmtime_runtime::make_factory(
               // both capabilities are granted to this exact binary. This is
               // a link-time AND, not a runtime check: a binary with only
               // `network` cannot even import bulk_load, the same
-              // enforcement PR-13 already relies on elsewhere.
+              // link-time-absence enforcement the capabilities above
+              // already rely on.
               if (grant_shared_memory) {
                   register_network_bulk_load_function(linker.get(), ssc);
               }

@@ -16,7 +16,9 @@
 #include "wasm/ffi.h"
 
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/net/api.hh>
 
@@ -71,8 +73,19 @@ public:
     // network activity happens.
     ss::future<int32_t> connect(uint32_t target_index, int32_t* out_handle);
 
-    // Writes the entirety of buf to the connection identified by handle.
-    ss::future<int32_t> send(int32_t handle, ffi::array<uint8_t> buf);
+    // Enqueues buf to be written to the connection identified by handle -
+    // does NOT perform the write itself. Copies buf (guest memory, only
+    // valid for the duration of this call - same reasoning as
+    // transform_module::write_record) into an owned buffer and returns
+    // immediately; the actual write happens in drain_pending_pushes(),
+    // never inline here, so a slow or unreachable peer can never make
+    // this call itself block. Returns BUFFER_FULL (not the usual
+    // IO_ERROR) if the pending-push queue is already at its cap - a
+    // guest that cares can treat this like any other error and back off
+    // or reconnect; one that doesn't just loses this one push, which is
+    // the expected cost of a best-effort side-channel under sustained
+    // backpressure.
+    int32_t send(int32_t handle, ffi::array<uint8_t> buf);
 
     // Reads up to buf.size() bytes from the connection into buf. *out_len
     // is the actual number of bytes read, which may be 0 on a graceful
@@ -100,6 +113,26 @@ public:
     bulk_load(uint32_t target_index, ffi::array<uint8_t> request);
     // End ABI exports
 
+    // Not part of the guest ABI - called once per batch by the owning
+    // engine (wasmtime.cc), at the same per-batch suspension point
+    // transform_module::drain_pending_writes() already uses, right after
+    // the guest's invocation for that batch completes.
+    //
+    // Dispatches (but deliberately does not await) a write for every
+    // push enqueued by send() since the last call, one per connection
+    // that doesn't already have a push in flight - see push_in_flight
+    // below for why "already in flight" means "drop this one" rather
+    // than "queue behind it". This function itself never suspends on
+    // network I/O, by design: that's the entire point of this being
+    // separate from send() at all. A connection whose write eventually
+    // fails is torn down once that failure is actually observed, in the
+    // background - never synchronously from here, and never while a
+    // write against the same connection might still be in flight
+    // (output_stream is not safe to operate on concurrently with itself
+    // - see the warning at net/batched_output_stream.h:93 against trying
+    // to force this via shutdown_output()).
+    void drain_pending_pushes();
+
     // Aborts any in-flight connect and closes every open connection. Called
     // once, from the owning engine's stop() - not part of the guest ABI.
     ss::future<> stop();
@@ -121,6 +154,23 @@ private:
         ss::connected_socket socket;
         ss::input_stream<char> in;
         ss::output_stream<char> out;
+        // Set for the duration of a single dispatched write+flush kicked
+        // off from drain_pending_pushes(), cleared once that write's
+        // future actually resolves (success or failure) - never while it
+        // might still be running. Guards the only invariant that
+        // actually matters here: never call anything on `out` while a
+        // previous call on the same `out` hasn't returned yet.
+        bool push_in_flight = false;
+    };
+
+    // A push enqueued by send(), not yet handed to the connection's
+    // output_stream. handle is re-validated against _connections at
+    // drain time, not enqueue time - a handle can go from valid to
+    // closed in between (guest-initiated close(), or this same
+    // connection failing an earlier push in the same drain pass).
+    struct pending_push {
+        int32_t handle;
+        bytes data;
     };
 
     // Shared by connect() and bulk_load() - resolves and dials target,
@@ -136,6 +186,14 @@ private:
     int32_t _next_handle{0};
     ss::abort_source _as;
     std::function<bool(bytes_view)> _shared_memory_sink;
+
+    ss::chunked_fifo<pending_push> _pending_pushes;
+    // Every write dispatched from drain_pending_pushes() runs under this
+    // gate, never awaited by the caller - stop() closes this gate before
+    // it touches _connections directly, so a background push can never
+    // still be running (and therefore never races) stop()'s own
+    // connection teardown.
+    ss::gate _push_gate;
 };
 
 } // namespace wasm

@@ -84,6 +84,7 @@ filegroup(
         "//src/transform-sdk/go/transform/internal/testdata/dynamic",
         "//src/transform-sdk/go/transform/internal/testdata/identity",
         "//src/transform-sdk/go/transform/internal/testdata/network-echo",
+        "//src/transform-sdk/go/transform/internal/testdata/network-slow-push",
         "//src/transform-sdk/go/transform/internal/testdata/schema-registry",
         "//src/transform-sdk/go/transform/internal/testdata/shared-memory",
         "//src/transform-sdk/go/transform/internal/testdata/setup-panic",

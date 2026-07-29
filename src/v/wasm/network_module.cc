@@ -15,6 +15,7 @@
 #include "logger.h"
 #include "net/dial.h"
 #include "net/dns.h"
+#include "ssx/future-util.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/units.hh>
@@ -61,6 +62,14 @@ constexpr size_t bulk_load_chunk_size = 64_KiB;
 // flags against G5 - this is the mitigation for it, for this one call.
 constexpr auto max_bulk_load_duration = 10s;
 
+// Bounds how much of a slow/unreachable relay's backlog send() will
+// accept before it starts failing closed instead of growing this queue
+// without limit. Deliberately generous relative to a realistic
+// one-push-per-record rate over one batch, not tuned to any specific
+// workload - the queue draining faster than it fills is the normal
+// case; this constant only matters once that stops being true.
+constexpr size_t max_pending_pushes = 4096;
+
 constexpr int32_t SUCCESS = 0;
 constexpr int32_t INVALID_TARGET_INDEX = -1;
 constexpr int32_t CONNECTION_LIMIT_EXCEEDED = -2;
@@ -70,6 +79,7 @@ constexpr int32_t IO_ERROR = -5;
 constexpr int32_t RESPONSE_TOO_LARGE = -6;
 constexpr int32_t TIMED_OUT = -7;
 constexpr int32_t NO_SHARED_MEMORY_REGION = -8;
+constexpr int32_t BUFFER_FULL = -9;
 } // namespace
 
 network_module::network_module(
@@ -116,25 +126,92 @@ network_module::connect(uint32_t target_index, int32_t* out_handle) {
     }
 }
 
-ss::future<int32_t>
-network_module::send(int32_t handle, ffi::array<uint8_t> buf) {
-    auto it = _connections.find(handle);
-    if (it == _connections.end()) {
-        co_return INVALID_HANDLE;
+int32_t network_module::send(int32_t handle, ffi::array<uint8_t> buf) {
+    if (!_connections.contains(handle)) {
+        return INVALID_HANDLE;
     }
-    try {
-        // NOLINTNEXTLINE(*-reinterpret-*)
-        co_await it->second.out.write(
-          reinterpret_cast<const char*>(buf.data()), buf.size());
-        co_await it->second.out.flush();
-        co_return SUCCESS;
-    } catch (...) {
-        vlog(
-          wasm_log.warn,
-          "wasm network send on handle {} failed: {}",
-          handle,
-          std::current_exception());
-        co_return IO_ERROR;
+    if (_pending_pushes.size() >= max_pending_pushes) {
+        return BUFFER_FULL;
+    }
+    // Own the data now: buf is guest memory, only valid for the duration
+    // of this call, but _pending_pushes outlives it (same reasoning as
+    // transform_module::write_record_with_options's owned_partition_key).
+    bytes data;
+    data.resize(buf.size());
+    std::copy(buf.begin(), buf.end(), data.begin());
+    _pending_pushes.push_back(pending_push{.handle = handle, .data = std::move(data)});
+    return SUCCESS;
+}
+
+void network_module::drain_pending_pushes() {
+    auto pending = std::exchange(_pending_pushes, {});
+    if (_push_gate.is_closed()) {
+        // Tearing down (stop() already ran) - nothing left to drain into.
+        return;
+    }
+    for (auto& p : pending) {
+        auto it = _connections.find(p.handle);
+        if (it == _connections.end()) {
+            // Closed since enqueue - by the guest, or by an earlier push
+            // to this same handle failing earlier in this same pass.
+            continue;
+        }
+        if (it->second.push_in_flight) {
+            // A previous push to this handle hasn't resolved yet. Drop
+            // this one rather than queue behind it (this is a best-
+            // effort side-channel - an occasional drop under sustained
+            // backpressure is the accepted cost) or touch the same
+            // output_stream concurrently (not safe - see the header
+            // comment on push_in_flight).
+            continue;
+        }
+        it->second.push_in_flight = true;
+        ssx::spawn_with_gate(
+          _push_gate,
+          [this, handle = p.handle, data = std::move(p.data)]() mutable {
+              auto it2 = _connections.find(handle);
+              if (it2 == _connections.end()) {
+                  return ss::now();
+              }
+              auto& conn = it2->second;
+              // NOLINTNEXTLINE(*-reinterpret-*)
+              return conn.out
+                .write(
+                  reinterpret_cast<const char*>(data.data()), data.size())
+                .then([&conn] { return conn.out.flush(); })
+                .then_wrapped([this, handle](ss::future<> fut) {
+                    auto it3 = _connections.find(handle);
+                    if (it3 == _connections.end()) {
+                        // Closed (by the guest, or by stop()) while this
+                        // write was in flight - nothing left to update.
+                        fut.ignore_ready_future();
+                        return;
+                    }
+                    it3->second.push_in_flight = false;
+                    if (fut.failed()) {
+                        // Same routine-failure reasoning as everywhere
+                        // else in this module: a slow/dead peer is the
+                        // expected case for a best-effort side-channel,
+                        // not something the transform's own per-batch
+                        // processing loop should ever see or wait on -
+                        // that loop already moved on the moment
+                        // drain_pending_pushes() dispatched this, long
+                        // before this continuation runs.
+                        vlog(
+                          wasm_log.debug,
+                          "wasm network push on handle {} failed, "
+                          "closing connection: {}",
+                          handle,
+                          fut.get_exception());
+                        // Safe now - the write we just observed complete
+                        // is the only thing that could have still been
+                        // touching this connection's output_stream.
+                        _connections.erase(it3);
+                    } else {
+                        fut.ignore_ready_future();
+                    }
+                });
+          });
     }
 }
 
@@ -241,6 +318,13 @@ network_module::bulk_load(uint32_t target_index, ffi::array<uint8_t> request) {
 
 ss::future<> network_module::stop() {
     _as.request_abort();
+    // Must happen before touching _connections below: a background push
+    // dispatched from drain_pending_pushes() may still be running
+    // against one of these connections' output_stream, and that stream
+    // is not safe to close (or do anything else to) concurrently with a
+    // write that hasn't resolved yet. Closing the gate waits for every
+    // in-flight push to actually finish first.
+    co_await _push_gate.close();
     auto connections = std::exchange(_connections, {});
     for (auto& [handle, conn] : connections) {
         try {
