@@ -36,6 +36,8 @@ members = [
   "sr-types",
   "sr-sys",
   "sr",
+  "network-sys",
+  "network",
   "examples/*",
 ]
 

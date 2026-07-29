@@ -70,6 +70,7 @@ redpanda_cc_library(
         ":logger",
         "//src/v/base",
         "//src/v/net",
+        "//src/v/ssx:future_util",
     ],
     deps = [
         ":ffi",

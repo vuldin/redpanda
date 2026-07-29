@@ -84,6 +84,7 @@ filegroup(
         "//src/transform-sdk/go/transform/internal/testdata/dynamic",
         "//src/transform-sdk/go/transform/internal/testdata/identity",
         "//src/transform-sdk/go/transform/internal/testdata/network-echo",
+        "//src/transform-sdk/go/transform/internal/testdata/network-slow-push",
         "//src/transform-sdk/go/transform/internal/testdata/schema-registry",
         "//src/transform-sdk/go/transform/internal/testdata/shared-memory",
         "//src/transform-sdk/go/transform/internal/testdata/setup-panic",
@@ -140,7 +141,10 @@ redpanda_cc_gtest(
 
 redpanda_cc_gtest(
     name = "wasm_network_test",
-    timeout = "moderate",
+    # Five tests, each compiling at least one wasm module, and a module
+    # compile is tens of seconds in an unoptimized build - which put this
+    # past the 300s "moderate" budget when the last two tests were added.
+    timeout = "long",
     srcs = [
         "wasm_network_test.cc",
     ],
