@@ -84,6 +84,7 @@ def data_dependency():
         patches = [
             "//bazel/thirdparty:0002-Fix-two-NegoEx-parsing-vulnerabilities.patch",
             "//bazel/thirdparty:0003-Fix-build-when-KRB5_DNS_LOOKUP-isnt-defined.patch",
+            "//bazel/thirdparty:0004-Make-configure.ac-detectable-by-autoconf-2.72.patch",
         ],
         patch_args = ["-p1"],
     )
