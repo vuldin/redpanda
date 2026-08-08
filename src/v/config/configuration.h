@@ -140,6 +140,11 @@ struct configuration final : public config_store {
     property<std::chrono::milliseconds> data_transforms_runtime_limit_ms;
     bounded_property<size_t> data_transforms_binary_max_size;
     bounded_property<size_t> data_transforms_logging_buffer_capacity_bytes;
+    // Relay (push-based consumer delivery, bypassing the Kafka fetch path)
+    property<bool> relay_enabled;
+    property<uint16_t> relay_port;
+    bounded_property<size_t> relay_max_queue_size;
+    property<bool> relay_stage_metrics_enabled;
     property<std::chrono::milliseconds>
       data_transforms_logging_flush_interval_ms;
     property<size_t> data_transforms_logging_line_max_bytes;

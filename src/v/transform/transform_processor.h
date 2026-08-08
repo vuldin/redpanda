@@ -18,6 +18,7 @@
 #include "model/record.h"
 #include "model/timestamp.h"
 #include "model/transform.h"
+#include "relay/fwd.h"
 #include "transform/memory_limiter.h"
 #include "transform/probe.h"
 #include "transform/transfer_queue.h"
@@ -119,7 +120,8 @@ public:
       probe*,
       memory_limits*,
       std::unique_ptr<sink> dead_letter_sink = nullptr,
-      std::unique_ptr<state_store> state_store = nullptr);
+      std::unique_ptr<state_store> state_store = nullptr,
+      relay::service* relay = nullptr);
     processor(const processor&) = delete;
     processor(processor&&) = delete;
     processor& operator=(const processor&) = delete;
@@ -215,6 +217,13 @@ private:
     // error; restore_guest_state/maybe_checkpoint_state both treat it as
     // a no-op.
     std::unique_ptr<state_store> _state_store;
+
+    // The shard-local relay this processor fans its transformed output out
+    // to, in addition to the durable Kafka write. Null when the relay is
+    // disabled - the callback then skips the push entirely, so transforms
+    // pay nothing for a relay they aren't using. Owned by the application,
+    // outlives this processor.
+    relay::service* _relay;
     ss::lowres_clock::time_point _last_checkpoint_at
       = ss::lowres_clock::time_point::min();
 

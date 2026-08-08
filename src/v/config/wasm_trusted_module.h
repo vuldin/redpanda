@@ -45,6 +45,11 @@ enum class wasm_capability {
     // Direct read access to a host-owned memory region mapped into the
     // guest's own linear memory, bypassing the normal per-call ABI.
     shared_memory,
+    // Subscription to relay-pushed data (see src/v/relay/) delivered into the
+    // guest's shared-memory region. Only meaningful alongside shared_memory -
+    // the relay delivers via engine::write_shared_memory, so a guest granted
+    // this without shared_memory has nowhere for the data to land.
+    relay_consumer,
 };
 
 std::string_view to_string_view(wasm_capability c);

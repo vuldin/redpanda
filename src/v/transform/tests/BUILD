@@ -136,3 +136,27 @@ redpanda_cc_gtest(
         "@seastar",
     ],
 )
+
+redpanda_cc_gtest(
+    name = "relay_source_test",
+    timeout = "short",
+    srcs = [
+        "relay_source_test.cc",
+    ],
+    cpu = 1,
+    memory = "128MiB",
+    deps = [
+        "//src/v/base",
+        "//src/v/config",
+        "//src/v/model",
+        "//src/v/model/tests:random",
+        "//src/v/relay:probe",
+        "//src/v/relay:relay",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:random_bytes",
+        "//src/v/transform:impl",
+        "//src/v/transform:logger",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)

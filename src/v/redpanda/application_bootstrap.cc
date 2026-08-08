@@ -33,6 +33,7 @@
 #include "raft/group_manager.h"
 #include "redpanda/admin/server.h"
 #include "redpanda/application.h"
+#include "relay/relay_service.h"
 #include "resource_mgmt/memory_groups.h"
 #include "resource_mgmt/scheduling_groups_probe.h"
 #include "rpc/rpc_utils.h"
@@ -718,6 +719,7 @@ void application::wire_up_and_start(
           },
         };
         _wasm_runtime->start(config).get();
+        _relay_service.invoke_on_all(&relay::service::start).get();
         _transform_rpc_client.invoke_on_all(&transform::rpc::client::start)
           .get();
         _transform_service.invoke_on_all(&transform::service::start).get();

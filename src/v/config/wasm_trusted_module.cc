@@ -22,6 +22,8 @@ std::string_view to_string_view(wasm_capability c) {
         return "network";
     case wasm_capability::shared_memory:
         return "shared_memory";
+    case wasm_capability::relay_consumer:
+        return "relay_consumer";
     }
 }
 
@@ -37,6 +39,9 @@ from_string_view<wasm_capability>(std::string_view sv) {
     }
     if (sv == "shared_memory") {
         return wasm_capability::shared_memory;
+    }
+    if (sv == "relay_consumer") {
+        return wasm_capability::relay_consumer;
     }
     return std::nullopt;
 }

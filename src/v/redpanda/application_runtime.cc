@@ -26,6 +26,7 @@
 #include "pandaproxy/schema_registry/api.h"
 #include "redpanda/admin/kafka_connections_service.h"
 #include "redpanda/application.h"
+#include "relay/relay_service.h"
 #include "resource_mgmt/memory_groups.h"
 #include "resource_mgmt/scheduling_groups_probe.h"
 #include "syschecks/syschecks.h"
@@ -72,9 +73,23 @@ void application::wire_up_runtime_services(
     }
 
     if (wasm_data_transforms_enabled()) {
+        // The relay fans transform output out to push consumers, bypassing
+        // the Kafka fetch path for consumers that opt in. Constructed before
+        // the wasm runtime and transform service so both can be wired to it
+        // (it's started later, alongside the transform service).
+        construct_service(
+          _relay_service,
+          relay::service::config{
+            .tcp_enabled = config::shard_local_cfg().relay_enabled.value(),
+            .tcp_port = config::shard_local_cfg().relay_port.value(),
+            .max_queue_size
+            = config::shard_local_cfg().relay_max_queue_size.value(),
+          })
+          .get();
+
         syschecks::systemd_message("Starting wasm runtime").get();
         auto base_runtime = wasm::create_default_runtime(
-          _schema_registry.get());
+          _schema_registry.get(), &_relay_service);
         construct_single_service(_wasm_runtime, std::move(base_runtime));
 
         syschecks::systemd_message("Starting data transforms").get();
@@ -141,7 +156,8 @@ void application::wire_up_runtime_services(
           &metadata_cache,
           &id_allocator_frontend,
           scheduling_groups::instance().transforms_sg(),
-          memory_groups().data_transforms_max_memory())
+          memory_groups().data_transforms_max_memory(),
+          &_relay_service)
           .get();
     }
 

@@ -601,6 +601,14 @@ public:
      */
     transformed_data copy() const;
 
+    /**
+     * The underlying serialized record payload (key, value, and headers,
+     * vint-encoded). Exposed read-only so the relay can fan the exact bytes
+     * a Kafka consumer would parse out of the record out to push consumers
+     * without a copy on the hot path.
+     */
+    const iobuf& value() const { return _data; }
+
 private:
     explicit transformed_data(iobuf d);
 

@@ -11,14 +11,17 @@
 #pragma once
 
 #include "base/seastarx.h"
+#include "relay/fwd.h"
 #include "wasm/fwd.h"
 
 #include <seastar/core/future.hh>
+#include <seastar/core/sharded.hh>
 
 namespace schema {
 class registry;
 } // namespace schema
 
 namespace wasm::wasmtime {
-std::unique_ptr<runtime> create_runtime(std::unique_ptr<schema::registry>);
+std::unique_ptr<runtime> create_runtime(
+  std::unique_ptr<schema::registry>, ss::sharded<relay::service>* = nullptr);
 }
