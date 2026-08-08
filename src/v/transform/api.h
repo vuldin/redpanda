@@ -16,6 +16,7 @@
 #include "cluster/utils/partition_change_notifier.h"
 #include "features/fwd.h"
 #include "model/transform.h"
+#include "relay/fwd.h"
 #include "transform/fwd.h"
 #include "transform/logging/fwd.h"
 #include "wasm/fwd.h"
@@ -64,7 +65,8 @@ public:
       ss::sharded<cluster::metadata_cache>* metadata_cache,
       ss::sharded<cluster::id_allocator_frontend>* id_allocator_frontend,
       ss::scheduling_group sg,
-      size_t memory_limit);
+      size_t memory_limit,
+      ss::sharded<relay::service>* relay = nullptr);
     service(const service&) = delete;
     service(service&&) = delete;
     service& operator=(const service&) = delete;
@@ -164,6 +166,11 @@ private:
 
     // The total amount of memory available to transforms
     size_t _total_memory_limit;
+
+    // The relay transform processors fan their output out to, or null when
+    // the relay isn't in use. Owned by the application, outlives this
+    // service.
+    ss::sharded<relay::service>* _relay;
 };
 
 } // namespace transform

@@ -53,6 +53,7 @@
 #include "pandaproxy/schema_registry/configuration.h"
 #include "pandaproxy/schema_registry/fwd.h"
 #include "redpanda/admin/kafka_connections_service.h"
+#include "relay/fwd.h"
 #include "redpanda/monitor_unsafe.h"
 #include "resource_mgmt/cpu_profiler.h"
 #include "resource_mgmt/memory_sampling.h"
@@ -420,6 +421,7 @@ private:
     ss::sharded<archival::purger> _archival_purger;
 
     std::unique_ptr<wasm::caching_runtime> _wasm_runtime;
+    ss::sharded<relay::service> _relay_service;
     ss::sharded<transform::service> _transform_service;
     ss::sharded<transform::rpc::local_service> _transform_rpc_service;
     ss::sharded<transform::rpc::client> _transform_rpc_client;

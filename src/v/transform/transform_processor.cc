@@ -14,10 +14,12 @@
 #include "logger.h"
 #include "model/batch_compression.h"
 #include "model/fundamental.h"
+#include "model/namespace.h"
 #include "model/record.h"
 #include "model/timeout_clock.h"
 #include "model/timestamp.h"
 #include "model/transform.h"
+#include "relay/relay_service.h"
 #include "ssx/abort_source.h"
 #include "ssx/future-util.h"
 #include "wasm/engine.h"
@@ -111,10 +113,11 @@ processor::processor(
   std::unique_ptr<source> source,
   std::vector<std::unique_ptr<sink>> sinks,
   std::unique_ptr<offset_tracker> offset_tracker,
-  probe* p,
-  memory_limits* mem_limits,
-  std::unique_ptr<sink> dead_letter_sink,
-  std::unique_ptr<state_store> state_store)
+      probe* p,
+      memory_limits* mem_limits,
+      std::unique_ptr<sink> dead_letter_sink,
+      std::unique_ptr<state_store> state_store,
+      relay::service* relay)
   : _id(id)
   , _ntp(std::move(ntp))
   , _meta(std::move(meta))
@@ -127,6 +130,7 @@ processor::processor(
   , _outputs()
   , _dead_letter_sink(std::move(dead_letter_sink))
   , _state_store(std::move(state_store))
+  , _relay(relay)
   , _task(ss::now())
   , _logger(tlog, ss::format("{}/{}", _meta.name(), _ntp.tp.partition())) {
     const auto& outputs = _meta.output_topics;
@@ -429,6 +433,27 @@ ss::future<> processor::run_transform_loop() {
                 std::optional<model::topic_view> topic,
                 std::optional<iobuf> partition_key,
                 model::transformed_data data) {
+                  // Fan the transformed record out to any relay consumers
+                  // subscribed to this output stream, in addition to the
+                  // durable Kafka write below. Synchronous and fire-and-forget
+                  // - push() never blocks, drops for backlogged consumers, and
+                  // returns immediately when nothing subscribes, so the
+                  // transform hot path is unaffected either way. Keyed on the
+                  // output topic and this processor's (input) partition, which
+                  // matches the default same-index-as-input routing a Kafka
+                  // consumer of the output topic would fetch from.
+                  if (_relay) {
+                      model::topic out_topic = topic
+                                                 ? model::topic(topic.value())
+                                                 : _meta.output_topics.front()
+                                                     .tp;
+                      _relay->push(
+                        model::ntp(
+                          model::kafka_namespace,
+                          std::move(out_topic),
+                          _ntp.tp.partition),
+                        data.value());
+                  }
                   keyed_transformed_data keyed{
                     .partition_key = std::move(partition_key),
                     .data = std::move(data)};

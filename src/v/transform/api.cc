@@ -36,6 +36,9 @@
 #include "model/timestamp.h"
 #include "model/transform.h"
 #include "raft/consensus.h"
+#include "relay/relay_service.h"
+#include "transform/relay_offset_tracker.h"
+#include "transform/relay_source.h"
 #include "ssx/future-util.h"
 #include "transform/logging/log_manager.h"
 #include "transform/logging/rpc_client.h"
@@ -537,6 +540,22 @@ private:
     ss::lw_shared_ptr<cluster::partition> _partition_for_term;
 };
 
+// A transform is relay-sourced - fed by the relay (src/v/relay/) instead of
+// reading its input partition - when it sets this env var at deploy time.
+// This is the v1 opt-in mechanism for in-broker relay consumers; a
+// first-class metadata field is the planned follow-up. (Not REDPANDA_-prefixed:
+// plugin_frontend rejects reserved REDPANDA_* env keys.)
+constexpr std::string_view relay_source_env_var = "RELAY_SOURCE";
+
+bool is_relay_sourced(const model::transform_metadata& meta) {
+    auto it = meta.environment.find(ss::sstring(relay_source_env_var));
+    if (it == meta.environment.end()) {
+        return false;
+    }
+    const auto& v = it->second;
+    return v == "1" || v == "true" || v == "yes";
+}
+
 using wasm_engine_factory = ss::noncopyable_function<
   ss::future<ss::optimized_optional<ss::shared_ptr<wasm::engine>>>(
     model::ntp, model::transform_metadata)>;
@@ -549,13 +568,15 @@ public:
       cluster::partition_manager* partition_manager,
       rpc::client* client,
       commit_batcher<>* batcher,
-      cluster::id_allocator_frontend* id_allocator_frontend)
+      cluster::id_allocator_frontend* id_allocator_frontend,
+      relay::service* relay)
       : _wasm_engine_factory(std::move(factory))
       , _partition_manager(partition_manager)
       , _client(client)
       , _batcher(batcher)
       , _topic_table(topic_table)
-      , _id_allocator_frontend(id_allocator_frontend) {}
+      , _id_allocator_frontend(id_allocator_frontend)
+      , _relay(relay) {}
 
     ss::future<std::unique_ptr<processor>> create_processor(
       model::transform_id id,
@@ -590,26 +611,63 @@ public:
                 cluster::error_category().message(int(id_reply.ec))));
         }
         model::producer_identity producer_pid{id_reply.id, int16_t{0}};
-        auto partition = kafka::make_partition_proxy(ntp, *_partition_manager);
-        if (!partition) {
-            throw std::runtime_error("unable to create transform source");
+
+        // Relay-sourced consumers are fed by the relay rather than reading
+        // their input partition. Everything downstream of the source (the
+        // transform loop, the output sinks, offset tracking) is identical -
+        // only where input records come from differs.
+        bool relay_sourced = is_relay_sourced(meta);
+        if (relay_sourced && !_relay) {
+            vlog(
+              tlog.warn,
+              "transform {} is relay-sourced but the relay is not enabled; "
+              "falling back to a partition read",
+              meta.name);
+            relay_sourced = false;
         }
-        // Held alongside the partition_proxy so partition_source can wait on
-        // Raft's offset_monitor directly, the same way the Kafka fetch
-        // handler does for long-poll. May be null (e.g. a benign race with
-        // the partition being removed) - partition_source falls back to its
-        // deadline in that case.
-        //
-        // Copied (not moved) into partition_source below: offset_tracker_impl
-        // and state_store_impl also need it, for epoch-fencing and state
-        // persistence respectively, and it's a plain refcounted handle - a
-        // copy is one atomic increment, once per processor creation, not a
-        // hot-path cost. Moving it here instead would silently leave both
-        // of those with a null partition on every single processor create,
-        // not just the rare benign race the comment above describes.
-        auto partition_for_wait = _partition_manager->get(ntp);
-        auto src = std::make_unique<partition_source>(
-          *std::move(partition), partition_for_wait);
+
+        std::unique_ptr<source> src;
+        std::unique_ptr<offset_tracker> offset_tracker;
+        std::unique_ptr<state_store> state_store;
+
+        if (relay_sourced) {
+            src = std::make_unique<relay_source>(_relay, ntp);
+            offset_tracker = std::make_unique<relay_offset_tracker>();
+            // No guest-state persistence for relay consumers in v1 - they
+            // don't register a shared-memory region on this path.
+            state_store = nullptr;
+        } else {
+            auto partition = kafka::make_partition_proxy(ntp, *_partition_manager);
+            if (!partition) {
+                throw std::runtime_error("unable to create transform source");
+            }
+            // Held alongside the partition_proxy so partition_source can wait
+            // on Raft's offset_monitor directly, the same way the Kafka fetch
+            // handler does for long-poll. May be null (e.g. a benign race with
+            // the partition being removed) - partition_source falls back to its
+            // deadline in that case.
+            //
+            // Copied (not moved) into partition_source below:
+            // offset_tracker_impl and state_store_impl also need it, for
+            // epoch-fencing and state persistence respectively, and it's a
+            // plain refcounted handle - a copy is one atomic increment, once
+            // per processor creation, not a hot-path cost. Moving it here
+            // instead would silently leave both of those with a null partition
+            // on every single processor create, not just the rare benign race
+            // the comment above describes.
+            auto partition_for_wait = _partition_manager->get(ntp);
+            src = std::make_unique<partition_source>(
+              *std::move(partition), partition_for_wait);
+            offset_tracker = std::make_unique<offset_tracker_impl>(
+              id,
+              ntp.tp.partition,
+              meta.output_topics.size(),
+              _client,
+              _batcher,
+              partition_for_wait);
+            state_store = std::make_unique<state_store_impl>(
+              id, std::move(partition_for_wait));
+        }
 
         std::vector<std::unique_ptr<sink>> sinks;
         sinks.reserve(meta.output_topics.size());
@@ -633,17 +691,6 @@ public:
               producer_pid);
         }
 
-        auto offset_tracker = std::make_unique<offset_tracker_impl>(
-          id,
-          ntp.tp.partition,
-          meta.output_topics.size(),
-          _client,
-          _batcher,
-          partition_for_wait);
-
-        auto state_store = std::make_unique<state_store_impl>(
-          id, std::move(partition_for_wait));
-
         co_return std::make_unique<processor>(
           id,
           ntp,
@@ -656,7 +703,8 @@ public:
           p,
           ml,
           std::move(dead_letter_sink),
-          std::move(state_store));
+          std::move(state_store),
+          _relay);
     }
 
 private:
@@ -668,6 +716,7 @@ private:
     commit_batcher<>* _batcher;
     cluster::topic_table* _topic_table;
     cluster::id_allocator_frontend* _id_allocator_frontend;
+    relay::service* _relay;
 };
 
 class rpc_offset_committer : public offset_committer {
@@ -727,7 +776,8 @@ service::service(
   ss::sharded<cluster::metadata_cache>* metadata_cache,
   ss::sharded<cluster::id_allocator_frontend>* id_allocator_frontend,
   ss::scheduling_group sg,
-  size_t memory_limit)
+  size_t memory_limit,
+  ss::sharded<relay::service>* relay)
   : _runtime(runtime)
   , _self(self)
   , _plugin_frontend(plugin_frontend)
@@ -739,7 +789,8 @@ service::service(
   , _metadata_cache(metadata_cache)
   , _id_allocator_frontend(id_allocator_frontend)
   , _sg(sg)
-  , _total_memory_limit(memory_limit) {}
+  , _total_memory_limit(memory_limit)
+  , _relay(relay) {}
 
 service::~service() = default;
 
@@ -786,7 +837,8 @@ ss::future<> service::start() {
         &_partition_manager->local(),
         &_rpc_client->local(),
         _batcher.get(),
-        &_id_allocator_frontend->local()),
+        &_id_allocator_frontend->local(),
+        _relay ? &_relay->local() : nullptr),
       _sg,
       std::move(mem_limits));
 

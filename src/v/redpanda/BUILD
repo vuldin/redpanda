@@ -142,6 +142,8 @@ redpanda_cc_library(
         "//src/v/storage:chunk_cache",
         "//src/v/strings:utf8",
         "//src/v/syschecks",
+        "//src/v/relay:fwd",
+        "//src/v/relay:relay",
         "//src/v/transform",
         "//src/v/transform:fwd",
         "//src/v/transform/rpc",

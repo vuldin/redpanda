@@ -15,8 +15,10 @@
 #include "wasm/wasmtime.h"
 
 namespace wasm {
-std::unique_ptr<runtime>
-create_default_runtime(pandaproxy::schema_registry::api* schema_reg) {
-    return wasmtime::create_runtime(schema::registry::make_default(schema_reg));
+std::unique_ptr<runtime> create_default_runtime(
+  pandaproxy::schema_registry::api* schema_reg,
+  ss::sharded<relay::service>* relay) {
+    return wasmtime::create_runtime(
+      schema::registry::make_default(schema_reg), relay);
 }
 } // namespace wasm

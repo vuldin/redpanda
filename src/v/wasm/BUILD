@@ -225,6 +225,32 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "relay_consumer_module",
+    srcs = [
+        "relay_consumer_module.cc",
+    ],
+    hdrs = [
+        "relay_consumer_module.h",
+    ],
+    implementation_deps = [
+        ":logger",
+        "//src/v/base",
+        "//src/v/bytes",
+        "//src/v/bytes:iobuf",
+        "//src/v/relay:relay",
+        "//src/v/relay:subscription",
+    ],
+    deps = [
+        ":api",
+        ":ffi",
+        "//src/v/model",
+        "//src/v/relay:fwd",
+        "@abseil-cpp//absl/container:flat_hash_map",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "wasmtime",
     srcs = [
         "wasmtime.cc",
@@ -238,6 +264,7 @@ redpanda_cc_library(
         ":ffi",
         ":logger",
         ":network_module",
+        ":relay_consumer_module",
         ":schema_registry_module",
         ":shared_memory_module",
         ":transform_module",
@@ -249,6 +276,7 @@ redpanda_cc_library(
         "//src/v/model",
         "//src/v/model:batch_compression",
         "//src/v/reflection:type_traits",
+        "//src/v/relay:relay",
         "//src/v/schema:registry",
         "//src/v/ssx:mutex",
         "//src/v/ssx:thread_worker",
@@ -264,6 +292,7 @@ redpanda_cc_library(
     deps = [
         ":api",
         "//src/v/base",
+        "//src/v/relay:fwd",
         "@seastar",
     ],
 )
@@ -312,6 +341,7 @@ redpanda_cc_library(
         "//src/v/base",
         "//src/v/pandaproxy/schema_registry:fwd",
         "//src/v/pandaproxy/schema_registry:types",
+        "//src/v/relay:fwd",
         "@seastar",
     ],
 )
