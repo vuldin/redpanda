@@ -26,6 +26,8 @@
 #include "model/timestamp.h"
 #include "model/transform.h"
 #include "network_module.h"
+#include "relay/relay_service.h"
+#include "relay_consumer_module.h"
 #include "schema_registry_module.h"
 #include "shared_memory_module.h"
 #include "ssx/thread_worker.h"
@@ -157,7 +159,9 @@ private:
 
 class wasmtime_runtime : public runtime {
 public:
-    explicit wasmtime_runtime(std::unique_ptr<schema::registry> sr);
+    explicit wasmtime_runtime(
+      std::unique_ptr<schema::registry> sr,
+      ss::sharded<relay::service>* relay = nullptr);
 
     ss::future<> start(runtime::config c) override;
 
@@ -175,6 +179,11 @@ public:
     engine_probe_cache* engine_probe_cache();
 
     std::chrono::milliseconds per_invocation_timeout() const;
+
+    // The sharded relay transform processors fan output out to, or null when
+    // the relay isn't in use. Engines read the shard-local instance off this
+    // at construction (they're always built on the shard they'll run on).
+    ss::sharded<relay::service>* relay() const { return _relay; }
 
 private:
     void register_metrics();
@@ -215,6 +224,7 @@ private:
     metrics::public_metric_groups _public_metrics;
     ss::sharded<wasm::engine_probe_cache> _engine_probe_cache;
     std::chrono::milliseconds _per_invocation_timeout{0};
+    ss::sharded<relay::service>* _relay = nullptr;
     std::atomic<bool> _epoch_ticker_stop{false};
     // A dedicated OS thread, not a task submitted to _alien_thread: the
     // latter is a single-worker task queue meant for short-lived, one-shot
@@ -497,6 +507,12 @@ public:
         return _shared_memory_granted;
     }
 
+    // Same reasoning as shared_memory_granted, for the `relay_consumer`
+    // capability.
+    bool relay_consumer_granted() const noexcept {
+        return _relay_consumer_granted;
+    }
+
 private:
     friend class wasmtime_runtime;
     handle<wasmtime_instance_pre_t, wasmtime_instance_pre_delete> _underlying
@@ -506,6 +522,7 @@ private:
     std::optional<std::vector<net::unresolved_address>>
       _network_allowed_targets;
     bool _shared_memory_granted{false};
+    bool _relay_consumer_granted{false};
 };
 
 absl::flat_hash_map<ss::sstring, ss::sstring>
@@ -555,7 +572,8 @@ public:
       ss::foreign_ptr<ss::lw_shared_ptr<preinitialized_instance>>
         preinitialized,
       schema::registry* sr,
-      std::unique_ptr<wasm::logger> logger)
+      std::unique_ptr<wasm::logger> logger,
+      relay::service* relay)
       : _runtime(runtime)
       , _meta(std::move(metadata))
       , _preinitialized(std::move(preinitialized))
@@ -577,6 +595,12 @@ public:
         }
         if (_preinitialized->shared_memory_granted()) {
             _shared_memory_module.emplace();
+        }
+        // Same reasoning as the capabilities above: only engaged when this
+        // exact binary was granted relay_consumer (and therefore had the
+        // module linked in, in make_factory) AND the relay itself is in use.
+        if (_preinitialized->relay_consumer_granted() && relay) {
+            _relay_consumer_module.emplace(relay, this);
         }
     }
     wasmtime_engine(const wasmtime_engine&) = delete;
@@ -601,6 +625,12 @@ public:
         co_await std::move(main);
         if (_network_module) {
             co_await _network_module->stop();
+        }
+        if (_relay_consumer_module) {
+            // Unsubscribe before the store is torn down below - the relay
+            // delivers into this engine's shared memory, so it must stop
+            // being pointed at us before that memory goes away.
+            co_await _relay_consumer_module->stop();
         }
         // Deleting the store invalidates the instance and actually frees the
         // memory for the underlying instance.
@@ -719,6 +749,8 @@ public:
             return &_network_module.value();
         } else if constexpr (std::is_same_v<T, shared_memory_module>) {
             return &_shared_memory_module.value();
+        } else if constexpr (std::is_same_v<T, relay_consumer_module>) {
+            return &_relay_consumer_module.value();
         } else {
             static_assert(
               base::unsupported_type<T>::value, "unsupported module");
@@ -1072,6 +1104,9 @@ private:
     std::optional<network_module> _network_module;
     // Same reasoning as _network_module, for the `shared_memory` capability.
     std::optional<shared_memory_module> _shared_memory_module;
+    // Same reasoning as _network_module, for the `relay_consumer` capability
+    // (engaged only when the relay is also in use - see the constructor).
+    std::optional<relay_consumer_module> _relay_consumer_module;
 
     // The following state is only valid if there is a non-null store.
     handle<wasmtime_store_t, wasmtime_store_delete> _store;
@@ -1536,6 +1571,17 @@ void register_shared_memory_module(
 #undef REG_HOST_FN
 }
 
+void register_relay_consumer_module(
+  wasmtime_linker_t* linker, const strict_stack_config& ssc) {
+    // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define REG_HOST_FN(name)                                                      \
+    host_function<&relay_consumer_module::name>::reg(linker, #name, ssc)
+    REG_HOST_FN(check_abi_version_0);
+    REG_HOST_FN(subscribe);
+    REG_HOST_FN(unsubscribe);
+#undef REG_HOST_FN
+}
+
 class wasmtime_engine_factory : public factory {
 public:
     wasmtime_engine_factory(
@@ -1557,8 +1603,13 @@ public:
     ss::future<ss::shared_ptr<engine>>
     make_engine(model::ntp, std::unique_ptr<wasm::logger> logger) final {
         auto copy = co_await _preinitialized.copy();
+        // Called on the shard the engine will run on, so relay->local() is
+        // that shard's own relay instance - the same shard-locality the
+        // transform processor's own relay pushes rely on.
+        auto* relay = _runtime->relay() ? &_runtime->relay()->local()
+                                        : nullptr;
         co_return ss::make_shared<wasmtime_engine>(
-          _runtime, _meta, std::move(copy), _sr, std::move(logger));
+          _runtime, _meta, std::move(copy), _sr, std::move(logger), relay);
     }
 
 private:
@@ -1568,8 +1619,10 @@ private:
     schema::registry* _sr;
 };
 
-wasmtime_runtime::wasmtime_runtime(std::unique_ptr<schema::registry> sr)
-  : _sr(std::move(sr)) {
+wasmtime_runtime::wasmtime_runtime(
+  std::unique_ptr<schema::registry> sr, ss::sharded<relay::service>* relay)
+  : _sr(std::move(sr))
+  , _relay(relay) {
     wasm_config_t* config = wasm_config_new();
 
     // Spend more time compiling so that we can have faster code.
@@ -1761,6 +1814,9 @@ ss::future<ss::shared_ptr<factory>> wasmtime_runtime::make_factory(
     preinitialized->_shared_memory_granted
       = trusted
         && trusted->has_capability(::config::wasm_capability::shared_memory);
+    preinitialized->_relay_consumer_granted
+      = trusted
+        && trusted->has_capability(::config::wasm_capability::relay_consumer);
     size_t memory_usage_size = co_await _alien_thread.submit(
       [this,
        &meta,
@@ -1768,7 +1824,8 @@ ss::future<ss::shared_ptr<factory>> wasmtime_runtime::make_factory(
        &preinitialized,
        &ssc,
        grant_network,
-       grant_shared_memory = preinitialized->_shared_memory_granted] {
+       grant_shared_memory = preinitialized->_shared_memory_granted,
+       grant_relay_consumer = preinitialized->_relay_consumer_granted] {
           vlog(wasm_log.debug, "compiling wasm module {}", meta.name);
           // This can be a large contiguous allocation, however it happens
           // on an alien thread so it bypasses the seastar allocator.
@@ -1810,6 +1867,14 @@ ss::future<ss::shared_ptr<factory>> wasmtime_runtime::make_factory(
           }
           if (grant_shared_memory) {
               register_shared_memory_module(linker.get(), ssc);
+          }
+          // The relay delivers into the guest's shared-memory region, so the
+          // consumer module only makes sense - and is only linked in - when
+          // both relay_consumer and shared_memory are granted: a link-time
+          // AND, the same shape bulk_load uses above. A binary granted
+          // relay_consumer alone cannot even import subscribe/unsubscribe.
+          if (grant_relay_consumer && grant_shared_memory) {
+              register_relay_consumer_module(linker.get(), ssc);
           }
 
           error.reset(wasmtime_linker_instantiate_pre(
@@ -2079,8 +2144,9 @@ ss::future<> wasmtime_runtime::validate(model::wasm_binary_iobuf buf) {
 
 } // namespace
 
-std::unique_ptr<runtime> create_runtime(std::unique_ptr<schema::registry> sr) {
-    return std::make_unique<wasmtime_runtime>(std::move(sr));
+std::unique_ptr<runtime> create_runtime(
+  std::unique_ptr<schema::registry> sr, ss::sharded<relay::service>* relay) {
+    return std::make_unique<wasmtime_runtime>(std::move(sr), relay);
 }
 
 } // namespace wasm::wasmtime

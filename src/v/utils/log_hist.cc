@@ -77,6 +77,15 @@ log_hist<number_of_buckets, first_bucket_upper_bound>::
 template<int number_of_buckets, uint64_t first_bucket_upper_bound>
 seastar::metrics::histogram
 log_hist<number_of_buckets, first_bucket_upper_bound>::
+  relay_histogram_logform() const {
+    using relay_hist_config = logform_config<1'000'000l, 8ul, 26>;
+
+    return seastar_histogram_logform<relay_hist_config>();
+}
+
+template<int number_of_buckets, uint64_t first_bucket_upper_bound>
+seastar::metrics::histogram
+log_hist<number_of_buckets, first_bucket_upper_bound>::
   internal_histogram_logform() const {
     using internal_hist_config = logform_config<1l, 8ul, 26>;
 
@@ -120,6 +129,17 @@ seastar::metrics::histogram
 latency_log_hist<duration_t, number_of_buckets, first_bucket_upper_bound>::
   public_histogram_logform() const {
     return _histo.public_histogram_logform();
+}
+
+template<
+  class duration_t,
+  int number_of_buckets,
+  uint64_t first_bucket_upper_bound>
+requires detail::is_duration_v<duration_t>
+seastar::metrics::histogram
+latency_log_hist<duration_t, number_of_buckets, first_bucket_upper_bound>::
+  relay_histogram_logform() const {
+    return _histo.relay_histogram_logform();
 }
 
 template<

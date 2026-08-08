@@ -274,6 +274,43 @@ configuration::configuration()
       {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
       500_KiB,
       {.min = 100_KiB, .max = 2_MiB})
+  , relay_enabled(
+      *this,
+      "relay_enabled",
+      "Enable the relay's TCP listener for external push consumers. The "
+      "relay fans transform output out to push consumers, bypassing the "
+      "Kafka fetch path. Wasm-based consumers (delivered via shared memory) "
+      "work regardless of this setting.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      false)
+  , relay_port(
+      *this,
+      "relay_port",
+      "Base port for the relay's TCP listener. Each shard listens on "
+      "relay_port + shard_index, so a consumer connects to the shard that "
+      "owns its partition's data.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      9093)
+  , relay_max_queue_size(
+      *this,
+      "relay_max_queue_size",
+      "Per-consumer bound on queued-but-unsent relay records before the "
+      "oldest start being dropped. Protects the transform hot path from slow "
+      "consumers.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      1024,
+      {.min = 1, .max = 1_MiB})
+  , relay_stage_metrics_enabled(
+      *this,
+      "relay_stage_metrics_enabled",
+      "Record per-stage relay latency histograms: the fan-out dispatch loop's "
+      "own duration, and the enqueue-to-dequeue delay a relay consumer waits "
+      "before its processor is scheduled. Off by default because both land on "
+      "the relay hot path - each adds a steady-clock read per push. Enable it "
+      "to attribute relay latency between fan-out dispatch and consumer "
+      "scheduling, which are otherwise indistinguishable.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      false)
   , data_transforms_logging_flush_interval_ms(
       *this,
       "data_transforms_logging_flush_interval_ms",

@@ -99,6 +99,22 @@ public:
      */
     seastar::metrics::histogram public_histogram_logform() const;
     /*
+     * internal's bounds (8us first bucket, 26 buckets) with public's SECONDS
+     * scale.
+     *
+     * public_histogram_logform's first bucket is 0-256us, which is useless for
+     * anything in the tens of microseconds: on 2026-09-02 the relay's fan-out
+     * span (~68us mean) had EVERY sample in that one bucket, so p50/p90/p99 came
+     * out as 127.5/229.5/252.5 - identical across three runs whose means
+     * differed by 5%, i.e. interpolation artifacts of a single bucket rather
+     * than measurements.
+     *
+     * internal_histogram_logform has the right bounds but reports MICROSECONDS,
+     * and mixing units on /public_metrics silently makes every consumer 1e6x
+     * wrong. Hence this one: internal's resolution, public's units.
+     */
+    seastar::metrics::histogram relay_histogram_logform() const;
+    /*
      * Generates a Prometheus histogram with 26 buckets. The first bucket has an
      * upper bound of 8 - 1 and subsequent buckets have an upper bound of 2
      * times the upper bound of the previous bucket.
@@ -250,6 +266,9 @@ public:
     }
 
     seastar::metrics::histogram public_histogram_logform() const;
+
+    /// See log_hist::relay_histogram_logform.
+    seastar::metrics::histogram relay_histogram_logform() const;
 
     seastar::metrics::histogram internal_histogram_logform() const;
 
