@@ -11,6 +11,7 @@
 #include "transform_processor.h"
 
 #include "bytes/bytes.h"
+#include "config/configuration.h"
 #include "logger.h"
 #include "model/batch_compression.h"
 #include "model/fundamental.h"
@@ -28,6 +29,7 @@
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/util/variant_utils.hh>
 
 #include <boost/range/irange.hpp>
@@ -113,11 +115,11 @@ processor::processor(
   std::unique_ptr<source> source,
   std::vector<std::unique_ptr<sink>> sinks,
   std::unique_ptr<offset_tracker> offset_tracker,
-      probe* p,
-      memory_limits* mem_limits,
-      std::unique_ptr<sink> dead_letter_sink,
-      std::unique_ptr<state_store> state_store,
-      relay::service* relay)
+  probe* p,
+  memory_limits* mem_limits,
+  std::unique_ptr<sink> dead_letter_sink,
+  std::unique_ptr<state_store> state_store,
+  relay::service* relay)
   : _id(id)
   , _ntp(std::move(ntp))
   , _meta(std::move(meta))
@@ -221,6 +223,17 @@ ss::future<> processor::stop() {
 
 ss::future<> processor::restore_guest_state() {
     if (!_state_store) {
+        // A transform that opted into require_state_recovery but somehow
+        // ended up without a state_store (api.cc rejects this combination
+        // for relay-sourced transforms at construction time - this is a
+        // defense-in-depth check for any other path that might construct a
+        // processor without one) must not silently start as if recovery
+        // trivially succeeded.
+        if (_meta.state_options.require_state_recovery) {
+            throw std::runtime_error(
+              "require_state_recovery is set but this transform has no "
+              "guest-state store to recover from");
+        }
         co_return;
     }
     auto state = co_await _state_store->load_latest_state();
@@ -399,6 +412,44 @@ ss::future<> processor::run_consumer_loop(kafka::offset offset) {
         }
         offset = kafka::next_offset(*last_offset);
         vlog(_logger.trace, "consumed up to offset {}", offset);
+
+        // Optional read linger. `wait_for_offset` above only runs on an EMPTY
+        // read, so when records are flowing this loop re-reads immediately and
+        // consumes whatever tiny amount has landed - measured at ~3.3 records
+        // per batch on a 10k orders/sec stream. Every one of those reads pays a
+        // full setup: a reader constructed, futures chained, tasks queued,
+        // allocations made. A dwarf profile of the matcher's own core put
+        // `partition_source::read_batch` at 12.4% of it with no algorithmic
+        // hotspot anywhere, which is the signature of that per-read overhead.
+        //
+        // Sleeping here lets records accumulate so the next read serves more of
+        // them. Note the leading `::` on config - transform::processor has a
+        // NESTED `struct config`, so an unqualified `config::` resolves to that
+        // instead of the global namespace.
+        //
+        // Measured 2026-08-30 (run_id=1788133661, 10k orders/sec): 1000us cut
+        // this shard's transforms-group CPU by 21% and per-record consumer CPU
+        // by 42%, and essentially all of that was already captured at 1000us -
+        // so the interesting range is BELOW a millisecond, which is why the
+        // property is microseconds.
+        //
+        // Why this and not the reader's `min_bytes`: setting min_bytes on the
+        // transform's read config is a NO-OP. `storage::local_log_reader_config`
+        // has no min_bytes field at all - it exists only on the kafka-level and
+        // cloud reader configs - and the accumulate/long-poll logic lives in
+        // `kafka/server/handlers/fetch.cc` (`over_min_bytes`), a path transforms
+        // never take. A knob wired to min_bytes would have measured as "batching
+        // does not help".
+        auto linger = std::chrono::microseconds(
+          ::config::shard_local_cfg().data_transforms_read_linger_us.value());
+        if (linger > std::chrono::microseconds::zero()) {
+            try {
+                co_await ss::sleep_abortable(linger, _as);
+            } catch (const ss::sleep_aborted&) {
+                // Shutting down; the loop condition will end it.
+                break;
+            }
+        }
     }
 }
 
@@ -441,12 +492,21 @@ ss::future<> processor::run_transform_loop() {
                   // transform hot path is unaffected either way. Keyed on the
                   // output topic and this processor's (input) partition, which
                   // matches the default same-index-as-input routing a Kafka
-                  // consumer of the output topic would fetch from.
-                  if (_relay) {
-                      model::topic out_topic = topic
-                                                 ? model::topic(topic.value())
-                                                 : _meta.output_topics.front()
-                                                     .tp;
+                  // consumer of the output topic would fetch from - but only
+                  // when the record isn't guest-keyed (partition_key unset).
+                  // A guest-chosen key (REQ-17b) routes to whatever partition
+                  // that key hashes to, which this callback has no way to
+                  // compute synchronously without duplicating the real
+                  // partitioner, so a keyed write is never relayed rather
+                  // than guessing wrong and delivering it to whichever
+                  // consumer happens to be subscribed to the *input*
+                  // partition's ntp instead. A relay consumer that needs
+                  // keyed output should consume the durable output topic
+                  // directly.
+                  if (_relay && !partition_key) {
+                      model::topic out_topic
+                        = topic ? model::topic(topic.value())
+                                : _meta.output_topics.front().tp;
                       _relay->push(
                         model::ntp(
                           model::kafka_namespace,
