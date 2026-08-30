@@ -144,6 +144,8 @@ struct configuration final : public config_store {
     property<bool> relay_enabled;
     property<uint16_t> relay_port;
     bounded_property<size_t> relay_max_queue_size;
+    property<bool> relay_stage_metrics_enabled;
+    bounded_property<std::chrono::milliseconds> data_transforms_read_linger_ms;
     property<std::chrono::milliseconds>
       data_transforms_logging_flush_interval_ms;
     property<size_t> data_transforms_logging_line_max_bytes;

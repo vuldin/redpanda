@@ -300,6 +300,32 @@ configuration::configuration()
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       1024,
       {.min = 1, .max = 1_MiB})
+  , relay_stage_metrics_enabled(
+      *this,
+      "relay_stage_metrics_enabled",
+      "Record per-stage relay latency histograms: the fan-out dispatch loop's "
+      "own duration, and the enqueue-to-dequeue delay a relay consumer waits "
+      "before its processor is scheduled. Off by default because both land on "
+      "the relay hot path - each adds a steady-clock read per push. Enable it "
+      "to attribute relay latency between fan-out dispatch and consumer "
+      "scheduling, which are otherwise indistinguishable.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      false)
+  , data_transforms_read_linger_ms(
+      *this,
+      "data_transforms_read_linger_ms",
+      "How long a data transform waits after finishing a batch before reading "
+      "again, letting more records accumulate so one read serves more of them. "
+      "0 (the default) preserves the existing behaviour: the processor re-reads "
+      "immediately, which on a low-latency stream yields very small batches - "
+      "measured at ~3.3 records - so every record pays a full read setup. "
+      "Raising this trades a bounded, broker-side wait for fewer reads per "
+      "record. Unlike a client-side producer linger it does not sit inside the "
+      "client's round trip.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      std::chrono::milliseconds(0),
+      {.min = std::chrono::milliseconds(0),
+       .max = std::chrono::milliseconds(1000)})
   , data_transforms_logging_flush_interval_ms(
       *this,
       "data_transforms_logging_flush_interval_ms",
