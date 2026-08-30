@@ -145,6 +145,13 @@ struct configuration final : public config_store {
     property<uint16_t> relay_port;
     bounded_property<size_t> relay_max_queue_size;
     property<bool> relay_stage_metrics_enabled;
+    // Microseconds, as a plain integer: config/convert.h only knows
+    // milliseconds and seconds for chrono durations, and the measured useful
+    // range for this knob is entirely BELOW one millisecond, so a
+    // milliseconds-typed property cannot express it. Adding a
+    // convert<microseconds> specialisation would touch the framework every
+    // other property depends on; the unit lives in the name instead.
+    bounded_property<uint32_t> data_transforms_read_linger_us;
     property<std::chrono::milliseconds>
       data_transforms_logging_flush_interval_ms;
     property<size_t> data_transforms_logging_line_max_bytes;

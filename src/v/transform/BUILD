@@ -94,6 +94,7 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":logger",
+        "//src/v/config",
         "//src/v/metrics",
         "//src/v/model:batch_compression",
         "//src/v/relay:logger",
