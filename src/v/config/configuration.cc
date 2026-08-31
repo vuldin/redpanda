@@ -311,21 +311,23 @@ configuration::configuration()
       "scheduling, which are otherwise indistinguishable.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       false)
-  , data_transforms_read_linger_ms(
+  , data_transforms_read_linger_us(
       *this,
-      "data_transforms_read_linger_ms",
-      "How long a data transform waits after finishing a batch before reading "
-      "again, letting more records accumulate so one read serves more of them. "
-      "0 (the default) preserves the existing behaviour: the processor re-reads "
-      "immediately, which on a low-latency stream yields very small batches - "
-      "measured at ~3.3 records - so every record pays a full read setup. "
-      "Raising this trades a bounded, broker-side wait for fewer reads per "
-      "record. Unlike a client-side producer linger it does not sit inside the "
-      "client's round trip.",
+      "data_transforms_read_linger_us",
+      "Microseconds a data transform waits after finishing a batch before "
+      "reading again, letting more records accumulate so one read serves more "
+      "of them. 0 (the default) preserves the original behaviour: the processor "
+      "re-reads immediately, which on a low-latency stream yields very small "
+      "batches - measured at ~3.3 records - so every record pays a full read "
+      "setup. Measured on 2026-08-30 at 10k orders/sec: 1000us cut CPU on the "
+      "bottleneck shard by 21% and per-record consumer CPU by 42%, and "
+      "essentially all of that benefit was already captured at 1000us, so the "
+      "interesting range is BELOW a millisecond - which is why this is "
+      "microseconds and not milliseconds. Unlike a client-side producer linger "
+      "it does not sit inside the client's round trip.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
-      std::chrono::milliseconds(0),
-      {.min = std::chrono::milliseconds(0),
-       .max = std::chrono::milliseconds(1000)})
+      0,
+      {.min = 0, .max = 100000})
   , data_transforms_logging_flush_interval_ms(
       *this,
       "data_transforms_logging_flush_interval_ms",
