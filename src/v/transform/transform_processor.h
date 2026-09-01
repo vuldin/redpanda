@@ -121,7 +121,11 @@ public:
       memory_limits*,
       std::unique_ptr<sink> dead_letter_sink = nullptr,
       std::unique_ptr<state_store> state_store = nullptr,
-      relay::service* relay = nullptr);
+      relay::service* relay = nullptr,
+      // The group the processor's own loops run in. Optional so the many test
+      // constructions keep working unchanged: when unset the loops simply
+      // inherit the caller's group, which is the pre-existing behaviour.
+      std::optional<ss::scheduling_group> sg = std::nullopt);
     processor(const processor&) = delete;
     processor(processor&&) = delete;
     processor& operator=(const processor&) = delete;
@@ -224,6 +228,7 @@ private:
     // pay nothing for a relay they aren't using. Owned by the application,
     // outlives this processor.
     relay::service* _relay;
+    std::optional<ss::scheduling_group> _sg;
     ss::lowres_clock::time_point _last_checkpoint_at
       = ss::lowres_clock::time_point::min();
 

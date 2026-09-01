@@ -37,11 +37,12 @@
 #include "model/transform.h"
 #include "raft/consensus.h"
 #include "relay/relay_service.h"
-#include "transform/relay_offset_tracker.h"
-#include "transform/relay_source.h"
 #include "ssx/future-util.h"
 #include "transform/logging/log_manager.h"
 #include "transform/logging/rpc_client.h"
+#include "transform/relay_offset_tracker.h"
+#include "transform/relay_source.h"
+#include "transform/relay_source_env.h"
 #include "transform/rpc/client.h"
 #include "transform/rpc/deps.h"
 #include "transform/stm/transform_state_stm.h"
@@ -354,9 +355,12 @@ private:
 class registry_adapter : public registry {
 public:
     registry_adapter(
-      cluster::plugin_frontend* pf, cluster::partition_manager* m)
+      cluster::plugin_frontend* pf,
+      cluster::partition_manager* m,
+      cluster::topic_table* topic_table)
       : _pf(pf)
-      , _manager(m) {}
+      , _manager(m)
+      , _topic_table(topic_table) {}
 
     absl::flat_hash_set<model::partition_id>
     get_leader_partitions(model::topic_namespace_view tp_ns) const override {
@@ -365,6 +369,25 @@ public:
             if (entry.second->is_elected_leader()) {
                 p.emplace(entry.first.tp.partition);
             }
+        }
+        return p;
+    }
+
+    // Every partition of tp_ns, regardless of leadership or whether this
+    // node has any local replica at all - unlike get_leader_partitions(),
+    // which only ever answers for partitions this shard leads. Needed to
+    // place a relay-sourced transform on a shard that doesn't lead any of
+    // the topic's partitions (see transform_manager.cc's hint-placement
+    // handling).
+    absl::flat_hash_set<model::partition_id>
+    all_partitions(model::topic_namespace_view tp_ns) const override {
+        absl::flat_hash_set<model::partition_id> p;
+        auto assignments = _topic_table->get_topic_assignments(tp_ns);
+        if (!assignments) {
+            return p;
+        }
+        for (const auto& [_, assignment] : *assignments) {
+            p.emplace(assignment.id);
         }
         return p;
     }
@@ -387,6 +410,7 @@ public:
 private:
     cluster::plugin_frontend* _pf;
     cluster::partition_manager* _manager;
+    cluster::topic_table* _topic_table;
 };
 
 class state_store_impl : public state_store {
@@ -540,22 +564,6 @@ private:
     ss::lw_shared_ptr<cluster::partition> _partition_for_term;
 };
 
-// A transform is relay-sourced - fed by the relay (src/v/relay/) instead of
-// reading its input partition - when it sets this env var at deploy time.
-// This is the v1 opt-in mechanism for in-broker relay consumers; a
-// first-class metadata field is the planned follow-up. (Not REDPANDA_-prefixed:
-// plugin_frontend rejects reserved REDPANDA_* env keys.)
-constexpr std::string_view relay_source_env_var = "RELAY_SOURCE";
-
-bool is_relay_sourced(const model::transform_metadata& meta) {
-    auto it = meta.environment.find(ss::sstring(relay_source_env_var));
-    if (it == meta.environment.end()) {
-        return false;
-    }
-    const auto& v = it->second;
-    return v == "1" || v == "true" || v == "yes";
-}
-
 using wasm_engine_factory = ss::noncopyable_function<
   ss::future<ss::optimized_optional<ss::shared_ptr<wasm::engine>>>(
     model::ntp, model::transform_metadata)>;
@@ -569,14 +577,16 @@ public:
       rpc::client* client,
       commit_batcher<>* batcher,
       cluster::id_allocator_frontend* id_allocator_frontend,
-      relay::service* relay)
+      relay::service* relay,
+      ss::scheduling_group relay_consumers_sg)
       : _wasm_engine_factory(std::move(factory))
       , _partition_manager(partition_manager)
       , _client(client)
       , _batcher(batcher)
       , _topic_table(topic_table)
       , _id_allocator_frontend(id_allocator_frontend)
-      , _relay(relay) {}
+      , _relay(relay)
+      , _relay_consumers_sg(relay_consumers_sg) {}
 
     ss::future<std::unique_ptr<processor>> create_processor(
       model::transform_id id,
@@ -617,6 +627,9 @@ public:
         // transform loop, the output sinks, offset tracking) is identical -
         // only where input records come from differs.
         bool relay_sourced = is_relay_sourced(meta);
+        // Set only on the relay-sourced path below; unset means the
+        // processor's loops inherit the caller's group, as before.
+        std::optional<ss::scheduling_group> proc_sg;
         if (relay_sourced && !_relay) {
             vlog(
               tlog.warn,
@@ -631,13 +644,33 @@ public:
         std::unique_ptr<state_store> state_store;
 
         if (relay_sourced) {
+            if (meta.state_options.require_state_recovery) {
+                // Relay consumers don't register a shared-memory region and
+                // have no guest-state persistence in v1 (see state_store =
+                // nullptr below), so this deploy's own require_state_recovery
+                // request can never be satisfied. Rejecting it here, rather
+                // than starting and silently skipping recovery, is what
+                // require_state_recovery is for: a transform that opted into
+                // guaranteed state survival should never start successfully
+                // with state it can't guarantee.
+                throw std::runtime_error(
+                  "relay-sourced transforms (RELAY_SOURCE=1) do not support "
+                  "guest-state persistence in v1; require_state_recovery "
+                  "cannot be satisfied for this deploy");
+            }
             src = std::make_unique<relay_source>(_relay, ntp);
+            // Relay consumers get their own scheduling group so their guest
+            // CPU is accounted (and can be biased) separately from the
+            // transform whose output they consume - the two are normally
+            // pinned to the same shard.
+            proc_sg = _relay_consumers_sg;
             offset_tracker = std::make_unique<relay_offset_tracker>();
             // No guest-state persistence for relay consumers in v1 - they
             // don't register a shared-memory region on this path.
             state_store = nullptr;
         } else {
-            auto partition = kafka::make_partition_proxy(ntp, *_partition_manager);
+            auto partition = kafka::make_partition_proxy(
+              ntp, *_partition_manager);
             if (!partition) {
                 throw std::runtime_error("unable to create transform source");
             }
@@ -704,7 +737,8 @@ public:
           ml,
           std::move(dead_letter_sink),
           std::move(state_store),
-          _relay);
+          _relay,
+          proc_sg);
     }
 
 private:
@@ -717,6 +751,7 @@ private:
     cluster::topic_table* _topic_table;
     cluster::id_allocator_frontend* _id_allocator_frontend;
     relay::service* _relay;
+    ss::scheduling_group _relay_consumers_sg;
 };
 
 class rpc_offset_committer : public offset_committer {
@@ -777,7 +812,8 @@ service::service(
   ss::sharded<cluster::id_allocator_frontend>* id_allocator_frontend,
   ss::scheduling_group sg,
   size_t memory_limit,
-  ss::sharded<relay::service>* relay)
+  ss::sharded<relay::service>* relay,
+  ss::scheduling_group relay_consumers_sg)
   : _runtime(runtime)
   , _self(self)
   , _plugin_frontend(plugin_frontend)
@@ -790,7 +826,8 @@ service::service(
   , _id_allocator_frontend(id_allocator_frontend)
   , _sg(sg)
   , _total_memory_limit(memory_limit)
-  , _relay(relay) {}
+  , _relay(relay)
+  , _relay_consumers_sg(relay_consumers_sg) {}
 
 service::~service() = default;
 
@@ -828,7 +865,9 @@ ss::future<> service::start() {
     _manager = std::make_unique<manager<ss::lowres_clock>>(
       _self,
       std::make_unique<registry_adapter>(
-        &_plugin_frontend->local(), &_partition_manager->local()),
+        &_plugin_frontend->local(),
+        &_partition_manager->local(),
+        &_topic_table->local()),
       std::make_unique<proc_factory>(
         [this](model::ntp ntp, model::transform_metadata meta) {
             return create_engine(std::move(ntp), std::move(meta));
@@ -838,7 +877,8 @@ ss::future<> service::start() {
         &_rpc_client->local(),
         _batcher.get(),
         &_id_allocator_frontend->local(),
-        _relay ? &_relay->local() : nullptr),
+        _relay ? &_relay->local() : nullptr,
+        _relay_consumers_sg),
       _sg,
       std::move(mem_limits));
 

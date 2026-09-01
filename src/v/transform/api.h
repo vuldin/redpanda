@@ -66,7 +66,14 @@ public:
       ss::sharded<cluster::id_allocator_frontend>* id_allocator_frontend,
       ss::scheduling_group sg,
       size_t memory_limit,
-      ss::sharded<relay::service>* relay = nullptr);
+      ss::sharded<relay::service>* relay = nullptr,
+      // Scheduling group for relay-driven (in-broker push) consumers, kept
+      // separate from `sg` so their guest CPU is accounted independently of
+      // the transform whose output they consume. Defaults to the default
+      // group, which preserves existing behaviour for any caller that does
+      // not pass one.
+      ss::scheduling_group relay_consumers_sg
+      = ss::default_scheduling_group());
     service(const service&) = delete;
     service(service&&) = delete;
     service& operator=(const service&) = delete;
@@ -171,6 +178,7 @@ private:
     // the relay isn't in use. Owned by the application, outlives this
     // service.
     ss::sharded<relay::service>* _relay;
+    ss::scheduling_group _relay_consumers_sg;
 };
 
 } // namespace transform
