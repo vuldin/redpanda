@@ -157,8 +157,7 @@ void application::wire_up_runtime_services(
           &id_allocator_frontend,
           scheduling_groups::instance().transforms_sg(),
           memory_groups().data_transforms_max_memory(),
-          &_relay_service,
-          scheduling_groups::instance().relay_consumers_sg())
+          &_relay_service)
           .get();
     }
 

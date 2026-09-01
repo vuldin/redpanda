@@ -102,32 +102,6 @@ public:
          */
         _transforms = co_await ss::create_scheduling_group("transforms", 100);
         /**
-         * Relay consumers (in-broker wasm consumers driven by relay pushes
-         * rather than by a log read) run here instead of in `transforms`.
-         *
-         * Deliberately created with the SAME shares as `transforms`, so adding
-         * this group changes no scheduling behaviour on its own. Two things it
-         * does buy:
-         *
-         *  - Separate CPU accounting. A relay consumer and the transform whose
-         *    output it consumes are usually pinned to the same shard, and until
-         *    now their guest execution was pooled in one group, so "the matcher
-         *    is saturating its core" and "the consumers are saturating it" were
-         *    indistinguishable in the scheduler metrics. josh-236 showed the
-         *    fanout ceiling is single-core saturation on the matcher's shard;
-         *    attributing that between producer and consumers needs them split.
-         *  - A tuning knob for the split. An earlier experiment found
-         *    starvation accounted for 100% of a measured degradation, and with
-         *    one shared group there was no way to bias the two against each
-         *    other. Shares are settable per-shard at runtime via set_shares().
-         *
-         * Note this adds no CPU: at high fanout the producer and its consumers
-         * compete for the same core either way. It makes the competition
-         * visible and adjustable rather than removing it.
-         */
-        _relay_consumers = co_await ss::create_scheduling_group(
-          "relay_consumers", 100);
-        /**
          * Group used to run datalake translation.
          */
         _datalake = co_await ss::create_scheduling_group("datalake", 100);
@@ -182,13 +156,6 @@ public:
     ss::scheduling_group raft_heartbeats() { return _raft_heartbeats; }
     ss::scheduling_group self_test_sg() { return _self_test; }
     ss::scheduling_group transforms_sg() const { return _transforms; }
-    /**
-     * Scheduling group for relay-driven (in-broker push) wasm consumers. See
-     * the creation site for why this is separate from transforms_sg().
-     */
-    ss::scheduling_group relay_consumers_sg() const {
-        return _relay_consumers;
-    }
     ss::scheduling_group datalake_sg() { return _datalake; }
     /**
      * @brief Scheduling group for fetch requests.
@@ -236,7 +203,6 @@ public:
           std::cref(_self_test),
           std::cref(_fetch),
           std::cref(_transforms),
-          std::cref(_relay_consumers),
           std::cref(_datalake),
           std::cref(_produce),
           std::cref(_ts_read),
@@ -263,7 +229,6 @@ private:
     ss::scheduling_group _self_test;
     ss::scheduling_group _fetch;
     ss::scheduling_group _transforms;
-    ss::scheduling_group _relay_consumers;
     ss::scheduling_group _datalake;
     ss::scheduling_group _produce;
     ss::scheduling_group _ts_read;

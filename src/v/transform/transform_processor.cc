@@ -119,8 +119,7 @@ processor::processor(
   memory_limits* mem_limits,
   std::unique_ptr<sink> dead_letter_sink,
   std::unique_ptr<state_store> state_store,
-  relay::service* relay,
-  std::optional<ss::scheduling_group> sg)
+  relay::service* relay)
   : _id(id)
   , _ntp(std::move(ntp))
   , _meta(std::move(meta))
@@ -134,7 +133,6 @@ processor::processor(
   , _dead_letter_sink(std::move(dead_letter_sink))
   , _state_store(std::move(state_store))
   , _relay(relay)
-  , _sg(sg)
   , _task(ss::now())
   , _logger(tlog, ss::format("{}/{}", _meta.name(), _ntp.tp.partition())) {
     const auto& outputs = _meta.output_topics;
@@ -191,26 +189,10 @@ ss::future<> processor::start() {
             }
             // Mark that we're running now that the start offset is loaded.
             _state_callback(_id, _ntp, state::running);
-            // Run the three loops in this processor's scheduling group when
-            // one was supplied. Continuations scheduled from inside inherit
-            // it, so the guest execution these loops drive is accounted to
-            // that group too - which is the point for relay consumers, whose
-            // CPU was previously pooled with the transform they consume from
-            // (see scheduling_groups::relay_consumers_sg). When unset, the
-            // loops inherit the caller's group exactly as before.
-            auto loops = [this,
-                          min,
-                          latest_committed = std::move(
-                            latest_committed)]() mutable {
-                return when_all_shutdown(
-                  run_consumer_loop(min),
-                  run_transform_loop(),
-                  run_all_producers(std::move(latest_committed)));
-            };
-            if (_sg) {
-                return ss::with_scheduling_group(*_sg, std::move(loops));
-            }
-            return loops();
+            return when_all_shutdown(
+              run_consumer_loop(min),
+              run_transform_loop(),
+              run_all_producers(std::move(latest_committed)));
         }));
 }
 
