@@ -172,15 +172,15 @@ ss::future<result<model::offset, cluster::errc>> local_service::produce(
     // overload rather than the plain bulk replicate() this used before,
     // so a batch carrying a real producer_id (every transform output
     // batch does) actually gets rm_stm's existing (producer_id, epoch,
-    // sequence) dedup fencing instead of silently bypassing it. batch_identity::
-    // from() derives cleanly from whatever the batch's own header
-    // already carries - a batch without a real producer_id (is_idempotent()
-    // false) takes the exact same code path partition::replicate_in_stages
-    // already used for a non-idempotent batch, so this is not a behavior
-    // change for any caller that doesn't set one. Requires
-    // enable_idempotence (on by default) - a cluster with it off will see
-    // "doesn't support idempotent requests" instead of a silent
-    // dedup-free fallback, which is the more honest failure mode.
+    // sequence) dedup fencing instead of silently bypassing it.
+    // batch_identity:: from() derives cleanly from whatever the batch's own
+    // header already carries - a batch without a real producer_id
+    // (is_idempotent() false) takes the exact same code path
+    // partition::replicate_in_stages already used for a non-idempotent batch,
+    // so this is not a behavior change for any caller that doesn't set one.
+    // Requires enable_idempotence (on by default) - a cluster with it off will
+    // see "doesn't support idempotent requests" instead of a silent dedup-free
+    // fallback, which is the more honest failure mode.
     co_return co_await _partition_manager->invoke_on_shard(
       *shard,
       ntp,
@@ -293,6 +293,16 @@ local_service::consume_wasm_binary_reader(
     auto batches = co_await model::consume_reader_to_memory(
       std::move(rdr), deadline);
     if (batches.empty()) {
+        // An expired deadline also yields an empty batch list, so reporting
+        // this as invalid_request conflates "the request was malformed" with
+        // "the read ran out of time". That cost real diagnostic effort on
+        // 2026-09-02: deploying 500-1000 transforms at once produced 525
+        // "unable to load wasm binary ...: Invalid request" warnings, and
+        // nothing in the logs said timeout, so a thundering herd on the binary
+        // load looked like a malformed-request bug for hours. Distinguish them.
+        if (model::timeout_clock::now() >= deadline) {
+            co_return cluster::errc::timeout;
+        }
         co_return cluster::errc::invalid_request;
     }
     auto& batch = batches.front();

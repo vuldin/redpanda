@@ -46,6 +46,14 @@ public:
     virtual absl::flat_hash_set<model::partition_id>
       get_leader_partitions(model::topic_namespace_view) const = 0;
 
+    // Get every partition of this topic, regardless of leadership or
+    // whether this node has any local replica at all. Needed to place a
+    // relay-sourced transform on a shard that doesn't lead any of the
+    // topic's partitions - see manager::handle_plugin_change's
+    // hint-placement handling.
+    virtual absl::flat_hash_set<model::partition_id>
+      all_partitions(model::topic_namespace_view) const = 0;
+
     // Get all the transforms with this ns_tp as the input source.
     virtual absl::flat_hash_set<model::transform_id>
       lookup_by_input_topic(model::topic_namespace_view) const = 0;

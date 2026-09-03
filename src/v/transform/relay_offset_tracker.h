@@ -42,10 +42,12 @@ public:
     // the source's latest offset.
     ss::future<absl::flat_hash_map<model::output_topic_index, kafka::offset>>
     load_committed_offsets() final {
-        co_return absl::flat_hash_map<model::output_topic_index, kafka::offset>{};
+        co_return absl::
+          flat_hash_map<model::output_topic_index, kafka::offset>{};
     }
 
-    ss::future<> commit_offset(model::output_topic_index idx, kafka::offset o) final {
+    ss::future<>
+    commit_offset(model::output_topic_index idx, kafka::offset o) final {
         _committed[idx] = o;
         co_return;
     }

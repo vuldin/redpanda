@@ -1606,8 +1606,7 @@ public:
         // Called on the shard the engine will run on, so relay->local() is
         // that shard's own relay instance - the same shard-locality the
         // transform processor's own relay pushes rely on.
-        auto* relay = _runtime->relay() ? &_runtime->relay()->local()
-                                        : nullptr;
+        auto* relay = _runtime->relay() ? &_runtime->relay()->local() : nullptr;
         co_return ss::make_shared<wasmtime_engine>(
           _runtime, _meta, std::move(copy), _sr, std::move(logger), relay);
     }

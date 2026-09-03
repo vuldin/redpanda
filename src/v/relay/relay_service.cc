@@ -65,7 +65,11 @@ void ignore_no_sharded_instance(const std::exception_ptr& ex) {
 }
 } // namespace
 
-void service::deliver_locally(const model::ntp& ntp, const iobuf& data) {
+void service::deliver_locally(
+  const model::ntp& ntp,
+  const iobuf& data,
+  ss::steady_clock_type::time_point dispatched_at,
+  ss::steady_clock_type::time_point pushed_at) {
     auto it = _by_ntp.find(ntp);
     if (it == _by_ntp.end()) {
         return;
@@ -82,8 +86,23 @@ void service::deliver_locally(const model::ntp& ntp, const iobuf& data) {
       = ::config::shard_local_cfg().relay_stage_metrics_enabled();
     auto started = measure ? ss::steady_clock_type::now()
                            : ss::steady_clock_type::time_point{};
+
+    // Cross-shard transit, recorded BEFORE the delivery loop: what is being
+    // measured is how long the record took to GET here, so it must not
+    // include the local dispatch loop that fanout_duration already covers.
+    // Unset dispatched_at means push()'s local path (no transit exists) or
+    // stage metrics off at the producer.
+    if (measure && dispatched_at != ss::steady_clock_type::time_point{}) {
+        _probe.record_crossshard_transit(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+            started - dispatched_at));
+    }
+
     for (auto& [_, sub] : it->second) {
-        if (sub->deliver(data)) {
+        // pushed_at (not dispatched_at) - the span being measured starts at the
+        // producing transform's emit, so a local subscriber and one three shards
+        // away are measured from the same instant.
+        if (sub->deliver(data, pushed_at)) {
             _probe.increment_delivered();
         } else {
             _probe.increment_dropped();
@@ -104,7 +123,13 @@ void service::deliver_locally(const model::ntp& ntp, const iobuf& data) {
 }
 
 void service::push(const model::ntp& ntp, const iobuf& data) {
-    deliver_locally(ntp, data);
+    // One clock read for the whole push, taken FIRST so every subscriber -
+    // local and remote - is timed from the same emit instant.
+    const bool measure_emit
+      = ::config::shard_local_cfg().relay_stage_metrics_enabled();
+    auto pushed_at = measure_emit ? ss::steady_clock_type::now()
+                                  : ss::steady_clock_type::time_point{};
+    deliver_locally(ntp, data, ss::steady_clock_type::time_point{}, pushed_at);
     auto it = _shards_with_subscribers.find(ntp);
     if (it == _shards_with_subscribers.end()) {
         return;
@@ -158,6 +183,20 @@ void service::push(const model::ntp& ntp, const iobuf& data) {
     auto payload = ss::make_lw_shared<iobuf>(data.copy());
     auto topic = ss::make_lw_shared<model::ntp>(ntp);
 
+    // Taken AFTER the payload copy and before the first submission, so
+    // crossshard_transit measures the cross-shard path itself rather than
+    // re-counting the copy that crossshard_dispatch already charges.
+    //
+    // One stamp for the whole loop, not one per shard. That means a later
+    // shard's transit also includes the submission cost of the shards ahead of
+    // it - bounded by (remote - 1) x per-submission cost, measured at 25-100ns,
+    // so under ~2us even at fan-out 20. Deliberate: the effect being chased is
+    // milliseconds, and taking one clock read per remote shard would multiply
+    // the reads on this hot path by the fan-out factor, which is exactly the
+    // kind of instrumentation that changes what it measures.
+    auto dispatched_at = measure ? ss::steady_clock_type::now()
+                                 : ss::steady_clock_type::time_point{};
+
     std::vector<ss::future<>> dispatched;
     dispatched.reserve(remote);
     for (auto shard : it->second) {
@@ -168,8 +207,9 @@ void service::push(const model::ntp& ntp, const iobuf& data) {
           container()
             .invoke_on(
               shard,
-              [t = payload.get(), n = topic.get()](service& other) {
-                  other.deliver_locally(*n, *t);
+              [t = payload.get(), n = topic.get(), dispatched_at, pushed_at](
+                service& other) {
+                  other.deliver_locally(*n, *t, dispatched_at, pushed_at);
               })
             .handle_exception(&ignore_no_sharded_instance));
     }

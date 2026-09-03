@@ -98,6 +98,23 @@ public:
           .sample_count;
     }
 
+    size_t emit_to_guest_samples() {
+        return _svc->get_probe()
+          .emit_to_guest()
+          .public_histogram_logform()
+          .sample_count;
+    }
+
+    int64_t emit_to_guest_mean_us() {
+        auto h = _svc->get_probe().emit_to_guest().public_histogram_logform();
+        return h.sample_count ? int64_t(h.sample_sum / h.sample_count) : -1;
+    }
+
+    int64_t consume_delay_mean_us() {
+        auto h = _svc->get_probe().consume_delay().public_histogram_logform();
+        return h.sample_count ? int64_t(h.sample_sum / h.sample_count) : -1;
+    }
+
     size_t _max_queue = 1024;
     std::optional<relay::service> _svc;
     std::optional<relay_source> _src;
@@ -159,5 +176,41 @@ TEST_F(relay_source_test, flipping_the_flag_mid_queue_records_only_the_new) {
          "delay would be measured from the epoch, not from its enqueue";
 }
 
+
+// emit_to_guest is the span that replaced three inferred terms, so it needs its
+// own test rather than being trusted because the pieces it subsumes are tested.
+//
+// The invariant that makes it meaningful: emit_to_guest STRICTLY CONTAINS
+// consume_delay. consume_delay runs from the record being enqueued on the
+// destination to it being dequeued; emit_to_guest starts earlier, at the
+// producing transform's emit. So emit >= consume always, and if the wiring ever
+// passed the wrong timestamp through (dispatched_at instead of pushed_at, say)
+// this is the assertion that would catch it.
+TEST_F(relay_source_test, emit_to_guest_contains_consume_delay) {
+    set_stage_metrics(true);
+    push_records(8);
+    ASSERT_EQ(drain_record_count(), 8);
+
+    EXPECT_GT(emit_to_guest_samples(), 0u)
+      << "emit_to_guest recorded nothing - pushed_at is probably not reaching "
+         "relay_source::on_push through subscription::deliver";
+    EXPECT_EQ(emit_to_guest_samples(), consume_delay_samples())
+      << "the two spans must be recorded once per record each";
+    EXPECT_GE(emit_to_guest_mean_us(), consume_delay_mean_us())
+      << "emit_to_guest must CONTAIN consume_delay (emit happens before the "
+         "enqueue), so it can never be the smaller of the two";
+}
+
+// Same gate as every other stage histogram: recording costs clock reads on the
+// relay hot path, so it must stay off unless asked for.
+TEST_F(relay_source_test, emit_to_guest_not_recorded_when_metrics_off) {
+    set_stage_metrics(false);
+    push_records(8);
+    ASSERT_EQ(drain_record_count(), 8);
+    EXPECT_EQ(emit_to_guest_samples(), 0u)
+      << "emit_to_guest recorded while relay_stage_metrics_enabled=false";
+}
+
 } // namespace
+
 } // namespace transform

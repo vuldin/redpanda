@@ -10,6 +10,7 @@
  */
 
 #include "base/vassert.h"
+#include "config/configuration.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
 #include "relay/relay_service.h"
@@ -79,7 +80,84 @@ public:
         svcs.start(service::config{.tcp_enabled = false}).get();
     }
 
-    void TearDown() override { svcs.stop().get(); }
+    void TearDown() override {
+        svcs.stop().get();
+        // Always put the flag back: it is shard-local state that outlives the
+        // fixture, so a test that left it on would silently change what every
+        // later test measures.
+        set_stage_metrics(false);
+    }
+
+    // relay_stage_metrics_enabled is SHARD-LOCAL, so setting it on the calling
+    // shard alone would leave every other shard unmeasured - and in this test
+    // the shards that matter are the remote ones.
+    static void set_stage_metrics(bool v) {
+        ss::smp::invoke_on_all([v] {
+            ::config::shard_local_cfg().relay_stage_metrics_enabled.set_value(v);
+        }).get();
+    }
+
+    size_t transit_samples(unsigned shard) {
+        return svcs
+          .invoke_on(
+            shard,
+            [](service& s) {
+                return s.get_probe()
+                  .crossshard_transit()
+                  .public_histogram_logform()
+                  .sample_count;
+            })
+          .get();
+    }
+
+    size_t fanout_samples(unsigned shard) {
+        return svcs
+          .invoke_on(
+            shard,
+            [](service& s) {
+                return s.get_probe()
+                  .fanout_duration()
+                  .public_histogram_logform()
+                  .sample_count;
+            })
+          .get();
+    }
+
+    // Subscribe on EVERY shard, producer's included. Subscribing only on the
+    // remote ones would make the "producer records no transit" assertion pass
+    // for the wrong reason: with no local subscriber, deliver_locally returns
+    // at the _by_ntp lookup before it could record anything.
+    void subscribe_all_shards(const model::ntp& ntp) {
+        // ntp captured by REFERENCE, not value: invoke_on_all requires the
+        // functor to be nothrow-move-constructible, and model::ntp owns
+        // strings so a by-value capture is not. Safe here because the future
+        // is awaited before this frame returns, so the referent outlives every
+        // remote call - and cross-shard *reads* of another shard's memory are
+        // legal in seastar's single address space (the same argument push()
+        // relies on for its shared payload).
+        ss::smp::invoke_on_all([this, &ntp] {
+            g_sub_id = svcs.local().add_subscription(ntp, &g_sub);
+        }).get();
+    }
+
+    void push_until_remote_delivered(const model::ntp& ntp) {
+        // add_subscription's cross-shard broadcast is fire-and-forget, so
+        // retry the push itself rather than assuming one suffices.
+        tests::cooperative_spin_wait_with_timeout(
+          std::chrono::seconds(10),
+          [this, ntp] {
+              svcs.local().push(ntp, make_data(64));
+              return svcs.invoke_on(1, [](service&) {
+                  return g_sub.calls > 0;
+              });
+          })
+          .get();
+        for (int i = 0; i < 5; ++i) {
+            svcs.local().push(ntp, make_data(64));
+        }
+        // Let the fire-and-forget cross-shard dispatches drain.
+        ss::sleep(std::chrono::milliseconds(200)).get();
+    }
 
     ss::sharded<service> svcs;
 };
@@ -223,6 +301,65 @@ TEST_F(
                           .invoke_on(1, [](service&) { return g_sub.calls; })
                           .get();
     EXPECT_EQ(calls_after, calls_before);
+}
+
+
+// crossshard_transit, added 2026-09-01. It closes the one gap left in the relay
+// timeline: crossshard_dispatch stops before awaiting anything (it measures how
+// long the matcher was held up), and consume_delay starts only once a record is
+// already enqueued on the destination, so time spent inside seastar's
+// cross-shard path was charged to no stage at all.
+//
+// Two properties are asserted together, because either alone can pass for the
+// wrong reason: transit IS recorded on a destination shard, and is NOT recorded
+// for push()'s purely local delivery (where no transit exists). fanout_duration
+// on the producer is the tripwire - if it were zero, stage metrics never turned
+// on and the "no transit on the producer" half would be vacuous.
+TEST_F(relay_cross_shard_fixture, CrossShardTransitRecordedOnDestinationOnly) {
+    set_stage_metrics(true);
+    auto ntp = test_ntp();
+    const auto shards = ss::this_smp_shard_count();
+    ASSERT_GT(shards, 1u);
+
+    subscribe_all_shards(ntp);
+    push_until_remote_delivered(ntp);
+
+    ASSERT_GT(fanout_samples(0), 0u)
+      << "producer shard recorded no fanout_duration, so stage metrics were "
+         "not actually on and the transit assertions below prove nothing";
+
+    EXPECT_EQ(transit_samples(0), 0u)
+      << "the producer shard charged itself cross-shard transit for its own "
+         "LOCAL delivery; push()'s local path must pass no timestamp";
+
+    for (unsigned sh = 1; sh < shards; ++sh) {
+        EXPECT_GT(transit_samples(sh), 0u)
+          << "destination shard " << sh
+          << " recorded no cross-shard transit despite receiving pushes";
+    }
+}
+
+// The gate has to hold for the new histogram too: recording costs a
+// steady-clock read on the relay hot path, which is the whole reason
+// relay_stage_metrics_enabled defaults to false.
+TEST_F(relay_cross_shard_fixture, CrossShardTransitNotRecordedWhenMetricsOff) {
+    set_stage_metrics(false);
+    auto ntp = test_ntp();
+    const auto shards = ss::this_smp_shard_count();
+
+    subscribe_all_shards(ntp);
+    push_until_remote_delivered(ntp);
+
+    // Delivery itself must still have happened - otherwise zero samples would
+    // just mean nothing was pushed.
+    auto calls = svcs.invoke_on(1, [](service&) { return g_sub.calls; }).get();
+    ASSERT_GT(calls, 0) << "nothing was delivered, so this test is vacuous";
+
+    for (unsigned sh = 0; sh < shards; ++sh) {
+        EXPECT_EQ(transit_samples(sh), 0u)
+          << "shard " << sh
+          << " recorded crossshard_transit while stage metrics were off";
+    }
 }
 
 } // namespace relay

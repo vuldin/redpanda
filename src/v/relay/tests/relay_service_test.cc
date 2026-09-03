@@ -92,9 +92,7 @@ TEST_F(relay_fixture, RemoveSubscriptionStopsDelivery) {
     EXPECT_EQ(a.calls, 1);
 }
 
-TEST_F(relay_fixture, RemoveUnknownIdIsANoop) {
-    svc.remove_subscription(9999);
-}
+TEST_F(relay_fixture, RemoveUnknownIdIsANoop) { svc.remove_subscription(9999); }
 
 TEST_F(relay_fixture, DroppedDeliveryIsCountedNotFatal) {
     test_subscription a;

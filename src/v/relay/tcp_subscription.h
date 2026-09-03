@@ -47,7 +47,9 @@ public:
     // subscriptions. The socket itself is closed by the connected_socket
     // destructor when this subscription is destroyed.
     tcp_subscription(
-      ss::connected_socket conn, size_t max_queue_size, ss::abort_source& server_as)
+      ss::connected_socket conn,
+      size_t max_queue_size,
+      ss::abort_source& server_as)
       : _conn(std::move(conn))
       , _out(_conn.output())
       , _max_queue_size(max_queue_size)
@@ -60,13 +62,18 @@ public:
     ~tcp_subscription() final = default;
 
     bool deliver(const iobuf& data) final {
-        if (_queue.size() >= _max_queue_size) {
+        bool backlogged = _queue.size() >= _max_queue_size;
+        if (backlogged) {
             _queue.pop_front();
             ++_dropped;
         }
         _queue.push_back(data.copy());
         _cond.signal();
-        return true;
+        // false here (not the enqueue succeeding) is what feeds
+        // relay::service::push()'s dropped/delivered metrics - a consumer
+        // backlogged enough to evict its own oldest record is exactly the
+        // condition those metrics exist to surface.
+        return !backlogged;
     }
 
     // Drains the queue to the socket until the client disconnects (a write

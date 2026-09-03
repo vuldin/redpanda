@@ -76,6 +76,18 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "relay_source_env",
+    hdrs = [
+        "relay_source_env.h",
+    ],
+    visibility = ["//src/v/transform:__subpackages__"],
+    deps = [
+        "//src/v/model",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "impl",
     srcs = [
         "probe.cc",
@@ -94,10 +106,12 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":logger",
+        ":relay_source_env",
         "//src/v/config",
         "//src/v/metrics",
         "//src/v/model:batch_compression",
         "//src/v/relay:logger",
+        "//src/v/relay:probe",
         "//src/v/relay:relay",
         "//src/v/relay:subscription",
         "//src/v/rpc",
@@ -146,6 +160,7 @@ redpanda_cc_library(
         ":commit_batcher",
         ":impl",
         ":logger",
+        ":relay_source_env",
         "//src/v/bytes",
         "//src/v/cluster:errc",
         "//src/v/cluster:fwd",

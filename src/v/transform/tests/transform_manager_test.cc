@@ -51,6 +51,15 @@ public:
         return leaders;
     }
 
+    // This fake doesn't model "every partition of a topic" separately from
+    // "partitions this shard leads" - no existing test sets
+    // RELAY_TARGET_SHARD, so all_partitions() is never actually consulted
+    // for its own behavior, only needed to satisfy the interface.
+    absl::flat_hash_set<model::partition_id>
+    all_partitions(model::topic_namespace_view tp_ns) const override {
+        return get_leader_partitions(tp_ns);
+    }
+
     absl::flat_hash_set<model::transform_id>
     lookup_by_input_topic(model::topic_namespace_view tp_ns) const override {
         const auto& transforms = _states.back().transforms;
