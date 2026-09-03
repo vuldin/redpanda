@@ -62,13 +62,18 @@ public:
     ~tcp_subscription() final = default;
 
     bool deliver(const iobuf& data) final {
-        if (_queue.size() >= _max_queue_size) {
+        bool backlogged = _queue.size() >= _max_queue_size;
+        if (backlogged) {
             _queue.pop_front();
             ++_dropped;
         }
         _queue.push_back(data.copy());
         _cond.signal();
-        return true;
+        // false here (not the enqueue succeeding) is what feeds
+        // relay::service::push()'s dropped/delivered metrics - a consumer
+        // backlogged enough to evict its own oldest record is exactly the
+        // condition those metrics exist to surface.
+        return !backlogged;
     }
 
     // Drains the queue to the socket until the client disconnects (a write

@@ -307,6 +307,16 @@ local_service::consume_wasm_binary_reader(
     auto batches = co_await model::consume_reader_to_memory(
       std::move(rdr), deadline);
     if (batches.empty()) {
+        // An expired deadline also yields an empty batch list, so reporting
+        // this as invalid_request conflates "the request was malformed" with
+        // "the read ran out of time". That cost real diagnostic effort on
+        // 2026-09-02: deploying 500-1000 transforms at once produced 525
+        // "unable to load wasm binary ...: Invalid request" warnings, and
+        // nothing in the logs said timeout, so a thundering herd on the binary
+        // load looked like a malformed-request bug for hours. Distinguish them.
+        if (model::timeout_clock::now() >= deadline) {
+            co_return cluster::errc::timeout;
+        }
         co_return cluster::errc::invalid_request;
     }
     auto& batch = batches.front();

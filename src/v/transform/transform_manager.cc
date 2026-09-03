@@ -18,6 +18,7 @@
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/transform.h"
+#include "transform/relay_source_env.h"
 #include "transform_processor.h"
 #include "utils/backoff_policy.h"
 #include "utils/human.h"
@@ -80,6 +81,20 @@ private:
 static const model::ntp min_ntp = model::ntp(
   model::ns(""), model::topic(""), model::partition_id::min());
 
+// The shard this transform is pinned to via RELAY_TARGET_SHARD, or nullopt
+// if it isn't relay-sourced or doesn't set the hint. A hint-placed
+// transform is created and kept alive on that one shard regardless of
+// leadership - see handle_plugin_change(), start_processor(), and
+// processor_table::erase_by_ntp() below, all three of which need to treat
+// hint-placed entries differently from leadership-derived ones.
+std::optional<ss::shard_id>
+relay_source_hint_shard(const model::transform_metadata& meta) {
+    if (!is_relay_sourced(meta)) {
+        return std::nullopt;
+    }
+    return relay_target_shard(meta);
+}
+
 } // namespace
 
 // The underlying container for holding processors and indexing them correctly.
@@ -95,9 +110,11 @@ public:
     public:
         entry_t(
           std::unique_ptr<transform::processor> processor,
-          ss::lw_shared_ptr<transform::probe> probe)
+          ss::lw_shared_ptr<transform::probe> probe,
+          bool hint_placed)
           : _processor(std::move(processor))
-          , _probe(std::move(probe)) {
+          , _probe(std::move(probe))
+          , _hint_placed(hint_placed) {
             _probe->state_change({.to = _current_state});
         }
         entry_t(const entry_t&) = delete;
@@ -135,21 +152,34 @@ public:
         }
         state current_state() const { return _current_state; }
 
+        // Placed on this shard via RELAY_TARGET_SHARD rather than because
+        // this shard leads its ntp. Leadership-change notifications for
+        // this ntp are irrelevant to a hint-placed entry - it was never
+        // leadership-derived, so leadership churn elsewhere must not tear
+        // it down (see processor_table::erase_by_ntp), and losing/regaining
+        // leadership must not gate its restart either (see
+        // manager::start_processor).
+        bool hint_placed() const { return _hint_placed; }
+
     private:
         std::unique_ptr<transform::processor> _processor;
         ss::lw_shared_ptr<transform::probe> _probe;
         processor_backoff<ClockType> _backoff;
         state _current_state = state::inactive;
+        bool _hint_placed = false;
     };
 
     auto range() const { return std::make_pair(_table.begin(), _table.end()); }
 
-    entry_t&
-    insert(std::unique_ptr<processor> processor, ss::lw_shared_ptr<probe> p) {
+    entry_t& insert(
+      std::unique_ptr<processor> processor,
+      ss::lw_shared_ptr<probe> p,
+      bool hint_placed = false) {
         auto id = processor->id();
         auto ntp = processor->ntp();
         auto [table_it, table_inserted] = _table.emplace(
-          std::make_pair(id, ntp), entry_t(std::move(processor), std::move(p)));
+          std::make_pair(id, ntp),
+          entry_t(std::move(processor), std::move(p), hint_placed));
         vassert(table_inserted, "invalid transform processor management");
         auto [index_it, index_inserted] = _ntp_index.emplace(
           std::make_pair(ntp, id));
@@ -216,6 +246,14 @@ public:
 
     // Clear our all the transforms with a given ntp and return all the IDs that
     // no longer exist.
+    //
+    // Called on leadership loss for this ntp - but leadership-change
+    // notifications fire for any shard hosting a replica of the partition
+    // (leader or follower), on any leadership/term change anywhere in the
+    // raft group, not only "this shard specifically lost leadership it once
+    // held". A hint-placed entry (see entry_t::hint_placed) was never
+    // leadership-derived in the first place, so it must survive this - skip
+    // it rather than tearing it down on unrelated leadership churn.
     ss::future<> erase_by_ntp(model::ntp target_ntp) {
         auto it = _ntp_index.lower_bound(
           std::pair(target_ntp, model::transform_id::min()));
@@ -225,6 +263,12 @@ public:
             auto [ntp, id] = *it;
             if (ntp != target_ntp) {
                 break;
+            }
+            auto table_it = _table.find(std::make_pair(id, ntp));
+            vassert(table_it != _table.end(), "inconsistent index");
+            if (table_it->second.hint_placed()) {
+                ++it;
+                continue;
             }
             auto node = _table.extract(std::make_pair(id, ntp));
             stop_futures.push_back(node.mapped().processor()->stop());
@@ -349,8 +393,24 @@ ss::future<> manager<ClockType>::handle_plugin_change(model::transform_id id) {
         co_return;
     }
 
-    // Otherwise, start a processor for every partition we're a leader of.
-    auto partitions = _registry->get_leader_partitions(transform->input_topic);
+    // Otherwise, start a processor for every partition we're a leader of -
+    // unless this transform is pinned to a specific shard via
+    // RELAY_TARGET_SHARD, in which case leadership is irrelevant to it:
+    // only the hint shard creates anything (one processor per partition of
+    // the topic, since a hint-placed relay-sourced processor never reads
+    // its "input" partition at all - see transform::relay_source), and
+    // every other shard - including the partition's actual leader, if that
+    // differs from the hint - creates nothing, or the relay would end up
+    // with two independent subscribers for the same data.
+    auto hint_shard = relay_source_hint_shard(*transform);
+    absl::flat_hash_set<model::partition_id> partitions;
+    if (hint_shard) {
+        if (*hint_shard == ss::this_shard_id()) {
+            partitions = _registry->all_partitions(transform->input_topic);
+        }
+    } else {
+        partitions = _registry->get_leader_partitions(transform->input_topic);
+    }
     for (model::partition_id partition : partitions) {
         auto ntp = model::ntp(
           transform->input_topic.ns, transform->input_topic.tp, partition);
@@ -406,13 +466,22 @@ manager<ClockType>::start_processor(model::ntp ntp, model::transform_id id) {
     if (!transform) {
         co_return;
     }
-    auto leaders = _registry->get_leader_partitions(
-      model::topic_namespace_view(ntp));
-    // no longer a leader for this partition, if there was an entry, it
-    // *should* have a pending no_leader notification enqueued (that will
-    // cleanup the existing entry).
-    if (!leaders.contains(ntp.tp.partition)) {
-        co_return;
+    // A hint-placed entry (or a not-yet-created processor this shard is the
+    // relay hint target for) was never leadership-derived, so leadership
+    // has nothing to say about whether it should (re)start here - see
+    // entry_t::hint_placed.
+    bool hint_placed = entry ? entry->hint_placed()
+                             : relay_source_hint_shard(*transform)
+                                 == ss::this_shard_id();
+    if (!hint_placed) {
+        auto leaders = _registry->get_leader_partitions(
+          model::topic_namespace_view(ntp));
+        // no longer a leader for this partition, if there was an entry, it
+        // *should* have a pending no_leader notification enqueued (that
+        // will cleanup the existing entry).
+        if (!leaders.contains(ntp.tp.partition)) {
+            co_return;
+        }
     }
     if (entry) {
         entry->mark_start_attempt();
@@ -448,10 +517,12 @@ ss::future<> manager<ClockType>::create_processor(
               return start_processor(std::move(ntp), id);
           });
     } else {
+        bool hint_placed = relay_source_hint_shard(meta) == ss::this_shard_id();
         // Ensure that we insert this transform into our mapping before we
         // start it, so that if start fails and calls the error callback
         // we properly know that it's in flight.
-        auto& entry = _processors->insert(std::move(fut).get(), std::move(p));
+        auto& entry = _processors->insert(
+          std::move(fut).get(), std::move(p), hint_placed);
         vlog(tlog.info, "starting transform {} on {}", meta.name, ntp);
         entry.mark_start_attempt();
         co_await entry.processor()->start();
