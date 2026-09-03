@@ -346,6 +346,21 @@ admin_server::deploy_transform(std::unique_ptr<ss::http::request> req) {
         }
     }
 
+    // A relay-sourced transform (see transform::api.cc's
+    // relay_source_env_var) never registers a shared-memory region, so it
+    // has no guest-state persistence in v1 and can never satisfy
+    // require_state_recovery. Rejecting the deploy request itself here,
+    // rather than only failing (loudly, but silently to this request) at
+    // processor-creation time, gives the caller an immediate, actionable
+    // error instead of a request that reports success and then retries
+    // forever in the background.
+    if (state_options.require_state_recovery && env.contains("RELAY_SOURCE")) {
+        throw ss::httpd::bad_request_exception(
+          "relay-sourced transforms (RELAY_SOURCE set) do not support "
+          "guest-state persistence in v1; require_state_recovery cannot be "
+          "satisfied for this deploy");
+    }
+
     // Now do the deploy!
     std::error_code ec = co_await _transform_service->local().deploy_transform(
       {
