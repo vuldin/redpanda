@@ -1344,18 +1344,39 @@ ss::future<> admin_server::throw_on_error(
             throw ss::httpd::bad_request_exception(
               fmt::format("{}", ec.message()));
         case cluster::errc::transform_count_limit_exceeded: {
-            const size_t max_transforms
-              = config::shard_local_cfg()
-                  .data_transforms_per_core_memory_reservation.value()
-                / config::shard_local_cfg()
-                    .data_transforms_per_function_memory_limit.value();
+            // Mirror plugin_frontend::validate_mutation's own capacity math
+            // exactly - it is the code that produced this error, and the two
+            // drifting apart tells an operator to raise a property that will
+            // not move the limit they just hit. Three things it gets right
+            // that a straight reservation/limit division does not:
+            // max_instances_per_core takes precedence when set (so raising
+            // the reservation does nothing), the limit is scaled by core
+            // count, and the unit is input partitions across every deployed
+            // transform rather than a transform count.
+            const auto& cfg = config::shard_local_cfg();
+            const size_t max_instances_per_core
+              = cfg.data_transforms_max_instances_per_core.value();
+            const size_t instances_per_core
+              = max_instances_per_core > 0
+                  ? max_instances_per_core
+                  : cfg.data_transforms_per_core_memory_reservation.value()
+                      / cfg.data_transforms_per_function_memory_limit.value();
+            const size_t max_partitions = instances_per_core
+                                          * ss::this_smp_shard_count();
+            const auto& knob
+              = max_instances_per_core > 0
+                  ? cfg.data_transforms_max_instances_per_core.name()
+                  : cfg.data_transforms_per_core_memory_reservation.name();
             throw ss::httpd::bad_request_exception(
               ss::format(
-                "The limit of transforms has been reached ({}), more "
-                "memory must be configured via {}",
-                max_transforms,
-                config::shard_local_cfg()
-                  .data_transforms_per_core_memory_reservation.name()));
+                "The limit of transform partition-instances has been reached "
+                "({} = {} per core x {} cores; this counts input partitions "
+                "across every deployed transform, not transforms). Raise {}, "
+                "or add cores.",
+                max_partitions,
+                instances_per_core,
+                ss::this_smp_shard_count(),
+                knob));
         }
         case cluster::errc::invalid_data_migration_state:
         case cluster::errc::data_migration_already_exists:
