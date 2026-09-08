@@ -127,7 +127,22 @@ public:
     processor& operator=(const processor&) = delete;
     processor& operator=(processor&&) = delete;
     virtual ~processor() = default;
-    virtual ss::future<> start();
+    /**
+     * Bring the processor up.
+     *
+     * `bringup` is a startup clock the caller already started, for the case
+     * where work that counts towards startup happened before this processor
+     * existed - the manager starts one before creating the processor, because
+     * fetching and compiling the module happens there. Pass nullptr when
+     * there was no such work, e.g. restarting a processor that already exists,
+     * and the clock is started here instead.
+     *
+     * No default argument on purpose: a default on a virtual is resolved from
+     * the static type, so a caller working through a base reference could
+     * silently get a different one than an override intended.
+     */
+    virtual ss::future<>
+    start(std::unique_ptr<probe::hist_t::measurement> bringup);
     virtual ss::future<> stop();
 
     bool is_running() const;
@@ -182,6 +197,11 @@ private:
     std::unique_ptr<offset_tracker> _offset_tracker;
     state_callback _state_callback;
     probe* _probe;
+    // Alive from the start of start() until `running` is reported, so it spans
+    // the whole asynchronous startup chain. Cancelled rather than recorded if
+    // we are stopped first (see stop()), because a start that never finished
+    // is not a startup duration.
+    std::unique_ptr<probe::hist_t::measurement> _startup_m;
 
     static constexpr size_t buffer_chunk_size = 8;
 
