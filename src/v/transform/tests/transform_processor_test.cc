@@ -152,7 +152,7 @@ public:
           std::move(dead_letter_sink),
           std::move(state_store));
         if (param.autostart) {
-            _p->start().get();
+            _p->start(nullptr).get();
             // Wait for the initial offset to be committed so we know that the
             // processor is actually ready, otherwise it could be possible
             // that the processor picks up after the initial records are added
@@ -335,7 +335,34 @@ public:
         start();
     }
     void stop() { _p->stop().get(); }
-    void start() { _p->start().get(); }
+    void start() { _p->start(nullptr).get(); }
+    // Start while handing over an already-running bring-up clock, the way the
+    // manager does when it created the processor itself.
+    void start_with_inherited_clock() {
+        _p->start(_probe.startup_measurement()).get();
+    }
+
+    // Startup-phase sample counts, read through the public histogram because
+    // that is the form an operator actually sees.
+    uint64_t engine_start_samples() const {
+        return _probe._engine_start_latency.public_histogram_logform()
+          .sample_count;
+    }
+    uint64_t state_restore_samples() const {
+        return _probe._state_restore_latency.public_histogram_logform()
+          .sample_count;
+    }
+    uint64_t offset_load_samples() const {
+        return _probe._offset_load_latency.public_histogram_logform()
+          .sample_count;
+    }
+    uint64_t processor_create_samples() const {
+        return _probe._processor_create_latency.public_histogram_logform()
+          .sample_count;
+    }
+    uint64_t startup_samples() const {
+        return _probe._startup_latency.public_histogram_logform().sample_count;
+    }
 
     ss::future<> initiate_stop() { return _p->stop(); }
 
@@ -597,6 +624,77 @@ TEST_P(ProcessorTestFixture, MeasuresIdlePollingDelay) {
       << "idle-path delay of " << delay.count()
       << "ms looks like a regression back to fixed-interval polling";
     GTEST_LOG_(INFO) << "idle-path delay: " << delay.count() << "ms";
+}
+
+TEST_P(ProcessorTestFixture, MeasuresStartupPhases) {
+    // Startup is asynchronous: processor::start() returns as soon as it hands
+    // off the startup chain, so on return only the inline-ready prefix of that
+    // chain has run. Synchronise on the startup measurement instead, which
+    // lands when the processor reports `running` - the last link in the chain,
+    // and therefore proof that every phase before it has recorded.
+    RPTEST_REQUIRE_EVENTUALLY(10s, [this] { return startup_samples() == 1; });
+
+    EXPECT_EQ(engine_start_samples(), 1);
+    EXPECT_EQ(offset_load_samples(), 1);
+
+    // Recorded even for a transform with no state store, where restoring is a
+    // no-op: a zero-duration sample is the honest answer for a phase that took
+    // no time, and one sample per phase per start means an operator can compare
+    // counts across phases to spot one that stopped running.
+    EXPECT_EQ(state_restore_samples(), 1);
+
+    // Creating a processor - fetching the wasm binary and compiling it - is the
+    // manager's job, and this fixture builds a processor directly. If this ever
+    // becomes non-zero the create measurement has moved into a layer that
+    // cannot see the fetch or the compile it exists to time, which would make
+    // the metric silently useless rather than wrong.
+    EXPECT_EQ(processor_create_samples(), 0);
+}
+
+TEST_P(ProcessorTestFixture, MeasuresStartupPhasesOnEveryStart) {
+    // The reason these histograms exist is that startup is paid again on every
+    // input-partition leadership change, not just on first deploy. A restart
+    // must therefore add a second sample to each phase; if it only ever
+    // recorded once, the metric would describe deploys and quietly miss the
+    // cost this work is trying to measure.
+    RPTEST_REQUIRE_EVENTUALLY(10s, [this] { return startup_samples() == 1; });
+    stop();
+    start();
+    RPTEST_REQUIRE_EVENTUALLY(10s, [this] { return startup_samples() == 2; });
+
+    EXPECT_EQ(engine_start_samples(), 2);
+    EXPECT_EQ(state_restore_samples(), 2);
+    EXPECT_EQ(offset_load_samples(), 2);
+}
+
+TEST_P(ProcessorTestFixture, DoubleStartDropsAnInheritedBringupClock) {
+    // The manager starts the bring-up clock before creating the processor, so
+    // start() can be handed a clock that is already running. If the processor
+    // is already up, that start does no work and the clock must be dropped
+    // rather than left to record when the caller's pointer dies - otherwise a
+    // redundant start would be reported as a bring-up, and since the clock was
+    // started before a create it would look like an expensive one.
+    RPTEST_REQUIRE_EVENTUALLY(10s, [this] { return startup_samples() == 1; });
+    start_with_inherited_clock();
+    EXPECT_EQ(startup_samples(), 1)
+      << "a double start recorded an inherited bring-up clock";
+}
+
+TEST_P(ProcessorTestFixture, StopRecordsNoExtraStartupSample) {
+    // Stopping a running processor must not add a startup sample. This pins
+    // the ordering the cancel in stop() depends on: the measurement is already
+    // consumed by the time `running` was reported, so stop()'s cancel is a
+    // no-op here and cannot double-record.
+    //
+    // It does NOT cover the case the cancel actually exists for - a stop
+    // arriving before `running`, where the sample must be dropped rather than
+    // recording how long we took to give up. Arranging that deterministically
+    // needs a hook to stall the startup chain, which does not exist yet; until
+    // it does, that path is covered by inspection, not by this test.
+    RPTEST_REQUIRE_EVENTUALLY(10s, [this] { return startup_samples() == 1; });
+    stop();
+    EXPECT_EQ(startup_samples(), 1)
+      << "stopping a processor recorded an extra startup sample";
 }
 
 INSTANTIATE_TEST_SUITE_P(

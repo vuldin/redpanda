@@ -115,6 +115,72 @@ void probe::setup_metrics(const model::transform_metadata& meta) {
         [this] { return _e2e_latency.public_histogram_logform(); })
         .aggregate({sm::shard_label}));
 
+    metric_defs.emplace_back(
+      sm::make_histogram(
+        "startup_latency_seconds",
+        sm::description(
+          "A histogram of how long this partition's transform was dark: from "
+          "the broker beginning to bring it up - including fetching and "
+          "compiling the module when that is needed, which on a broker not "
+          "already running this transform dominates every other phase - "
+          "through to the processor running. Paid on every input-partition "
+          "leadership change, not only on deploy. Larger than the sum of the "
+          "per-phase histograms, since it also covers the scheduling gaps "
+          "between them. Bring-ups abandoned before running are not recorded"),
+        labels,
+        [this] { return _startup_latency.public_histogram_logform(); })
+        .aggregate({sm::shard_label}));
+    metric_defs.emplace_back(
+      sm::make_histogram(
+        "processor_create_latency_seconds",
+        sm::description(
+          "A histogram of the time in seconds to create a transform "
+          "processor, covering fetching the wasm binary from the cluster and "
+          "compiling it. Both are cached per broker, and the compiled module "
+          "is shared by every partition of this transform on the broker, so "
+          "expect this to be near-zero on a broker already running the "
+          "transform and to dominate startup on one that is not. Failed "
+          "attempts are recorded too, so a binary fetch that timed out shows "
+          "up here"),
+        labels,
+        [this] { return _processor_create_latency.public_histogram_logform(); })
+        .aggregate({sm::shard_label}));
+    metric_defs.emplace_back(
+      sm::make_histogram(
+        "engine_start_latency_seconds",
+        sm::description(
+          "A histogram of the time in seconds to start the wasm engine for a "
+          "processor, i.e. instantiating the already-compiled module. Engines "
+          "are cached per partition per shard, so unlike "
+          "transform_processor_create_latency_seconds this is not shared "
+          "between the partitions of one transform"),
+        labels,
+        [this] { return _engine_start_latency.public_histogram_logform(); })
+        .aggregate({sm::shard_label}));
+    metric_defs.emplace_back(
+      sm::make_histogram(
+        "state_restore_latency_seconds",
+        sm::description(
+          "A histogram of the time in seconds spent restoring a persisted "
+          "guest-state snapshot into the guest's memory on startup. Scales "
+          "with snapshot size, so for a transform holding large state this "
+          "can be the dominant part of startup"),
+        labels,
+        [this] { return _state_restore_latency.public_histogram_logform(); })
+        .aggregate({sm::shard_label}));
+    metric_defs.emplace_back(
+      sm::make_histogram(
+        "offset_load_latency_seconds",
+        sm::description(
+          "A histogram of the time in seconds spent loading the last "
+          "committed offsets before a processor begins reading. This is the "
+          "one startup phase that cannot be done before the broker leads the "
+          "partition, so it is the lower bound on how briefly a transform can "
+          "be dark across a leadership change"),
+        labels,
+        [this] { return _offset_load_latency.public_histogram_logform(); })
+        .aggregate({sm::shard_label}));
+
     auto output_topic_label = sm::label("output_topic");
     _lag.reserve(meta.output_topics.size());
     _write_bytes.reserve(meta.output_topics.size());

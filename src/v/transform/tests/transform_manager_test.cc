@@ -205,7 +205,13 @@ class processor_tracker : public processor_factory {
         tracked_processor& operator=(const tracked_processor&) = delete;
         tracked_processor& operator=(tracked_processor&&) = delete;
 
-        ss::future<> start() override {
+        ss::future<>
+        start(std::unique_ptr<probe::hist_t::measurement> bringup) override {
+            // The manager hands over a running clock; this fake does no
+            // bring-up work, so drop it rather than record a bogus sample.
+            if (bringup) {
+                bringup->cancel();
+            }
             _track_fn(lifecycle_status::active);
             co_return;
         }

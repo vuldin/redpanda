@@ -74,6 +74,62 @@ public:
      */
     void record_e2e_latency(model::timestamp source_batch_timestamp);
 
+    /**
+     * Time the phases of bringing a processor up.
+     *
+     * Startup is what a transform pays every time its input partition changes
+     * leader, not just on deploy, so together these say how long a transform
+     * is dark across a leadership move and which phase is worth attacking.
+     *
+     * They are kept separate because the phases differ in whether they *could*
+     * be done before leadership arrives: creating the processor, starting the
+     * engine and restoring guest state touch nothing outside this process,
+     * while loading committed offsets is only meaningful once this node
+     * actually leads the partition. So `offset_load` is the floor on any
+     * handover and the other three are what warming a target ahead of the move
+     * could hide.
+     */
+    /**
+     * How long this partition's transform was dark: from the broker beginning
+     * to bring it up through to the processor reporting `running`.
+     *
+     * This is the headline number for a leadership move, so the clock has to
+     * start where the expensive work does. It is therefore started by the
+     * MANAGER, before the processor is created, and handed to
+     * processor::start - fetching and compiling the module happens on the
+     * manager's side of that boundary, and on a broker not already running
+     * the transform it dominates every other phase (measured 2026-09-07:
+     * ~3.3s of create against ~1ms for everything after it). Timing from
+     * processor::start alone would report the cheap tail. Restarting a
+     * processor that already exists has no create to account for, so there the
+     * processor starts the clock itself.
+     *
+     * Also not the sum of the phase histograms below: bring-up runs as an
+     * asynchronous chain, so this covers the reactor scheduling gaps between
+     * phases too. Those are what a broker taking on many partitions at once
+     * pays, since compiling a module is serialised onto one shard, and no
+     * per-phase timing can see them.
+     *
+     * A bring-up abandoned before reaching `running` records nothing - see
+     * processor::stop and the failed-create path in manager::create_processor
+     * - so it cannot inflate this.
+     */
+    std::unique_ptr<hist_t::measurement> startup_measurement() {
+        return _startup_latency.auto_measure();
+    }
+    std::unique_ptr<hist_t::measurement> processor_create_measurement() {
+        return _processor_create_latency.auto_measure();
+    }
+    std::unique_ptr<hist_t::measurement> engine_start_measurement() {
+        return _engine_start_latency.auto_measure();
+    }
+    std::unique_ptr<hist_t::measurement> state_restore_measurement() {
+        return _state_restore_latency.auto_measure();
+    }
+    std::unique_ptr<hist_t::measurement> offset_load_measurement() {
+        return _offset_load_latency.auto_measure();
+    }
+
 private:
     friend class ProcessorTestFixture;
 
@@ -87,6 +143,11 @@ private:
       _processor_state;
     hist_t _input_delay;
     hist_t _e2e_latency;
+    hist_t _startup_latency;
+    hist_t _processor_create_latency;
+    hist_t _engine_start_latency;
+    hist_t _state_restore_latency;
+    hist_t _offset_load_latency;
 };
 
 } // namespace transform

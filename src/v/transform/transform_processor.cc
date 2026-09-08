@@ -158,22 +158,44 @@ processor::processor(
     _as.request_abort_ex(processor_shutdown_exception());
 }
 
-ss::future<> processor::start() {
+ss::future<>
+processor::start(std::unique_ptr<probe::hist_t::measurement> bringup) {
     // Don't allow double starts of this module - we use the abort_requested
     // flag to determine if the module is "running" or not.
     if (!_as.abort_requested()) {
+        // A double start brings nothing up, so an inherited clock would be
+        // timing an operation that did not happen. Drop it rather than let it
+        // record when the caller's unique_ptr dies.
+        if (bringup) {
+            bringup->cancel();
+        }
         co_return;
     }
     _as = {};
+    // Adopt the caller's clock when it started one before creating us (the
+    // module fetch and compile are on that side and dominate a cold bring-up),
+    // otherwise start one now - with no create to pay for, this phase is the
+    // whole of startup.
+    _startup_m = bringup ? std::move(bringup) : _probe->startup_measurement();
     co_await _source->start();
     co_await _offset_tracker->start();
     if (_state_store) {
         co_await _state_store->start();
     }
+    // Each startup phase is timed separately - see the comment on
+    // probe::processor_create_measurement for why the split is where it is.
+    auto engine_start_m = _probe->engine_start_measurement();
     _task = handle_processor_task(
       _engine->start()
-        .then([this] { return restore_guest_state(); })
-        .then([this] { return load_latest_committed(); })
+        .finally([m = std::move(engine_start_m)] {})
+        .then([this] {
+            auto m = _probe->state_restore_measurement();
+            return restore_guest_state().finally([m = std::move(m)] {});
+        })
+        .then([this] {
+            auto m = _probe->offset_load_measurement();
+            return load_latest_committed().finally([m = std::move(m)] {});
+        })
         .then([this](
                 absl::flat_hash_map<model::output_topic_index, kafka::offset>
                   latest_committed) {
@@ -188,6 +210,10 @@ ss::future<> processor::start() {
                 min = std::min(min, kafka::next_offset(offset));
             }
             // Mark that we're running now that the start offset is loaded.
+            // Stopping the startup clock here rather than when start() returns
+            // is the whole point: start() returns as soon as this chain is
+            // handed off, so it says nothing about when the transform is live.
+            _startup_m.reset();
             _state_callback(_id, _ntp, state::running);
             return when_all_shutdown(
               run_consumer_loop(min),
@@ -205,6 +231,14 @@ ss::future<> processor::stop() {
     auto ex = std::make_exception_ptr(processor_shutdown_exception());
     _as.request_abort_ex(ex);
     co_await std::exchange(_task, ss::now());
+    if (_startup_m) {
+        // Torn down before reaching `running`. Cancel so this abandoned start
+        // contributes no sample - recording it would report the time we spent
+        // giving up as though it were a startup, skewing the one number the
+        // handover work is sized against.
+        _startup_m->cancel();
+        _startup_m.reset();
+    }
     _consumer_transform_pipe.clear();
     for (auto& [_, output] : _outputs) {
         output.queue.clear();
