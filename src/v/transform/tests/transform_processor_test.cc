@@ -335,6 +335,10 @@ public:
         start();
     }
     void stop() { _p->stop().get(); }
+    bool drain(std::chrono::milliseconds timeout = std::chrono::seconds(10)) {
+        return _p->drain(model::timeout_clock::now() + timeout).get();
+    }
+    size_t flush_count() const { return _offset_tracker->flushes(); }
     void start() { _p->start(nullptr).get(); }
     // Start while handing over an already-running bring-up clock, the way the
     // manager does when it created the processor itself.
@@ -667,6 +671,242 @@ TEST_P(ProcessorTestFixture, MeasuresStartupPhasesOnEveryStart) {
     EXPECT_EQ(offset_load_samples(), 2);
 }
 
+TEST_P(ProcessorTestFixture, DrainCommitsWhatWasAlreadyRead) {
+    // The whole point of drain(): stop() discards anything read but not
+    // committed, so every planned leadership move reprocesses it, and those
+    // duplicates cannot be suppressed downstream because each processor start
+    // takes a fresh producer_id. A drain must instead let in-flight work
+    // finish and commit.
+    constexpr size_t num_records = 8;
+    auto batch = make_records(num_records);
+    auto last = push_batch(batch);
+
+    // Let the pipeline actually pick the records up first. drain() only
+    // promises to finish what has been READ - a drain arriving before the
+    // consumer has read anything has nothing in flight and correctly does
+    // nothing, which is covered separately below. Without this wait the test
+    // races the consumer and proves neither case.
+    EXPECT_FALSE(
+      read_records_within({}, num_records, std::chrono::seconds(30)).empty());
+
+    EXPECT_TRUE(drain()) << "drain did not quiesce";
+
+    // Everything read reached the sink, and progress for it is committed - so
+    // the next owner starts after it rather than replaying it.
+    for (auto idx : output_topics()) {
+        auto committed = committed_offsets();
+        auto it = committed.find(idx);
+        ASSERT_NE(it, committed.end());
+        EXPECT_GE(it->second, last)
+          << "output " << idx() << " committed " << it->second
+          << " but the pipeline had read up to " << last;
+    }
+    EXPECT_EQ(error_count(), 0);
+}
+
+TEST_P(ProcessorTestFixture, DrainBeforeAnythingIsReadIsANoOp) {
+    // A drain can arrive before the consumer has read anything - the
+    // leadership-transfer path drains every processor it finds, including ones
+    // that just started. Nothing is in flight, so there is nothing to finish,
+    // and this must report success immediately rather than waiting out the
+    // deadline for progress that was never going to be made.
+    auto batch = make_records(4);
+    push_batch(batch);
+    EXPECT_TRUE(drain(std::chrono::milliseconds(200)));
+}
+
+TEST_P(ProcessorTestFixture, DrainedProcessorResumesConsumingAfterRestart) {
+    // The consumer is halted by its own abort source, which start() has to
+    // reset. If it did not, a processor that had been drained would come back
+    // up unable to read anything - and since a drain runs on every planned
+    // leadership move, a transform would silently stop making progress after
+    // its first maintenance window, with no error raised anywhere. That is the
+    // worst failure this change could introduce, so it gets its own test.
+    push_batch(make_records(2));
+    EXPECT_FALSE(read_records_within({}, 2, std::chrono::seconds(30)).empty());
+    EXPECT_TRUE(drain());
+    stop();
+    start();
+
+    auto batch = make_records(3);
+    push_batch(batch);
+    EXPECT_THAT(
+      read_records_within({}, 3, std::chrono::seconds(30)), SameRecords(batch));
+    EXPECT_EQ(error_count(), 0);
+}
+
+TEST_P(ProcessorTestFixture, DrainTimesOutWhenTheOutputIsBlocked) {
+    // A corked sink lets records be read and transformed but never written, so
+    // the pipeline cannot reach a committed state. The drain has to give up at
+    // its deadline and report that, rather than holding a leadership transfer
+    // open indefinitely: the transfer proceeds and the work is reprocessed,
+    // which is the same outcome as not draining at all.
+    for (auto idx : output_topics()) {
+        cork_sink(idx);
+    }
+    push_batch(make_records(4));
+    // Wait until the records really have been READ. Without this the drain
+    // would take the nothing-in-flight path and correctly return true, and the
+    // test would be asserting the opposite of what it claims to.
+    RPTEST_REQUIRE_EVENTUALLY(
+      10s, [this] { return current_stats().read_bytes > 0; });
+
+    auto before = flush_count();
+    EXPECT_FALSE(drain(std::chrono::milliseconds(300)))
+      << "a drain that cannot complete reported success";
+    // Flushed even on timeout: progress that DID complete should not be
+    // discarded just because the rest did not.
+    EXPECT_GT(flush_count(), before);
+
+    // Uncork before teardown - stop() would otherwise be waiting on a sink
+    // write that can never resolve.
+    for (auto idx : output_topics()) {
+        uncork_sink(idx);
+    }
+}
+
+TEST_P(ProcessorTestFixture, SecondDrainDoesNotRepeatTheWait) {
+    // Leadership is relinquished through TWO hooks that both fire on the
+    // transfer path: cluster::partition's, which runs before the STM prepare
+    // phase while produces still flow, and raft's, which runs after
+    // rm_stm::prepare_transfer_leadership has taken the state lock for
+    // writing. If a drain that timed out re-waits when the second hook calls
+    // it, the entire budget lands on the produce path - which is the exact
+    // pathology moving the quiesce earlier was meant to remove.
+    //
+    // Measured locally on a 3-broker cluster before this was fixed: a 5000ms
+    // budget cost 5.17s of produce max on the transform's own input partition,
+    // while an untransformed control partition led by the same node on the
+    // same single-shard reactor stayed at 194ms. The stall began one full
+    // budget after the injection, which is the second drain, not the first.
+    for (auto idx : output_topics()) {
+        cork_sink(idx);
+    }
+    push_batch(make_records(4));
+    RPTEST_REQUIRE_EVENTUALLY(
+      10s, [this] { return current_stats().read_bytes > 0; });
+
+    constexpr auto budget = std::chrono::milliseconds(500);
+    ASSERT_FALSE(drain(budget)) << "first drain should have timed out";
+
+    // Timed, not mocked: the defect was a DURATION, not a return value. The
+    // old code returned false both times and looked perfectly correct.
+    auto flushes_before = flush_count();
+    auto started = model::timeout_clock::now();
+    EXPECT_FALSE(drain(budget));
+    auto elapsed = model::timeout_clock::now() - started;
+    EXPECT_LT(elapsed, budget / 2)
+      << "second drain waited "
+      << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+      << "ms of a " << budget.count()
+      << "ms budget - it repeated the wait instead of answering from the "
+         "first attempt";
+    EXPECT_EQ(flush_count(), flushes_before)
+      << "second drain did work; it should have short-circuited entirely";
+
+    for (auto idx : output_topics()) {
+        uncork_sink(idx);
+    }
+}
+
+TEST_P(ProcessorTestFixture, DrainVerdictDoesNotSurviveARestart) {
+    // The short-circuit above is per processor LIFETIME. A processor that is
+    // stopped and started again is a new owner with its own in-flight work, so
+    // it must get its own bounded chance to drain. If the verdict leaked
+    // across a restart, every leadership move after the first would skip the
+    // drain silently and go back to emitting duplicates - a regression that no
+    // return value would reveal, since the skipped drain reports the old
+    // success.
+    for (auto idx : output_topics()) {
+        cork_sink(idx);
+    }
+    push_batch(make_records(4));
+    RPTEST_REQUIRE_EVENTUALLY(
+      10s, [this] { return current_stats().read_bytes > 0; });
+    constexpr auto budget = std::chrono::milliseconds(500);
+    ASSERT_FALSE(drain(budget));
+
+    for (auto idx : output_topics()) {
+        uncork_sink(idx);
+    }
+    stop();
+    start();
+
+    // Cork again so this drain also has to wait: if the verdict had leaked, it
+    // would return immediately instead.
+    for (auto idx : output_topics()) {
+        cork_sink(idx);
+    }
+    // read_bytes is CUMULATIVE, so "> 0" is already true from the first phase
+    // and would let this proceed before the new batch was read - the drain
+    // would then take the nothing-was-ever-read path, return true, and the
+    // test would fail while the code was correct. Compare against a snapshot.
+    auto read_before = current_stats().read_bytes;
+    push_batch(make_records(4));
+    RPTEST_REQUIRE_EVENTUALLY(10s, [this, read_before] {
+        return current_stats().read_bytes > read_before;
+    });
+    auto started = model::timeout_clock::now();
+    EXPECT_FALSE(drain(budget));
+    auto elapsed = model::timeout_clock::now() - started;
+    EXPECT_GE(elapsed, budget / 2)
+      << "drain after a restart returned in "
+      << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+      << "ms - it inherited the previous lifetime's verdict";
+
+    for (auto idx : output_topics()) {
+        uncork_sink(idx);
+    }
+}
+
+TEST_P(ProcessorTestFixture, DrainFlushesPendingCommits) {
+    // commit_offset only queues; the batcher writes on a timer measured in
+    // seconds. A drain that relied on that timer would reintroduce the
+    // multi-second stall that fencing commits by epoch removed, so it has to
+    // ask for the pending commits directly.
+    auto before = flush_count();
+    push_batch(make_records(2));
+    EXPECT_TRUE(drain());
+    EXPECT_GT(flush_count(), before)
+      << "drain left pending commits to the batcher's timer";
+}
+
+TEST_P(ProcessorTestFixture, DrainStopsConsumingButLeavesTheProcessorAlive) {
+    // Wait for the first batch to actually flow through, so that a committed
+    // offset exists to compare against. Without this the assertion below would
+    // hold trivially - nothing read means nothing committed either side of the
+    // drain - and the test would pass without exercising the consumer stop.
+    push_batch(make_records(2));
+    EXPECT_FALSE(read_records_within({}, 2, std::chrono::seconds(30)).empty());
+    EXPECT_TRUE(drain());
+    auto committed_after_drain = committed_offsets();
+    ASSERT_FALSE(committed_after_drain.empty());
+
+    // Records arriving after a drain must not be picked up: the point is to
+    // reach a quiescent point and stay there until the caller stops us. If the
+    // consumer kept reading, the drain would never converge on a busy
+    // partition, and the offsets it just committed would already be stale.
+    push_batch(make_records(4));
+    auto committed_later = committed_offsets();
+    for (auto idx : output_topics()) {
+        EXPECT_EQ(committed_later[idx], committed_after_drain[idx])
+          << "the consumer kept reading after a drain";
+    }
+
+    // drain() deliberately does not stop the processor - stop() is still the
+    // caller's job, and must still work afterwards.
+    EXPECT_TRUE(processor_running());
+}
+
+TEST_P(ProcessorTestFixture, DrainOfAStoppedProcessorSucceeds) {
+    // Nothing is in flight, so there is nothing to wait for. This has to
+    // report success rather than time out, because the leadership-transfer
+    // path drains every processor it can find and a processor that is already
+    // down must not hold up the transfer for the full deadline.
+    stop();
+    EXPECT_TRUE(drain(std::chrono::milliseconds(200)));
+}
+
 TEST_P(ProcessorTestFixture, DoubleStartDropsAnInheritedBringupClock) {
     // The manager starts the bring-up clock before creating the processor, so
     // start() can be handed a clock that is already running. If the processor
@@ -696,6 +936,33 @@ TEST_P(ProcessorTestFixture, StopRecordsNoExtraStartupSample) {
     EXPECT_EQ(startup_samples(), 1)
       << "stopping a processor recorded an extra startup sample";
 }
+
+using ProcessorDrainCheckpointTestFixture = ProcessorTestFixture;
+
+TEST_P(ProcessorDrainCheckpointTestFixture, DrainForcesAStateCheckpoint) {
+    // Checkpoints are otherwise taken on a timer measured in seconds and
+    // decoupled from offset commits, so a recovered snapshot can sit either
+    // side of the resumed offset. The drain is the one place the two are
+    // written at the same point, so it must checkpoint even though the
+    // interval has not elapsed - otherwise it would commit offsets past state
+    // it never saved, and the next owner would resume with state missing
+    // effects it will never replay.
+    set_shared_memory_registered(true);
+    push_batch(make_records(2));
+    EXPECT_FALSE(read_records_within({}, 2, std::chrono::seconds(30)).empty());
+
+    auto before = state_store_save_count();
+    EXPECT_TRUE(drain());
+    EXPECT_GT(state_store_save_count(), before)
+      << "drain committed offsets without checkpointing state alongside them";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  DrainCheckpointTest,
+  ProcessorDrainCheckpointTestFixture,
+  ::testing::Values(
+    fixture_param{
+      .meta = testing::my_single_output_metadata, .with_state_store = true}));
 
 INSTANTIATE_TEST_SUITE_P(
   GenericProcessorTest,

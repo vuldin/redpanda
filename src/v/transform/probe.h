@@ -132,6 +132,10 @@ public:
 
 private:
     friend class ProcessorTestFixture;
+    // Reads the startup histogram to check that a create which never produced
+    // a processor records no bring-up - a manager-level concern, so it cannot
+    // be asserted from the processor fixture.
+    friend class TransformManagerTest;
 
     uint64_t _read_bytes = 0;
     std::vector<uint64_t> _write_bytes;

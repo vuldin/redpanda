@@ -177,6 +177,11 @@ processor::start(std::unique_ptr<probe::hist_t::measurement> bringup) {
     // otherwise start one now - with no create to pay for, this phase is the
     // whole of startup.
     _startup_m = bringup ? std::move(bringup) : _probe->startup_measurement();
+    _consumer_as = {};
+    _last_read_offset = kafka::offset::min();
+    // A new lifetime gets a new bounded chance to drain; the previous owner's
+    // verdict says nothing about this one's in-flight work.
+    _drain_outcome.reset();
     co_await _source->start();
     co_await _offset_tracker->start();
     if (_state_store) {
@@ -222,6 +227,96 @@ processor::start(std::unique_ptr<probe::hist_t::measurement> bringup) {
         }));
 }
 
+ss::future<bool> processor::drain(model::timeout_clock::time_point deadline) {
+    if (_as.abort_requested()) {
+        // Never started, or already stopped. Nothing is in flight, so this
+        // trivially succeeded.
+        co_return true;
+    }
+    if (_drain_outcome.has_value()) {
+        // Already had its one bounded chance. Waiting again would re-spend the
+        // entire budget, and on the transfer path the second caller is raft -
+        // which is reached after rm_stm's state lock is held for writing, so
+        // that second wait lands directly on produce latency.
+        co_return *_drain_outcome;
+    }
+    // Stop reading. The transform and producer stages stay on `_as` and keep
+    // running, so whatever is already queued flows through to a commit.
+    if (!_consumer_as.abort_requested()) {
+        _consumer_as.request_abort_ex(
+          std::make_exception_ptr(processor_shutdown_exception()));
+    }
+    if (_last_read_offset == kafka::offset::min()) {
+        // Nothing was ever read, so there is nothing to wait for. Still flush,
+        // because a previous owner's progress may be sitting in the batcher.
+        _drain_outcome = true;
+        co_await _offset_tracker->flush();
+        co_return true;
+    }
+
+    // Wait for every output to catch up to what was read. Polling rather than
+    // waiting on a condition: the offset_tracker interface exposes committed
+    // offsets but not a wait, and adding one would put a drain-only concern
+    // into the interface every tracker has to implement.
+    constexpr auto poll = std::chrono::milliseconds(5);
+    bool drained = false;
+    while (model::timeout_clock::now() < deadline) {
+        auto committed = co_await _offset_tracker->load_committed_offsets();
+        bool all_caught_up = !committed.empty();
+        for (const auto& [_, output] : _outputs) {
+            auto it = committed.find(output.index);
+            if (it == committed.end() || it->second < _last_read_offset) {
+                all_caught_up = false;
+                break;
+            }
+        }
+        if (all_caught_up) {
+            drained = true;
+            break;
+        }
+        co_await ss::sleep_abortable<ss::lowres_clock>(poll, _as)
+          .handle_exception([](const std::exception_ptr&) {});
+        if (_as.abort_requested()) {
+            break;
+        }
+    }
+
+    // Recorded before the flush, not after: this is what a second drain will
+    // answer with, and a second drain must not be able to observe "not yet
+    // attempted" just because the flush is still in flight.
+    _drain_outcome = drained;
+
+    // Make the progress durable now rather than on the batcher's timer. Worth
+    // doing even when the wait timed out: whatever did complete should not be
+    // reprocessed just because the rest did not.
+    co_await _offset_tracker->flush();
+
+    // Checkpoint the guest's state at the same point its offsets were
+    // committed. This is the one place the two are written together - the
+    // periodic checkpoint runs on its own timer, decoupled from commits, so
+    // outside a drain a restored snapshot can be skewed against the resumed
+    // offset in either direction.
+    if (_state_store && drained) {
+        co_await maybe_checkpoint_state(/*force=*/true)
+          .handle_exception([this](const std::exception_ptr& e) {
+              // A failed checkpoint is not a failed drain: offsets are already
+              // committed, so the next owner replays from the right place with
+              // older state, which is the same position it would be in with no
+              // drain at all.
+              vlog(_logger.warn, "drain could not checkpoint state: {}", e);
+          });
+    }
+
+    if (!drained) {
+        vlog(
+          _logger.warn,
+          "drain did not quiesce before its deadline - work read up to offset "
+          "{} was not all committed and will be reprocessed by the next owner",
+          _last_read_offset);
+    }
+    co_return drained;
+}
+
 ss::future<> processor::stop() {
     // We reset the abort source when being started, so protect against double
     // stops by checking if we've already requested being stopped.
@@ -229,6 +324,12 @@ ss::future<> processor::stop() {
         co_return;
     }
     auto ex = std::make_exception_ptr(processor_shutdown_exception());
+    // Consumer stage first. A drain may already have aborted it; abort_source
+    // ignores a second request, so this is safe either way, and it must
+    // happen or the consumer would outlive an ordinary stop.
+    if (!_consumer_as.abort_requested()) {
+        _consumer_as.request_abort_ex(ex);
+    }
     _as.request_abort_ex(ex);
     co_await std::exchange(_task, ss::now());
     if (_startup_m) {
@@ -307,7 +408,7 @@ ss::future<> processor::restore_guest_state() {
     }
 }
 
-ss::future<> processor::maybe_checkpoint_state() {
+ss::future<> processor::maybe_checkpoint_state(bool force) {
     if (!_state_store) {
         co_return;
     }
@@ -319,7 +420,7 @@ ss::future<> processor::maybe_checkpoint_state() {
     // otherwise wrap around to a value that looks smaller than
     // checkpoint_interval, silently skipping that first checkpoint.
     if (
-      _last_checkpoint_at != ss::lowres_clock::time_point::min()
+      !force && _last_checkpoint_at != ss::lowres_clock::time_point::min()
       && now - _last_checkpoint_at < checkpoint_interval) {
         co_return;
     }
@@ -422,10 +523,11 @@ ss::future<> processor::run_consumer_loop(kafka::offset offset) {
         co_await output.queue.push(
           {progress_marker{.offset = kafka::prev_offset(offset)}}, &_as);
     }
-    while (!_as.abort_requested()) {
-        auto reader = co_await _source->read_batch(offset, &_as);
+    while (!_as.abort_requested() && !_consumer_as.abort_requested()) {
+        auto reader = co_await _source->read_batch(offset, &_consumer_as);
         auto last_offset = co_await std::move(reader).consume(
-          queue_output_consumer(&_consumer_transform_pipe, &_as, _probe),
+          queue_output_consumer(
+            &_consumer_transform_pipe, &_consumer_as, _probe),
           model::no_timeout);
         if (!last_offset) {
             vlog(
@@ -445,6 +547,10 @@ ss::future<> processor::run_consumer_loop(kafka::offset offset) {
             continue;
         }
         offset = kafka::next_offset(*last_offset);
+        // How far the pipeline has been fed. drain() waits for every output to
+        // commit at least this far, which is what "everything already read has
+        // been finished" means.
+        _last_read_offset = *last_offset;
         vlog(_logger.trace, "consumed up to offset {}", offset);
 
         // Optional read linger. `wait_for_offset` above only runs on an EMPTY

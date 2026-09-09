@@ -174,6 +174,42 @@ public:
       transfer_leadership(raft::transfer_leadership_request);
 
     /**
+     * Called at the START of transfer_leadership, before the archiver and STM
+     * prepare phases, to let a layer above finish work bound to leadership.
+     *
+     * Why here and not raft's own pre-relinquish hook: the STM prepare phase
+     * takes rm_stm's state lock for WRITING (prepare_transfer_leadership ->
+     * hold_write_lock), and the produce path takes it for reading. Anything
+     * run after that point stalls every incoming produce for its whole
+     * duration. Measured 2026-09-09: a transform drain invoked from inside
+     * raft cost 2.79s of produce p99 for exactly that reason, against 61ms
+     * with no drain at all. Run before the lock and writes keep flowing while
+     * the quiesce happens.
+     *
+     * raft's hook still exists and still fires - it is the only way to cover
+     * being removed from the voter set (decommission), which never reaches
+     * this function. A transform drain is close to idempotent, so on the
+     * transfer path this hook does the work and raft's is a cheap no-op.
+     *
+     * Best-effort: bounded by its owner, and an exception is logged and
+     * swallowed. Tidying up must never block a leadership transfer.
+     */
+    using pre_transfer_quiesce_cb_t = ss::noncopyable_function<ss::future<>()>;
+    void set_pre_transfer_quiesce_hook(pre_transfer_quiesce_cb_t cb) {
+        _pre_transfer_quiesce = std::move(cb);
+    }
+
+private:
+    // Phase one of transfer_leadership: runs while writes still flow.
+    ss::future<> run_pre_transfer_quiesce();
+    // Phase two: from here on rm_stm's state lock is held for writing, so
+    // every produce blocks until the transfer completes. Anything added here
+    // is on that critical path; anything that must not be is phase one.
+    ss::future<std::error_code>
+      do_transfer_leadership_blocking_writes(raft::transfer_leadership_request);
+
+public:
+    /**
      * Returns the maximum offset that may not be delivered to the newly joining
      * learners as claimed by the state machines implemented on top of this
      * partition.
@@ -426,6 +462,7 @@ private:
     ss::future<> restart_archiver(bool should_notify_topic_config);
 
     consensus_ptr _raft; // never null
+    pre_transfer_quiesce_cb_t _pre_transfer_quiesce;
     ss::shared_ptr<cluster::log_eviction_stm> _log_eviction_stm;
     ss::shared_ptr<cluster::rm_stm> _rm_stm;
     ss::shared_ptr<archival_metadata_stm> _archival_meta_stm;

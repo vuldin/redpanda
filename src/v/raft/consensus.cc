@@ -3619,8 +3619,43 @@ ss::future<std::error_code> consensus::prepare_transfer_leadership(
     co_return make_error_code(errc::success);
 }
 
+ss::future<> consensus::run_relinquish_quiesce(std::string_view ctx) {
+    if (!_relinquish_quiesce) {
+        co_return;
+    }
+    vlog(_ctxlog.debug, "[{}] running pre-relinquish quiesce", ctx);
+    // futurize_invoke, not a direct call: a hook that throws SYNCHRONOUSLY
+    // (say a precondition check before its first suspension) would throw
+    // before handle_exception could be attached, and the exception would
+    // escape into the middle of relinquishing leadership. This turns that
+    // into a failed future the handler below can absorb.
+    co_await ss::futurize_invoke(_relinquish_quiesce)
+      .handle_exception([this, ctx](const std::exception_ptr& e) {
+          // Swallowed on purpose. Whatever the layer above was tidying up, it
+          // does not get to prevent this node from giving up leadership - the
+          // alternative is a maintenance drain or a decommission wedged on a
+          // subsystem that failed to quiesce.
+          vlog(
+            _ctxlog.warn,
+            "[{}] pre-relinquish quiesce failed, relinquishing anyway: {}",
+            ctx,
+            e);
+      });
+}
+
 ss::future<std::error_code>
 consensus::do_transfer_leadership(transfer_leadership_request req) {
+    // Quiesce only if there is leadership to give up. The impl refuses a
+    // non-leader anyway, and draining for a transfer that is about to be
+    // refused would stop a healthy processor for nothing.
+    if (is_elected_leader()) {
+        co_await run_relinquish_quiesce("transfer_leadership");
+    }
+    co_return co_await do_transfer_leadership_impl(std::move(req));
+}
+
+ss::future<std::error_code>
+consensus::do_transfer_leadership_impl(transfer_leadership_request req) {
     auto target = req.target;
     transfer_leadership_options opts{
       .recovery_timeout = req.timeout.value_or(
@@ -3833,6 +3868,11 @@ consensus::do_transfer_leadership(transfer_leadership_request req) {
 }
 
 ss::future<> consensus::transfer_and_stepdown(std::string_view ctx) {
+    // Decommission reaches leadership relinquishment here rather than through
+    // do_transfer_leadership, so the quiesce has to be run on this path too -
+    // hooking only the other one would cover maintenance and the balancer but
+    // silently miss being removed from the voter set.
+    co_await run_relinquish_quiesce(ctx);
     // select a follower with longest log
     auto voters = _fstates
                   | std::views::filter(

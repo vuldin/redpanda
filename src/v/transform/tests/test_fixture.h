@@ -240,12 +240,22 @@ public:
     ss::future<>
       commit_offset(model::output_topic_index, kafka::offset) override;
 
+    // Nothing is held back here - commit_offset is already durable for this
+    // fake - so this only records that a flush was asked for, which is what
+    // the drain tests assert on.
+    ss::future<> flush() override {
+        ++_flushes;
+        return ss::now();
+    }
+    size_t flushes() const { return _flushes; }
+
     ss::future<>
       wait_for_committed_offset(model::output_topic_index, kafka::offset);
 
 private:
     absl::flat_hash_map<model::output_topic_index, kafka::offset> _committed;
     ss::condition_variable _cond_var;
+    size_t _flushes = 0;
 };
 
 } // namespace transform::testing

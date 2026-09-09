@@ -121,3 +121,86 @@ TEST_F(
     leader_id = wait_for_leader(10s).get();
     ASSERT_TRUE(assert_leadership_stable(leader_id));
 }
+
+// --- pre-relinquish quiesce hook -----------------------------------------
+//
+// The hook exists so a layer above raft (the transform subsystem) can finish
+// work bound to being leader before leadership goes away. What matters is that
+// it runs on BOTH paths by which leadership is deliberately relinquished, and
+// that it can never prevent the relinquishment.
+
+TEST_F(leadership_test_fixture, quiesce_hook_runs_before_a_transfer) {
+    create_simple_group(3).get();
+    auto leader_id = wait_for_leader(10s).get();
+
+    bool ran = false;
+    node(leader_id).raft()->set_relinquish_quiesce_hook([&ran] {
+        ran = true;
+        return ss::now();
+    });
+
+    node(leader_id)
+      .raft()
+      ->transfer_leadership(
+        transfer_leadership_request{.group = node(leader_id).raft()->group()})
+      .get();
+
+    EXPECT_TRUE(ran) << "leadership was transferred without quiescing first";
+}
+
+TEST_F(leadership_test_fixture, a_throwing_quiesce_hook_still_relinquishes) {
+    // The layer above does not get a veto. If it could block a transfer by
+    // failing, a maintenance drain or a decommission would wedge on a
+    // subsystem that could not tidy up - strictly worse than not waiting.
+    create_simple_group(3).get();
+    auto leader_id = wait_for_leader(10s).get();
+
+    bool ran = false;
+    node(leader_id).raft()->set_relinquish_quiesce_hook(
+      [&ran]() -> ss::future<> {
+          ran = true;
+          throw std::runtime_error("quiesce failed");
+      });
+
+    node(leader_id)
+      .raft()
+      ->transfer_leadership(
+        transfer_leadership_request{.group = node(leader_id).raft()->group()})
+      .get();
+
+    EXPECT_TRUE(ran);
+    // The transfer went ahead regardless: someone else leads now.
+    RPTEST_REQUIRE_EVENTUALLY(
+      10s, [this, leader_id] { return !node(leader_id).raft()->is_leader(); });
+}
+
+TEST_F(leadership_test_fixture, quiesce_hook_runs_when_removed_from_voters) {
+    // This is the decommission shape, and the reason the hook lives in
+    // consensus rather than one layer up: being removed from the voter set
+    // relinquishes leadership through transfer_and_stepdown, which does NOT
+    // go through do_transfer_leadership. A hook placed only on the transfer
+    // path would cover maintenance and the leader balancer while silently
+    // missing decommission - exactly the gap the archiver and STM prepare
+    // phases already have.
+    create_simple_group(3).get();
+    auto leader_id = wait_for_leader(10s).get();
+
+    bool ran = false;
+    node(leader_id).raft()->set_relinquish_quiesce_hook([&ran] {
+        ran = true;
+        return ss::now();
+    });
+
+    std::vector<vnode> remaining;
+    for (auto& [id, n] : nodes()) {
+        if (id != leader_id) {
+            remaining.push_back(n->get_vnode());
+        }
+    }
+    node(leader_id)
+      .raft()
+      ->replace_configuration(remaining, model::revision_id(0))
+      .get();
+
+    RPTEST_REQUIRE_EVENTUALLY(10s, [&ran] { return ran; });
+}

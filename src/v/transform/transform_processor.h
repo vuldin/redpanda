@@ -145,6 +145,39 @@ public:
     start(std::unique_ptr<probe::hist_t::measurement> bringup);
     virtual ss::future<> stop();
 
+    /**
+     * Quiesce this processor before it loses its partition, so that work
+     * already read is finished rather than discarded.
+     *
+     * stop() aborts everything and clears the pipeline, so anything read but
+     * not yet committed is dropped and reprocessed by the next owner. That is
+     * correct but it makes every planned leadership move emit duplicates, and
+     * duplicates are not suppressible across owners because a processor takes
+     * a fresh producer_id on every start. drain() instead stops only the
+     * consumer, lets what is already in flight finish and commit, flushes the
+     * commit batcher, and takes a final state checkpoint so the guest's state
+     * and its committed offset agree at one point.
+     *
+     * Bounded by `deadline` and best-effort: returns false if the pipeline
+     * did not quiesce in time, having left the processor in a state where a
+     * normal stop() is still the correct next call. A caller that cannot wait
+     * should stop() without draining rather than skip the stop.
+     *
+     * SINGLE-SHOT per processor lifetime. The second and later calls return
+     * the first call's outcome without waiting again, because leadership is
+     * relinquished through two hooks that both fire on the transfer path -
+     * cluster::partition's, before the STM prepare phase, and raft's, after -
+     * and only the first runs while produces still flow. Re-waiting in the
+     * second call puts the whole budget back on the produce path: measured
+     * locally, a 5000ms budget cost 5.17s of produce max on the transform's
+     * own input partition while an untransformed control partition on the
+     * same reactor stayed at 194ms. One bounded chance is the semantic; a
+     * second identical wait can only add cost.
+     *
+     * This does NOT stop the processor - stop() must still be called.
+     */
+    virtual ss::future<bool> drain(model::timeout_clock::time_point deadline);
+
     bool is_running() const;
     model::transform_id id() const;
     const model::ntp& ntp() const;
@@ -183,7 +216,10 @@ private:
     // rather than every batch: this is a coarse, occasional durability
     // improvement, not something that should add a raft round trip to
     // this transform's hot path.
-    ss::future<> maybe_checkpoint_state();
+    // `force` skips the interval check, for a drain that needs the guest's
+    // state written at the same point its offsets were committed rather than
+    // whenever the periodic timer next comes round.
+    ss::future<> maybe_checkpoint_state(bool force = false);
 
     template<typename... Future>
     ss::future<> when_all_shutdown(Future&&...);
@@ -197,6 +233,18 @@ private:
     std::unique_ptr<offset_tracker> _offset_tracker;
     state_callback _state_callback;
     probe* _probe;
+    // Aborts the consumer stage ALONE, so a drain can stop reading new
+    // records while the transform and producer stages keep running to finish
+    // what is already in flight. stop() aborts this too - it must, or the
+    // consumer would outlive an ordinary stop.
+    ss::abort_source _consumer_as;
+    // Highest input offset handed to the pipeline. A drain is complete when
+    // every output has committed at least this far.
+    kafka::offset _last_read_offset = kafka::offset::min();
+    // Set by the first drain() of this processor's lifetime, cleared by
+    // start(). Holds that call's result so a second drain can answer without
+    // repeating the wait - see drain()'s comment on why that matters.
+    std::optional<bool> _drain_outcome;
     // Alive from the start of start() until `running` is reported, so it spans
     // the whole asynchronous startup chain. Cancelled rather than recorded if
     // we are stopped first (see stop()), because a start that never finished
