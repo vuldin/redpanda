@@ -36,6 +36,10 @@ public:
     relay_offset_tracker() = default;
 
     ss::future<> start() final { return ss::now(); }
+    // Relay-sourced transforms track no durable offsets at all - there is no
+    // input partition being consumed, so there is nothing held back and
+    // nothing to make durable.
+    ss::future<> flush() final { return ss::now(); }
     ss::future<> stop() final { return ss::now(); }
 
     // No durable commits to load - always empty, so the consumer starts from

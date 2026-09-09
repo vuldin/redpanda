@@ -134,6 +134,8 @@ struct configuration final : public config_store {
     // Data Transforms
     property<bool> data_transforms_enabled;
     property<std::chrono::milliseconds> data_transforms_commit_interval_ms;
+    property<std::optional<std::chrono::milliseconds>>
+      data_transforms_graceful_transfer_timeout_ms;
     bounded_property<size_t> data_transforms_per_core_memory_reservation;
     bounded_property<size_t> data_transforms_per_function_memory_limit;
     bounded_property<size_t> data_transforms_max_instances_per_core;

@@ -96,6 +96,7 @@ redpanda_cc_gtest(
     deps = [
         ":test_fixture",
         "//src/v/base",
+        "//src/v/config",
         "//src/v/model",
         "//src/v/ssx:semaphore",
         "//src/v/test_utils:gtest",

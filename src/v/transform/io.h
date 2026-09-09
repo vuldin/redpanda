@@ -137,6 +137,20 @@ public:
      */
     virtual ss::future<>
       commit_offset(model::output_topic_index, kafka::offset) = 0;
+
+    /**
+     * Make any commits still held back by batching durable now.
+     *
+     * commit_offset only queues; the batcher decides when to write, on a
+     * timer measured in seconds. A graceful drain cannot wait for that timer
+     * without reintroducing exactly the multi-second stall that fencing
+     * commits by epoch removed, so it asks for the pending commits directly.
+     *
+     * Not required to be fast, and not required to succeed: a drain that
+     * cannot flush proceeds anyway and the work is simply reprocessed by the
+     * next owner, which is the same at-least-once outcome as no drain at all.
+     */
+    virtual ss::future<> flush() = 0;
 };
 
 /**

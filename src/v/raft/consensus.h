@@ -97,6 +97,30 @@ public:
     };
     enum class vote_state { follower, candidate, leader };
     using leader_cb_t = ss::noncopyable_function<void(leadership_status)>;
+    /**
+     * Called before this node deliberately gives up leadership of the group,
+     * to let a layer above quiesce work that is bound to being leader.
+     *
+     * Raft cannot call such a layer directly - nothing above raft is visible
+     * from here - so this is dependency inversion: whoever owns that work sets
+     * a callback and raft invokes it without knowing what it does.
+     *
+     * Invoked from BOTH paths by which leadership is deliberately relinquished
+     * - do_transfer_leadership (maintenance drains, the leader balancer, an
+     * explicit admin transfer) and transfer_and_stepdown (being removed from
+     * the voter set, i.e. decommission). Those are separate code paths that do
+     * not share an entry point, which is why the hook lives here rather than
+     * in cluster::partition: a hook one level up would silently miss
+     * decommission, as the archiver and STM prepare phases already do.
+     *
+     * NOT called when leadership is lost involuntarily - a crash, a partition,
+     * or an election timeout give no opportunity to run anything first.
+     *
+     * Best-effort: the callback is expected to bound itself, and an exception
+     * from it is logged and swallowed. Relinquishing leadership must not be
+     * blocked by a layer above failing to tidy up.
+     */
+    using relinquish_quiesce_cb_t = ss::noncopyable_function<ss::future<>()>;
 
     consensus(
       model::node_id,
@@ -441,12 +465,31 @@ public:
      * Attempt to transfer leadership to another node in this raft group. If no
      * node is specified, the most up-to-date node will be selected.
      */
+    /**
+     * Set the callback run before this node deliberately relinquishes
+     * leadership - see relinquish_quiesce_cb_t. Pass {} to clear it.
+     *
+     * There is one slot, not a list: the only user is the transform subsystem
+     * quiescing its processors, and a second caller silently replacing the
+     * first would be worse than needing to notice the conflict here.
+     */
+    void set_relinquish_quiesce_hook(relinquish_quiesce_cb_t cb) {
+        _relinquish_quiesce = std::move(cb);
+    }
+
     ss::future<transfer_leadership_reply>
       transfer_leadership(transfer_leadership_request);
     ss::future<std::error_code>
       prepare_transfer_leadership(vnode, transfer_leadership_options);
     ss::future<std::error_code>
       do_transfer_leadership(transfer_leadership_request);
+    // The transfer itself. Split out so do_transfer_leadership can await the
+    // pre-relinquish quiesce first; this body returns ready futures directly
+    // rather than being a coroutine, so it cannot await anything itself.
+    ss::future<std::error_code>
+      do_transfer_leadership_impl(transfer_leadership_request);
+    // Runs _relinquish_quiesce, if set, swallowing anything it throws.
+    ss::future<> run_relinquish_quiesce(std::string_view ctx);
 
     ss::future<> remove_persistent_state();
 
@@ -871,6 +914,7 @@ private:
     config::binding<bool> _enable_longest_log_detection;
     consensus_client_protocol _client_protocol;
     leader_cb_t _leader_notification;
+    relinquish_quiesce_cb_t _relinquish_quiesce;
 
     // consensus state
     model::offset _commit_index;

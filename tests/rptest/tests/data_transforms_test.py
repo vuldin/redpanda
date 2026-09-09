@@ -803,10 +803,28 @@ class DataTransformsLeadershipChangingTest(BaseDataTransformsTest):
         )
 
     @cluster(num_nodes=4)
-    def test_leadership_changing_randomly(self):
+    @matrix(graceful_drain_ms=[None, 200])
+    def test_leadership_changing_randomly(self, graceful_drain_ms: Optional[int]):
         """
         Test that transforms can still make progress without dropping records in the face of leadership transfers.
+
+        Runs with data_transforms_graceful_transfer_timeout_ms unset and set.
+        When set, a transform stops reading and commits what it has already
+        read before leadership moves, instead of discarding it for the next
+        owner to reprocess. That is a different shutdown path through the
+        processor, and it only executes when the property is set, so without
+        this parametrization it gets no ducktape coverage at all.
+
+        What this asserts is that the drain path does not LOSE or corrupt
+        records. It deliberately does not assert that duplicates fall, because
+        TransformVerifierConsumeStatus does not count them - that claim is
+        covered by the processor unit tests and by measurement in the
+        redpanda-wasm-bench resilience series.
         """
+        if graceful_drain_ms is not None:
+            self._modify_cluster_config(
+                {"data_transforms_graceful_transfer_timeout_ms": graceful_drain_ms}
+            )
         self._deploy_wasm(
             "identity-xform", input_topic=self.topics[0], output_topic=self.topics[-1]
         )

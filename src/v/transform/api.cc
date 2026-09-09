@@ -555,6 +555,8 @@ public:
         return _batcher->commit_offset(key, {.offset = offset, .epoch = epoch});
     }
 
+    ss::future<> flush() override { return _batcher->flush(); }
+
 private:
     model::transform_id _id;
     model::partition_id _partition;
@@ -865,7 +867,52 @@ ss::future<> service::start() {
         &_id_allocator_frontend->local(),
         _relay ? &_relay->local() : nullptr),
       _sg,
-      std::move(mem_limits));
+      std::move(mem_limits),
+      // Installs the manager's quiesce hook on a partition, on both the
+      // paths that can take leadership away from it. This lives here rather
+      // than in the manager because it is the only layer that already names
+      // cluster and raft types; the manager decides when a hook should exist
+      // and what it does.
+      [this](
+        const model::ntp& ntp,
+        manager<ss::lowres_clock>::quiesce_hook_fn hook) {
+          auto partition = _partition_manager->local().get(ntp);
+          if (!partition) {
+              // Gone from this shard already - there is nothing to install on,
+              // and nothing to drain either.
+              return;
+          }
+          auto raft = partition->raft();
+          if (!raft) {
+              return;
+          }
+          // Installed in TWO places, at different points, on purpose.
+          //
+          // cluster::partition's hook runs at the start of
+          // transfer_leadership, BEFORE the prepare phases take rm_stm's state
+          // lock for writing - so the drain happens while produces still flow.
+          // Putting it only in raft cost 2.79s of produce p99, because raft is
+          // reached after that lock is held.
+          //
+          // raft's hook runs on both relinquish paths, and is the only one
+          // that covers being removed from the voter set (decommission), which
+          // never goes through cluster::partition. On the transfer path it
+          // fires second and finds the work already done, which is cheap
+          // because a drain of an already-drained processor stops nothing and
+          // waits for commits that have already landed.
+          if (!hook) {
+              partition->set_pre_transfer_quiesce_hook({});
+              raft->set_relinquish_quiesce_hook({});
+              return;
+          }
+          auto ntp_copy = ntp;
+          partition->set_pre_transfer_quiesce_hook(
+            // _manager is assigned by the statement this lambda is an
+            // argument to, so it is only safe to dereference when CALLED -
+            // which is always later, on a leadership transfer.
+            [this, ntp_copy] { return _manager->drain_ntp(ntp_copy); });
+          raft->set_relinquish_quiesce_hook(std::move(hook));
+      });
 
     co_await _log_manager->start();
     co_await _batcher->start();

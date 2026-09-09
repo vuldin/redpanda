@@ -190,6 +190,22 @@ configuration::configuration()
       "The commit interval at which data transforms progress.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       3s)
+  , data_transforms_graceful_transfer_timeout_ms(
+      *this,
+      "data_transforms_graceful_transfer_timeout_ms",
+      "Time limit on letting a transform finish work it has already read "
+      "before its input partition changes leader. Within this budget the "
+      "transform stops reading, finishes and commits what is in flight, and "
+      "checkpoints its state alongside that commit, so the next owner resumes "
+      "after it instead of reprocessing it. If null (the default), leadership "
+      "moves immediately and in-flight work is discarded and reprocessed by "
+      "the next owner - the behaviour before this setting existed. Exceeding "
+      "the limit is not an error: the transfer proceeds and the remaining work "
+      "is reprocessed, which is the same outcome as not waiting at all. "
+      "Reprocessing is visible downstream as duplicate output, because a "
+      "transform takes a new producer id whenever it starts.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      std::nullopt)
   , data_transforms_per_core_memory_reservation(
       *this,
       "data_transforms_per_core_memory_reservation",

@@ -2,6 +2,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_split.h"
+#include "config/configuration.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -219,12 +220,29 @@ class processor_tracker : public processor_factory {
             _track_fn(lifecycle_status::inactive);
             co_return;
         }
+        // Recorded rather than delegated. This fake never runs the base
+        // start(), so its abort source is still in the pre-start state and the
+        // real drain() would early-return true - which is indistinguishable
+        // from never having been called, and would make the wiring tests below
+        // pass whether or not the hook reaches a processor.
+        ss::future<bool>
+        drain(model::timeout_clock::time_point deadline) override {
+            ++_drains;
+            _last_deadline = deadline;
+            co_return true;
+        }
+        size_t drains() const { return _drains; }
+        std::optional<model::timeout_clock::time_point> last_deadline() const {
+            return _last_deadline;
+        }
         ~tracked_processor() override {
             _track_fn(lifecycle_status::destroyed);
         }
 
     private:
         std::function<void(lifecycle_status)> _track_fn;
+        size_t _drains = 0;
+        std::optional<model::timeout_clock::time_point> _last_deadline;
     };
 
 public:
@@ -237,7 +255,11 @@ public:
       probe* probe,
       memory_limits* ml) override {
         EXPECT_NE(probe, nullptr);
-        co_return std::make_unique<tracked_processor>(
+        _last_probe = probe;
+        if (_fail_creates) {
+            throw std::runtime_error("injected create failure");
+        }
+        auto p = std::make_unique<tracked_processor>(
           [this, id, ntp](lifecycle_status change) {
               handle_lifecycle_change(id, ntp, change);
           },
@@ -246,6 +268,31 @@ public:
           meta,
           probe,
           ml);
+        // Kept so drains can be counted after the manager takes ownership.
+        // Erased when the processor reports `destroyed`, so this never
+        // outlives the object it points at.
+        _live.insert_or_assign(std::make_pair(id, ntp), p.get());
+        co_return std::move(p);
+    }
+
+    // Total drains across every processor currently live for this ntp.
+    size_t drains_for(const model::ntp& ntp) const {
+        size_t n = 0;
+        for (const auto& [key, proc] : _live) {
+            if (key.second == ntp) {
+                n += proc->drains();
+            }
+        }
+        return n;
+    }
+    std::optional<model::timeout_clock::time_point>
+    last_drain_deadline(const model::ntp& ntp) const {
+        for (const auto& [key, proc] : _live) {
+            if (key.second == ntp && proc->last_deadline().has_value()) {
+                return proc->last_deadline();
+            }
+        }
+        return std::nullopt;
     }
 
     absl::flat_hash_map<
@@ -255,9 +302,20 @@ public:
         return _status;
     }
 
+    // Make every subsequent create throw, standing in for the real failure
+    // this models: get_factory could not fetch the wasm binary (that RPC has a
+    // 3s timeout) or could not compile it, so no processor exists.
+    void fail_creates(bool fail) { _fail_creates = fail; }
+    // The probe the manager handed to the most recent create attempt,
+    // including a failed one.
+    transform::probe* last_probe() const { return _last_probe; }
+
 private:
     void handle_lifecycle_change(
       model::transform_id id, model::ntp ntp, lifecycle_status change) {
+        if (change == lifecycle_status::destroyed) {
+            _live.erase(std::make_pair(id, ntp));
+        }
         _status.insert_or_assign(std::make_pair(id, std::move(ntp)), change);
     }
 
@@ -265,6 +323,12 @@ private:
       std::pair<model::transform_id, model::ntp>,
       lifecycle_status>
       _status;
+    bool _fail_creates = false;
+    transform::probe* _last_probe = nullptr;
+    absl::flat_hash_map<
+      std::pair<model::transform_id, model::ntp>,
+      tracked_processor*>
+      _live;
 };
 
 using status_map = absl::flat_hash_map<std::string, lifecycle_status>;
@@ -303,11 +367,26 @@ public:
           std::move(r),
           std::move(t),
           ss::current_scheduling_group(),
-          std::make_unique<memory_limits>(memory_limits::config{
-            .read = memory_limit, .write = memory_limit}));
+          std::make_unique<memory_limits>(
+            memory_limits::config{.read = memory_limit, .write = memory_limit}),
+          // Stands in for raft: records the hook the manager wants installed
+          // for each ntp so a test can inspect it and invoke it, without
+          // needing a real raft group.
+          [this](
+            const model::ntp& ntp,
+            manager<ss::manual_clock>::quiesce_hook_fn hook) {
+              if (hook) {
+                  _hooks.insert_or_assign(ntp, std::move(hook));
+              } else {
+                  _hooks.erase(ntp);
+              }
+          });
         _manager->start().get();
     }
     void TearDown() override {
+        ::config::shard_local_cfg()
+          .data_transforms_graceful_transfer_timeout_ms.reset();
+        _hooks.clear();
         _manager->stop().get();
         _registry = nullptr;
         _tracker = nullptr;
@@ -351,6 +430,50 @@ public:
         _manager->on_transform_state_change(
           entry->first, ntp, processor::state::errored);
     }
+    // These three exist on the fixture rather than in the test body because
+    // friendship is not inherited: probe befriends TransformManagerTest, but a
+    // TEST_F body is a class derived from it and cannot reach probe's privates.
+    void fail_creates(bool fail) { _tracker->fail_creates(fail); }
+    uint64_t last_create_startup_samples() const {
+        auto* pr = _tracker->last_probe();
+        return pr == nullptr
+                 ? 0
+                 : pr->_startup_latency.public_histogram_logform().sample_count;
+    }
+    uint64_t last_create_create_samples() const {
+        auto* pr = _tracker->last_probe();
+        return pr == nullptr
+                 ? 0
+                 : pr->_processor_create_latency.public_histogram_logform()
+                     .sample_count;
+    }
+    bool a_create_was_attempted() const {
+        return _tracker->last_probe() != nullptr;
+    }
+
+    // --- pre-relinquish quiesce hook helpers ---
+    bool has_quiesce_hook(std::string_view np_str) {
+        return _hooks.contains(parse_ntp(np_str));
+    }
+    // Run the hook raft would run before giving this ntp's leadership away.
+    void run_quiesce_hook(std::string_view np_str) {
+        auto it = _hooks.find(parse_ntp(np_str));
+        ASSERT_TRUE(it != _hooks.end()) << "no quiesce hook installed";
+        it->second().get();
+    }
+    size_t drains_for(std::string_view np_str) {
+        return _tracker->drains_for(parse_ntp(np_str));
+    }
+    std::optional<model::timeout_clock::time_point>
+    last_drain_deadline(std::string_view np_str) {
+        return _tracker->last_drain_deadline(parse_ntp(np_str));
+    }
+    void
+    set_graceful_transfer_timeout(std::optional<std::chrono::milliseconds> t) {
+        ::config::shard_local_cfg()
+          .data_transforms_graceful_transfer_timeout_ms.set_value(t);
+    }
+
     void drain_queue() {
         // Drain the seastar task queue to ensure manual clock tasks have
         // processed, then drain the manager queue.
@@ -464,6 +587,8 @@ private:
     std::optional<ss::promise<>> _idle_waiter_task;
     fake_registry* _registry;
     processor_tracker* _tracker;
+    absl::flat_hash_map<model::ntp, manager<ss::manual_clock>::quiesce_hook_fn>
+      _hooks;
     std::unique_ptr<manager<ss::manual_clock>> _manager;
 };
 
@@ -475,6 +600,112 @@ TEST_F(TransformManagerTest, FullLifecycle) {
     lose_leadership("foo/1");
     drain_queue();
     EXPECT_THAT(status(), status_is("foo->bar/1", lifecycle_status::destroyed));
+}
+
+TEST_F(TransformManagerTest, InstallsAQuiesceHookWhenAProcessorStarts) {
+    EXPECT_FALSE(has_quiesce_hook("foo/1"));
+    become_leader("foo/1");
+    deploy_transform("foo->bar");
+    drain_queue();
+    EXPECT_TRUE(has_quiesce_hook("foo/1"))
+      << "raft was never asked to let this transform finish before a transfer";
+}
+
+TEST_F(TransformManagerTest, ClearsTheQuiesceHookWhenLeadershipIsLost) {
+    become_leader("foo/1");
+    deploy_transform("foo->bar");
+    drain_queue();
+    ASSERT_TRUE(has_quiesce_hook("foo/1"));
+
+    lose_leadership("foo/1");
+    drain_queue();
+    // Nothing of ours reads this partition now. Leaving the hook installed
+    // would keep raft holding a callback into this manager for as long as the
+    // group lives, long after there is anything to drain.
+    EXPECT_FALSE(has_quiesce_hook("foo/1"));
+}
+
+TEST_F(TransformManagerTest, TheQuiesceHookDrainsTheNtpsProcessors) {
+    set_graceful_transfer_timeout(std::chrono::seconds(5));
+    become_leader("foo/1");
+    deploy_transform("foo->bar");
+    drain_queue();
+    ASSERT_EQ(drains_for("foo/1"), 0u);
+
+    run_quiesce_hook("foo/1");
+    EXPECT_EQ(drains_for("foo/1"), 1u)
+      << "the hook fired but no processor was drained";
+    // The deadline has to come from the configured budget, not be open-ended -
+    // an unbounded drain would hold a leadership transfer open indefinitely.
+    auto deadline = last_drain_deadline("foo/1");
+    ASSERT_TRUE(deadline.has_value());
+    EXPECT_LE(*deadline, model::timeout_clock::now() + std::chrono::seconds(5));
+}
+
+TEST_F(TransformManagerTest, TheQuiesceHookDrainsEveryTransformOnTheNtp) {
+    // Raft has one hook per group, but an ntp can host several transforms, so
+    // the hook is installed per ntp and has to quiesce all of them. If it
+    // drained only one, the second transform's in-flight work would still be
+    // discarded on every planned leadership move - and the bug would be
+    // invisible with a single transform deployed, which is the common case in
+    // testing.
+    set_graceful_transfer_timeout(std::chrono::seconds(5));
+    become_leader("foo/1");
+    deploy_transform("foo->bar");
+    deploy_transform("foo->baz");
+    drain_queue();
+
+    run_quiesce_hook("foo/1");
+    EXPECT_EQ(drains_for("foo/1"), 2u)
+      << "only some of the transforms on this partition were drained";
+}
+
+TEST_F(TransformManagerTest, TheQuiesceHookDoesNothingWhenTheTimeoutIsUnset) {
+    // Unset is the default and means "do not wait": leadership moves
+    // immediately and in-flight work is reprocessed, exactly as before this
+    // existed. The hook is still installed - the property is live-updatable,
+    // so it must start draining as soon as it is set without needing a
+    // processor restart - but it must not drain while unset.
+    set_graceful_transfer_timeout(std::nullopt);
+    become_leader("foo/1");
+    deploy_transform("foo->bar");
+    drain_queue();
+    ASSERT_TRUE(has_quiesce_hook("foo/1"));
+
+    run_quiesce_hook("foo/1");
+    EXPECT_EQ(drains_for("foo/1"), 0u)
+      << "drained despite no graceful transfer budget being configured";
+
+    // Setting it takes effect immediately on the already-installed hook.
+    set_graceful_transfer_timeout(std::chrono::seconds(5));
+    run_quiesce_hook("foo/1");
+    EXPECT_EQ(drains_for("foo/1"), 1u) << "the hook ignored a newly set budget";
+}
+
+TEST_F(TransformManagerTest, AFailedCreateRecordsNoBringup) {
+    // The bring-up clock starts BEFORE the processor is created, because
+    // fetching and compiling the module happens there and dominates a cold
+    // start. So a create that fails has to record nothing: no processor was
+    // brought up, and the time spent failing is not a startup duration.
+    //
+    // This is the cancel path most likely to fire in production - the binary
+    // fetch is an RPC with a 3s timeout, and a broker that cannot reach the
+    // wasm_binaries partition hits it repeatedly. Recording those attempts
+    // would inflate the startup metric by its single dominant term, in the
+    // direction that makes bring-up look worse than it is, which would
+    // corrupt the measurement this metric exists to provide.
+    fail_creates(true);
+    become_leader("foo/1");
+    deploy_transform("foo->bar");
+    drain_queue();
+
+    ASSERT_TRUE(a_create_was_attempted()) << "no create was even attempted";
+    EXPECT_EQ(last_create_startup_samples(), uint64_t(0))
+      << "a failed create was recorded as a bring-up";
+    // The create measurement, by contrast, SHOULD record a failed attempt -
+    // a binary fetch that timed out is exactly the sample worth having.
+    EXPECT_EQ(last_create_create_samples(), uint64_t(1))
+      << "a failed create was not timed";
 }
 
 TEST_F(TransformManagerTest, PauseUnpause) {

@@ -111,12 +111,29 @@ class manager {
       "Only lowres or manual clocks are supported");
 
 public:
+    /**
+     * A callback raft runs before this node deliberately gives up leadership
+     * of a partition, and the means of installing one.
+     *
+     * Type-erased on purpose. The manager is what knows WHEN a hook should
+     * exist and what it should do - it owns the processors - but reaching the
+     * raft group would mean naming cluster and raft types this layer does not
+     * otherwise depend on. So the layer that already owns those types supplies
+     * the installer, and passing {} as the hook clears it.
+     */
+    using quiesce_hook_fn = ss::noncopyable_function<ss::future<>()>;
+    using install_quiesce_hook_fn
+      = ss::noncopyable_function<void(const model::ntp&, quiesce_hook_fn)>;
+
     manager(
       model::node_id self,
       std::unique_ptr<registry>,
       std::unique_ptr<processor_factory>,
       ss::scheduling_group,
-      std::unique_ptr<memory_limits>);
+      std::unique_ptr<memory_limits>,
+      // May be null, in which case no hooks are installed and leadership
+      // moves discard in-flight work exactly as they did before.
+      install_quiesce_hook_fn = {});
     manager(const manager&) = delete;
     manager& operator=(const manager&) = delete;
     manager(manager&&) = delete;
@@ -130,6 +147,10 @@ public:
     void on_leadership_change(model::ntp, ntp_leader);
     // Called everytime a transform changes
     void on_plugin_change(model::transform_id);
+    // Quiesce every processor reading `ntp`, bounded by
+    // data_transforms_graceful_transfer_timeout_ms. Installed as raft's
+    // pre-relinquish hook; a no-op when that property is unset.
+    ss::future<> drain_ntp(model::ntp);
     // Called when processors have state changes
     void on_transform_state_change(
       model::transform_id, model::ntp, processor::state);
@@ -165,6 +186,7 @@ private:
     model::node_id _self;
     ssx::work_queue _queue;
     std::unique_ptr<memory_limits> _memory_limits;
+    install_quiesce_hook_fn _install_quiesce_hook;
     std::unique_ptr<registry> _registry;
     std::unique_ptr<processor_table<ClockType>> _processors;
     std::unique_ptr<processor_factory> _processor_factory;

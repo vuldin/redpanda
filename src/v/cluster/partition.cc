@@ -1082,6 +1082,38 @@ ss::future<> partition::serialize_json_manifest_to_output_stream(
 
 ss::future<std::error_code>
 partition::transfer_leadership(raft::transfer_leadership_request req) {
+    // Two phases, split into named functions rather than sequenced by
+    // statement order inside one long body.
+    //
+    // The split is the safety property: everything in phase two blocks
+    // produces, because it takes rm_stm's state lock for writing, so anything
+    // that should happen while writes still flow has to be in phase one. Left
+    // as one body, a later prepare step could be added above the quiesce, or
+    // the quiesce moved below a prepare, and nothing would object - which is
+    // exactly the mistake this fix corrects. There is no unit test guarding
+    // the order (a cluster::partition needs five sharded services to build and
+    // no test in the tree constructs one), so the decomposition carries it.
+    co_await run_pre_transfer_quiesce();
+    co_return co_await do_transfer_leadership_blocking_writes(std::move(req));
+}
+
+ss::future<> partition::run_pre_transfer_quiesce() {
+    if (!_pre_transfer_quiesce) {
+        co_return;
+    }
+    co_await ss::futurize_invoke(_pre_transfer_quiesce)
+      .handle_exception([this](const std::exception_ptr& e) {
+          vlog(
+            clusterlog.warn,
+            "transfer_leadership[{}]: pre-transfer quiesce failed, "
+            "transferring anyway: {}",
+            ntp(),
+            e);
+      });
+}
+
+ss::future<std::error_code> partition::do_transfer_leadership_blocking_writes(
+  raft::transfer_leadership_request req) {
     auto target = req.target;
 
     vlog(

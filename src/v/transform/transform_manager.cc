@@ -14,6 +14,7 @@
 #include "absl/container/btree_set.h"
 #include "base/vassert.h"
 #include "base/vlog.h"
+#include "config/configuration.h"
 #include "logger.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -254,6 +255,41 @@ public:
     // held". A hint-placed entry (see entry_t::hint_placed) was never
     // leadership-derived in the first place, so it must survive this - skip
     // it rather than tearing it down on unrelated leadership churn.
+    /**
+     * Quiesce every processor reading `target_ntp`, concurrently, sharing one
+     * deadline.
+     *
+     * Skips hint-placed entries for the same reason erase_by_ntp does: they
+     * are pinned to this shard rather than placed by this ntp's leadership, so
+     * this ntp changing leader takes nothing away from them and there is
+     * nothing for them to finish.
+     */
+    ss::future<>
+    drain_by_ntp(model::ntp target_ntp, model::timeout_clock::time_point d) {
+        auto it = _ntp_index.lower_bound(
+          std::pair(target_ntp, model::transform_id::min()));
+        ss::chunked_fifo<ss::future<bool>> drains;
+        while (it != _ntp_index.end()) {
+            auto [ntp, id] = *it;
+            if (ntp != target_ntp) {
+                break;
+            }
+            auto table_it = _table.find(std::make_pair(id, ntp));
+            vassert(table_it != _table.end(), "inconsistent index");
+            if (!table_it->second.hint_placed()) {
+                drains.push_back(table_it->second.processor()->drain(d));
+            }
+            ++it;
+            co_await ss::coroutine::maybe_yield();
+        }
+        co_await ss::when_all_succeed(drains.begin(), drains.end())
+          .discard_result()
+          .handle_exception([](const std::exception_ptr&) {
+              // A drain that threw is reported by the processor itself; the
+              // transfer proceeds regardless.
+          });
+    }
+
     ss::future<> erase_by_ntp(model::ntp target_ntp) {
         auto it = _ntp_index.lower_bound(
           std::pair(target_ntp, model::transform_id::min()));
@@ -293,7 +329,8 @@ manager<ClockType>::manager(
   std::unique_ptr<registry> r,
   std::unique_ptr<processor_factory> f,
   ss::scheduling_group sg,
-  std::unique_ptr<memory_limits> memory_limits)
+  std::unique_ptr<memory_limits> memory_limits,
+  install_quiesce_hook_fn install_quiesce_hook)
   : _self(self)
   , _queue(
       sg,
@@ -301,6 +338,7 @@ manager<ClockType>::manager(
           vlog(tlog.error, "unexpected transform manager error: {}", ex);
       })
   , _memory_limits(std::move(memory_limits))
+  , _install_quiesce_hook(std::move(install_quiesce_hook))
   , _registry(std::move(r))
   , _processors(std::make_unique<processor_table<ClockType>>())
   , _processor_factory(std::move(f)) {}
@@ -365,6 +403,14 @@ ss::future<> manager<ClockType>::handle_leadership_change(
     if (leader_status == ntp_leader::no) {
         // We're not the leader anymore, time to shutdown all the processors
         co_await _processors->erase_by_ntp(ntp);
+        // Nothing of ours reads this partition now, so drop the hook rather
+        // than leave raft holding a callback into a table with no entries for
+        // this ntp. It would be harmless (drain_by_ntp would find nothing) but
+        // it would keep this manager reachable from the raft group for as long
+        // as the group lives.
+        if (_install_quiesce_hook) {
+            _install_quiesce_hook(ntp, {});
+        }
         co_return;
     }
     // We're the leader - start all the processor that aren't already running
@@ -494,6 +540,19 @@ manager<ClockType>::start_processor(model::ntp ntp, model::transform_id id) {
 }
 
 template<typename ClockType>
+ss::future<> manager<ClockType>::drain_ntp(model::ntp ntp) {
+    auto timeout = ::config::shard_local_cfg()
+                     .data_transforms_graceful_transfer_timeout_ms.value();
+    if (!timeout.has_value()) {
+        // Unset: leadership moves immediately and in-flight work is discarded
+        // and reprocessed, which is the behaviour before this existed.
+        co_return;
+    }
+    co_await _processors->drain_by_ntp(
+      std::move(ntp), model::timeout_clock::now() + *timeout);
+}
+
+template<typename ClockType>
 ss::future<> manager<ClockType>::create_processor(
   model::ntp ntp, model::transform_id id, model::transform_metadata meta) {
     auto p = _processors->get_or_create_probe(id, meta);
@@ -542,6 +601,15 @@ ss::future<> manager<ClockType>::create_processor(
           std::move(fut).get(), std::move(p), hint_placed);
         vlog(tlog.info, "starting transform {} on {}", meta.name, ntp);
         entry.mark_start_attempt();
+        // Ask raft to let us finish in-flight work before it hands this
+        // partition's leadership away. Installed per ntp rather than per
+        // processor because raft has one hook per group while an ntp can host
+        // several transforms - drain_ntp quiesces all of them. Re-installing
+        // for a second transform on the same ntp simply replaces an
+        // equivalent hook.
+        if (_install_quiesce_hook) {
+            _install_quiesce_hook(ntp, [this, ntp] { return drain_ntp(ntp); });
+        }
         co_await entry.processor()->start(std::move(startup_m));
     }
 }
