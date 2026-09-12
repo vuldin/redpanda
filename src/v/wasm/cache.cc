@@ -339,6 +339,36 @@ ss::future<ss::shared_ptr<factory>> caching_runtime::make_factory(
     co_return created;
 }
 
+ss::future<ss::shared_ptr<factory>> caching_runtime::get_or_create_factory(
+  model::transform_metadata meta, binary_loader_fn load) {
+    model::offset offset = meta.source_ptr;
+    // Outside the lock, so the common hit costs nothing.
+    auto cached = get_cached_factory(meta);
+    if (cached) {
+        co_return *cached;
+    }
+    auto lock = co_await factory_creation_lock_guard::acquire(
+      &_factory_creation_mu_map, offset);
+    // Again under the lock: whoever held it before us may have created it,
+    // and this is the check that makes the fetch below happen at most once.
+    cached = get_cached_factory(meta);
+    if (cached) {
+        co_return *cached;
+    }
+    auto binary = co_await load();
+    if (!binary) {
+        // The loader has already reported why. Nothing is cached, so the next
+        // caller retries rather than inheriting a failure.
+        co_return nullptr;
+    }
+    auto factory = co_await _underlying->make_factory(
+      std::move(meta), std::move(*binary));
+    auto created = ss::make_shared<cached_factory>(
+      ss::make_foreign(std::move(factory)), offset, &_engine_caches);
+    _factory_cache.insert_or_assign(offset, created->weak_from_this());
+    co_return created;
+}
+
 ss::optimized_optional<ss::shared_ptr<factory>>
 caching_runtime::get_cached_factory(const model::transform_metadata& meta) {
     auto it = _factory_cache.find(meta.source_ptr);

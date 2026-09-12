@@ -20,6 +20,9 @@
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/weak_ptr.hh>
+#include <seastar/util/noncopyable_function.hh>
+
+#include <optional>
 
 namespace wasm {
 
@@ -65,6 +68,42 @@ public:
      */
     ss::optimized_optional<ss::shared_ptr<factory>>
     get_cached_factory(const model::transform_metadata&);
+
+    /**
+     * Fetches the binary only if this call is the one that will compile it.
+     *
+     * make_factory takes the binary as an argument, so its caller has to
+     * fetch before it can find out whether a compile was needed at all. With
+     * N partitions of one transform arriving on a broker together - which is
+     * the normal case after a leadership move - that is N fetches of the same
+     * bytes over RPC, of which N-1 are then discarded by the cache check.
+     * Only the compile was ever deduplicated.
+     *
+     * Taking the loader as a callback instead lets the fetch happen inside
+     * the per-offset lock, after the second cache check, so it runs at most
+     * once per compile. It also widens is_creating_factory() to cover the
+     * fetch window, not just the compile.
+     *
+     * The loader returns nullopt to mean "could not fetch"; this returns a
+     * null factory in that case, and caches nothing, so the next caller
+     * retries rather than inheriting the failure.
+     */
+    using binary_loader_fn = ss::noncopyable_function<
+      ss::future<std::optional<model::wasm_binary_iobuf>>()>;
+    ss::future<ss::shared_ptr<factory>>
+      get_or_create_factory(model::transform_metadata, binary_loader_fn);
+
+    /**
+     * True while some caller holds a factory-creation lock, i.e. a fetch or a
+     * compile is in flight somewhere on this broker.
+     *
+     * Every compile in the process runs on one alien thread, so this exists
+     * for speculative work to check before queueing in front of a compile
+     * that a running transform is actually blocked on.
+     */
+    bool is_creating_factory() const {
+        return !_factory_creation_mu_map.empty();
+    }
 
     ss::future<> validate(model::wasm_binary_iobuf) override;
 
