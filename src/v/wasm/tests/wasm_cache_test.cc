@@ -207,6 +207,9 @@ public:
           });
     }
     bool is_creating() const { return _caching_runtime->is_creating_factory(); }
+    void invalidate(model::offset o) {
+        _caching_runtime->invalidate_factory(o);
+    }
 
     int64_t gc() { return _caching_runtime->do_gc().get(); }
     auto* state() { return _fake_runtime->get_state(); }
@@ -448,6 +451,68 @@ TEST_F(WasmCacheTest, IsCreatingFactoryCoversTheFetchNotJustTheCompile) {
     EXPECT_TRUE(is_creating()) << "a fetch in flight did not register";
     std::move(pending).get();
     EXPECT_FALSE(is_creating());
+}
+
+TEST_F(WasmCacheTest, InvalidateForcesTheNextCallerToRecompile) {
+    // A factory's capability grants are baked in when it is compiled, so
+    // revoking a grant does nothing to an already-compiled module. Dropping
+    // the cache entry is what makes the next compile observe the revocation.
+    auto meta = random_metadata();
+    int loads = 0;
+    auto first = get_or_create_async(meta, &loads).get();
+    ASSERT_EQ(loads, 1);
+    ASSERT_EQ(state()->factories, 1);
+
+    invalidate(meta.source_ptr);
+
+    auto second = get_or_create_async(meta, &loads).get();
+    EXPECT_EQ(loads, 2) << "the next caller reused the invalidated factory";
+    EXPECT_NE(first.get(), second.get()) << "same factory handed back";
+}
+
+TEST_F(WasmCacheTest, AnEngineAlreadyRunningSurvivesInvalidation) {
+    // Deliberate non-behaviour: a running engine holds its own strong
+    // reference and keeps the grants it was linked with. Tearing it down here
+    // would turn a capability change into an unannounced data-plane
+    // interruption. What must recompile is a RESTART, per the test above.
+    auto meta = random_metadata();
+    int loads = 0;
+    auto factory = get_or_create_async(meta, &loads).get();
+    ASSERT_TRUE(factory);
+
+    invalidate(meta.source_ptr);
+
+    EXPECT_EQ(state()->factories, 1);
+    EXPECT_TRUE(factory);
+}
+
+TEST_F(WasmCacheTest, InvalidatingAnUncachedOffsetIsHarmless) {
+    // The caller is a config watch that does not know which offsets this
+    // broker has compiled, so this has to be safe rather than checked.
+    invalidate(model::offset(12345));
+    EXPECT_EQ(state()->factories, 0);
+}
+
+TEST_F(WasmCacheTest, ACompileThatBeganBeforeAnInvalidateIsNotCached) {
+    // The race the epoch guard exists for, and the reason the epoch is
+    // captured at entry rather than before the compile: this invalidation
+    // lands while the FETCH is still in flight, which is the longer of the
+    // two windows. Caching the result would immediately undo the
+    // invalidation and hand the revoked module to everyone who came later.
+    auto meta = random_metadata();
+    int loads = 0;
+    auto pending = get_or_create_async(meta, &loads);
+    ASSERT_TRUE(is_creating());
+    invalidate(meta.source_ptr);
+    auto factory = std::move(pending).get();
+
+    // The caller still gets a usable factory - it asked for one.
+    EXPECT_TRUE(factory);
+    // But it was not shared, so the next caller compiles under the new
+    // grants rather than inheriting this one.
+    auto after = get_or_create_async(meta, &loads).get();
+    EXPECT_EQ(loads, 2) << "the pre-invalidation compile was cached anyway";
+    EXPECT_NE(factory.get(), after.get());
 }
 
 } // namespace wasm

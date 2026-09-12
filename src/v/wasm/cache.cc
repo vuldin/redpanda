@@ -308,40 +308,33 @@ ss::future<> caching_runtime::stop() {
 
 ss::future<ss::shared_ptr<factory>> caching_runtime::make_factory(
   model::transform_metadata meta, model::wasm_binary_iobuf binary) {
-    model::offset offset = meta.source_ptr;
-    // Look in the cache outside the lock
-    auto cached = get_cached_factory(meta);
-    if (cached) {
-        co_return *cached;
-    }
-    auto lock = co_await factory_creation_lock_guard::acquire(
-      &_factory_creation_mu_map, offset);
-    // Look again in the cache with the lock
-    cached = get_cached_factory(meta);
-    if (cached) {
-        co_return *cached;
-    }
-    // There is no factory and we're holding the lock,
-    // time to create a new one.
-    auto factory = co_await _underlying->make_factory(
-      std::move(meta), std::move(binary));
-
-    // Now cache the factory and return the result.
+    // Delegates so there is exactly ONE place that compiles and caches, and
+    // therefore exactly one place that has to honour the invalidation epoch.
+    // A second insert site would be a silent hole in that guard.
     //
-    // The underlying factory is wrapped in a foreign pointer because it could
-    // be accessed and used from any core (it's expected the caller of this
-    // function will wrap the factories in foreign pointers to hand out to other
-    // cores, and we can't do that here because of the inheritance).
-    auto created = ss::make_shared<cached_factory>(
-      ss::make_foreign(std::move(factory)), offset, &_engine_caches);
-    _factory_cache.insert_or_assign(offset, created->weak_from_this());
-
-    co_return created;
+    // The caller already holds the binary, so the "loader" just hands it
+    // over - which also means a caller that loses the race for the lock
+    // discards the binary it brought, exactly as before.
+    auto held = ss::make_lw_shared<std::optional<model::wasm_binary_iobuf>>(
+      std::move(binary));
+    return get_or_create_factory(
+      std::move(meta),
+      [held]() -> ss::future<std::optional<model::wasm_binary_iobuf>> {
+          return ss::make_ready_future<std::optional<model::wasm_binary_iobuf>>(
+            std::move(*held));
+      });
 }
 
 ss::future<ss::shared_ptr<factory>> caching_runtime::get_or_create_factory(
   model::transform_metadata meta, binary_loader_fn load) {
     model::offset offset = meta.source_ptr;
+    // Captured before ANY suspension point, not just before the compile.
+    // Both the fetch and the compile can be in flight when a capability
+    // change invalidates this offset, and a factory produced by either was
+    // linked under the grants being revoked - so capturing after the fetch
+    // would miss an invalidation that arrived during it, which is the longer
+    // of the two windows.
+    auto epoch_at_start = _cache_epoch;
     // Outside the lock, so the common hit costs nothing.
     auto cached = get_cached_factory(meta);
     if (cached) {
@@ -365,7 +358,12 @@ ss::future<ss::shared_ptr<factory>> caching_runtime::get_or_create_factory(
       std::move(meta), std::move(*binary));
     auto created = ss::make_shared<cached_factory>(
       ss::make_foreign(std::move(factory)), offset, &_engine_caches);
-    _factory_cache.insert_or_assign(offset, created->weak_from_this());
+    if (_cache_epoch == epoch_at_start) {
+        _factory_cache.insert_or_assign(offset, created->weak_from_this());
+    }
+    // Returned either way: the caller asked for a factory and this one is
+    // usable. It simply is not shared with whoever comes next, so the next
+    // caller compiles under the current grants.
     co_return created;
 }
 
@@ -376,6 +374,11 @@ caching_runtime::get_cached_factory(const model::transform_metadata& meta) {
         return {};
     }
     return ss::static_pointer_cast<factory>(it->second->shared_from_this());
+}
+
+void caching_runtime::invalidate_factory(model::offset offset) {
+    ++_cache_epoch;
+    _factory_cache.erase(offset);
 }
 
 ss::future<int64_t> caching_runtime::do_gc() {
