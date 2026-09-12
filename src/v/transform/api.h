@@ -33,6 +33,9 @@
 namespace transform {
 
 class trusted_module_reconciler;
+class factory_store;
+template<typename ClockType>
+class factory_residency;
 
 /** Request options for listing committed offsets. */
 struct list_committed_offsets_options {
@@ -134,6 +137,24 @@ private:
 
     void unregister_notifications();
 
+    /// Tells residency to re-derive what belongs on this broker. Forwards to
+    /// the shard that owns the module cache, since any shard may be the one
+    /// that notices a replica arriving or leaving.
+    void poke_residency();
+
+    /// Whether this broker holds a replica of any partition of this topic.
+    bool replicates(const model::topic_namespace&) const;
+
+    /// The wasm binary fetch, as a callback the module cache can run inside
+    /// its own per-offset lock so that it happens at most once per compile.
+    ss::noncopyable_function<
+      ss::future<std::optional<model::wasm_binary_iobuf>>()>
+      binary_loader(model::transform_name, model::offset);
+
+    /// Compile this transform's module now and keep it in memory. Creation
+    /// shard only, which is where residency runs.
+    ss::future<bool> pin_factory(model::transform_metadata);
+
     ss::future<> cleanup_wasm_binary(uuid_t);
 
     ss::future<ss::optimized_optional<ss::shared_ptr<wasm::engine>>>
@@ -178,6 +199,13 @@ private:
     // trusted_module_reconciler for why that needs doing and why it is a
     // separate type.
     std::unique_ptr<trusted_module_reconciler> _trusted_modules;
+    // Keeps compiled modules in memory on brokers that replicate a
+    // transform's input, so a partition moving here does not start cold.
+    // Both live on the creation shard only, since that is where the
+    // process-wide module cache is: a per-shard sweep would be several
+    // sweeps contending over one table.
+    std::unique_ptr<factory_store> _factory_store;
+    std::unique_ptr<factory_residency<ss::lowres_clock>> _residency;
 };
 
 } // namespace transform

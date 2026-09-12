@@ -86,6 +86,26 @@ redpanda_test_cc_library(
 )
 
 redpanda_cc_gtest(
+    name = "factory_residency_test",
+    timeout = "short",
+    srcs = [
+        "factory_residency_test.cc",
+    ],
+    cpu = 1,
+    memory = "64MiB",
+    deps = [
+        "//src/v/config",
+        "//src/v/model",
+        "//src/v/test_utils:gtest",
+        "//src/v/transform:impl",
+        "@abseil-cpp//absl/container:btree",
+        "@abseil-cpp//absl/container:flat_hash_set",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
     name = "trusted_module_reconciler_test",
     timeout = "short",
     srcs = [

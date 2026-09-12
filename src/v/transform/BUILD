@@ -90,6 +90,7 @@ redpanda_cc_library(
 redpanda_cc_library(
     name = "impl",
     srcs = [
+        "factory_residency.cc",
         "probe.cc",
         "relay_source.cc",
         "transform_manager.cc",
@@ -97,6 +98,7 @@ redpanda_cc_library(
         "trusted_module_reconciler.cc",
     ],
     hdrs = [
+        "factory_residency.h",
         "io.h",
         "probe.h",
         "relay_offset_tracker.h",
