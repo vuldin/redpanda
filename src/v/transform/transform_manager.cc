@@ -188,17 +188,6 @@ public:
         return table_it->second;
     }
 
-    ss::lw_shared_ptr<probe> get_or_create_probe(
-      model::transform_id id, const model::transform_metadata& meta) {
-        auto it = _table.lower_bound(std::make_pair(id, min_ntp));
-        if (it != _table.end() && it->first.first == id) {
-            return it->second.probe();
-        }
-        auto probe = ss::make_lw_shared<transform::probe>();
-        probe->setup_metrics(meta);
-        return probe;
-    }
-
     bool contains(model::transform_id id, const model::ntp& ntp) {
         return _table.contains(std::make_pair(id, ntp));
     }
@@ -380,6 +369,9 @@ ss::future<> manager<ClockType>::stop() {
     vlog(tlog.info, "Stopping transform manager...");
     co_await _queue.shutdown();
     co_await _processors->clear();
+    // After the processors, since tearing one down reports a final state
+    // change through its probe.
+    _probes.clear();
     vlog(tlog.info, "Stopped transform manager.");
 }
 
@@ -606,9 +598,21 @@ ss::future<> manager<ClockType>::rebuild_transform(model::transform_id id) {
 }
 
 template<typename ClockType>
+ss::lw_shared_ptr<probe>
+manager<ClockType>::get_or_create_probe(const model::transform_metadata& meta) {
+    auto it = _probes.find(meta.name());
+    if (it != _probes.end()) {
+        return it->second;
+    }
+    auto p = ss::make_lw_shared<transform::probe>();
+    p->setup_metrics(meta);
+    return _probes.emplace(meta.name(), std::move(p)).first->second;
+}
+
+template<typename ClockType>
 ss::future<> manager<ClockType>::create_processor(
   model::ntp ntp, model::transform_id id, model::transform_metadata meta) {
-    auto p = _processors->get_or_create_probe(id, meta);
+    auto p = get_or_create_probe(meta);
     processor::state_callback cb =
       [this](model::transform_id id, model::ntp ntp, processor::state state) {
           on_transform_state_change(id, ntp, state);

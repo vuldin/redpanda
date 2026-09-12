@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include "absl/container/btree_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -196,6 +197,18 @@ private:
     ss::future<> create_processor(
       model::ntp, model::transform_id, model::transform_metadata);
 
+    /**
+     * This transform's probe, creating and registering it on first use.
+     *
+     * Keyed on the transform NAME, which is what the metrics themselves are
+     * labelled with (function_name, and nothing else - there is no ntp or
+     * partition label). Keying on the id instead would let a transform that
+     * was deleted and recreated under the same name register a second probe
+     * carrying identical labels.
+     */
+    ss::lw_shared_ptr<probe>
+    get_or_create_probe(const model::transform_metadata&);
+
     model::node_id _self;
     ssx::work_queue _queue;
     std::unique_ptr<memory_limits> _memory_limits;
@@ -203,5 +216,25 @@ private:
     std::unique_ptr<registry> _registry;
     std::unique_ptr<processor_table<ClockType>> _processors;
     std::unique_ptr<processor_factory> _processor_factory;
+    /**
+     * Probes outlive the processors that report through them, and are
+     * released only by stop().
+     *
+     * They used to be owned by the processor-table entry, so a transform's
+     * metrics disappeared the moment its last processor on this shard did -
+     * which is exactly when an operator goes looking for them. A leadership
+     * move away from this broker, a transform erroring out, a failed
+     * bring-up: in each case the series vanishes rather than reporting the
+     * state it ended in.
+     *
+     * Costs no new label values, because every series here is labelled with
+     * function_name alone. The cardinality argument that justifies partition
+     * metrics disappearing with their partition does not transfer.
+     *
+     * Same shape and lifetime as transform::logging::manager's own
+     * _logger_probes, for the same reason.
+     */
+    using probe_map_t = absl::btree_map<ss::sstring, ss::lw_shared_ptr<probe>>;
+    probe_map_t _probes;
 };
 } // namespace transform
