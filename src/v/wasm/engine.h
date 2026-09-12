@@ -115,6 +115,19 @@ public:
      */
     virtual ss::future<ss::shared_ptr<engine>>
       make_engine(model::ntp, std::unique_ptr<wasm::logger>) = 0;
+
+    /**
+     * How much executable memory this module's compiled machine code
+     * occupies.
+     *
+     * Only knowable after the compile, which is what forces any bound on how
+     * many modules are kept in memory to count modules rather than bytes -
+     * see `caching_runtime::pin_factory`. Exported as a gauge so that an
+     * operator choosing that count can turn it into a memory figure for
+     * their own binaries instead of guessing.
+     */
+    virtual size_t image_bytes() const = 0;
+
     virtual ~factory() = default;
 };
 

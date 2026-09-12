@@ -29,6 +29,7 @@
 #include <memory>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace wasm {
 
@@ -41,6 +42,10 @@ struct state {
     std::atomic_int engines = 0;
     std::atomic_int running_engines = 0;
     std::atomic_int engine_restarts = 0;
+    // What the next factory created will report as its compiled size. Fixed
+    // at construction, the way a real module's image size is fixed by its
+    // compile.
+    std::atomic_size_t next_factory_image_bytes = 0;
 
     std::atomic_bool engine_transform_should_throw = false;
 };
@@ -92,7 +97,8 @@ private:
 class fake_factory : public factory {
 public:
     explicit fake_factory(state* state)
-      : _state(state) {
+      : _state(state)
+      , _image_bytes(state->next_factory_image_bytes) {
         ++_state->factories;
     }
     fake_factory(const fake_factory&) = delete;
@@ -106,8 +112,11 @@ public:
         co_return ss::make_shared<fake_engine>(_state);
     }
 
+    size_t image_bytes() const override { return _image_bytes; }
+
 private:
     state* _state;
+    size_t _image_bytes;
 };
 
 class fake_runtime : public runtime {
@@ -144,12 +153,22 @@ public:
         _caching_runtime = std::make_unique<caching_runtime>(
           std::move(fr), /*gc_interval=*/std::chrono::hours(1));
         _caching_runtime->start({}).get();
+        _stopped = false;
     }
 
     void TearDown() override {
-        _caching_runtime->stop().get();
+        stop_runtime();
         _fake_runtime = nullptr;
         _caching_runtime = nullptr;
+    }
+
+    // Idempotent, so a test can assert on what stopping releases and still
+    // let TearDown run.
+    void stop_runtime() {
+        if (!_stopped) {
+            _caching_runtime->stop().get();
+            _stopped = true;
+        }
     }
 
     model::transform_metadata random_metadata() {
@@ -183,11 +202,10 @@ public:
 
     // Counts how many times the loader actually ran, which is the point of
     // get_or_create_factory: the fetch must happen once per compile, not once
-    // per caller.
-    ss::future<ss::shared_ptr<factory>>
-    get_or_create_async(model::transform_metadata metadata, int* loads) {
-        return _caching_runtime->get_or_create_factory(
-          std::move(metadata),
+    // per caller. It is also how the residency tests below tell a refusal
+    // that cost nothing from one that fetched a binary first.
+    caching_runtime::binary_loader_fn counting_loader(int* loads) {
+        return
           [this,
            loads]() -> ss::future<std::optional<model::wasm_binary_iobuf>> {
               ++*loads;
@@ -196,19 +214,53 @@ public:
               co_await ss::yield();
               co_return model::wasm_binary_iobuf(
                 std::make_unique<iobuf>(_wasm_module.copy()));
-          });
+          };
+    }
+    static caching_runtime::binary_loader_fn failing_loader() {
+        return []() -> ss::future<std::optional<model::wasm_binary_iobuf>> {
+            co_return std::nullopt;
+        };
+    }
+
+    ss::future<ss::shared_ptr<factory>>
+    get_or_create_async(model::transform_metadata metadata, int* loads) {
+        return _caching_runtime->get_or_create_factory(
+          std::move(metadata), counting_loader(loads));
     }
     ss::future<ss::shared_ptr<factory>>
     get_or_create_failing_async(model::transform_metadata metadata) {
         return _caching_runtime->get_or_create_factory(
-          std::move(metadata),
-          []() -> ss::future<std::optional<model::wasm_binary_iobuf>> {
-              co_return std::nullopt;
-          });
+          std::move(metadata), failing_loader());
     }
     bool is_creating() const { return _caching_runtime->is_creating_factory(); }
     void invalidate(model::offset o) {
         _caching_runtime->invalidate_factory(o);
+    }
+
+    ss::future<bool> pin_async(model::transform_metadata metadata, int* loads) {
+        return _caching_runtime->pin_factory(
+          std::move(metadata), counting_loader(loads));
+    }
+    bool pin(model::transform_metadata metadata, int* loads) {
+        return pin_async(std::move(metadata), loads).get();
+    }
+    bool pin_failing(model::transform_metadata metadata) {
+        return _caching_runtime
+          ->pin_factory(std::move(metadata), failing_loader())
+          .get();
+    }
+    void unpin(model::offset o) { _caching_runtime->unpin_factory(o); }
+    bool is_resident(model::offset o) const {
+        return _caching_runtime->is_resident(o);
+    }
+    std::vector<model::offset> resident() const {
+        return _caching_runtime->resident_factories();
+    }
+    void set_max_resident(size_t max) {
+        _caching_runtime->set_max_resident_factories(max);
+    }
+    caching_runtime::residency_stats residency() const {
+        return _caching_runtime->residency();
     }
 
     int64_t gc() { return _caching_runtime->do_gc().get(); }
@@ -223,6 +275,7 @@ private:
     model::offset _offset = model::offset(0);
     fake_runtime* _fake_runtime;
     std::unique_ptr<caching_runtime> _caching_runtime;
+    bool _stopped = false;
 };
 
 void PrintTo(const ss::shared_ptr<factory>& f, std::ostream* os) {
@@ -513,6 +566,233 @@ TEST_F(WasmCacheTest, ACompileThatBeganBeforeAnInvalidateIsNotCached) {
     auto after = get_or_create_async(meta, &loads).get();
     EXPECT_EQ(loads, 2) << "the pre-invalidation compile was cached anyway";
     EXPECT_NE(factory.get(), after.get());
+}
+
+TEST_F(WasmCacheTest, AResidentModuleSurvivesItsLastProcessor) {
+    // The exact inverse of FactoryReplacementBeforeGC, which asserts that
+    // today a module dies with the last thing using it - before any GC runs,
+    // because every cache entry is a weak reference. That is what makes the
+    // next start, typically on the far side of a leadership move, pay for the
+    // fetch and the compile again.
+    set_max_resident(1);
+    auto meta = random_metadata();
+    int loads = 0;
+    ASSERT_TRUE(pin(meta, &loads));
+    ASSERT_EQ(loads, 1);
+
+    // A transform takes it, runs, and goes away.
+    auto factory = get_or_create_async(meta, &loads).get();
+    ASSERT_TRUE(factory);
+    ASSERT_EQ(loads, 1);
+    factory = nullptr;
+
+    EXPECT_EQ(state()->factories, 1) << "the module died with its processor";
+    EXPECT_EQ(gc(), 0) << "gc reaped a module that is being kept resident";
+
+    auto next = get_or_create_async(meta, &loads).get();
+    EXPECT_TRUE(next);
+    EXPECT_EQ(loads, 1) << "a resident module was fetched and compiled again";
+}
+
+TEST_F(WasmCacheTest, ResidencyIsOffUntilItIsGivenABudget) {
+    // Also the clearest statement of where admission happens: a refusal must
+    // not have fetched anything. That ordering is what forces the bound to
+    // count modules rather than bytes - a byte bound could only be applied
+    // after the compile it is meant to prevent.
+    auto meta = random_metadata();
+    int loads = 0;
+    EXPECT_FALSE(pin(meta, &loads));
+    EXPECT_EQ(loads, 0) << "a refused pin fetched the binary anyway";
+    EXPECT_FALSE(is_resident(meta.source_ptr));
+    EXPECT_EQ(residency().count, 0u);
+    EXPECT_EQ(residency().admission_failures, 1u);
+}
+
+TEST_F(WasmCacheTest, PinningWhatIsAlreadyResidentCostsNothing) {
+    // The caller reconciles towards a desired set, so it asks on every sweep.
+    set_max_resident(1);
+    auto meta = random_metadata();
+    int loads = 0;
+    ASSERT_TRUE(pin(meta, &loads));
+    ASSERT_EQ(loads, 1);
+
+    EXPECT_TRUE(pin(meta, &loads));
+    EXPECT_EQ(loads, 1) << "a resweep refetched a module it already had";
+    EXPECT_EQ(residency().count, 1u);
+}
+
+TEST_F(WasmCacheTest, AModuleNoTransformAskedForIsDroppedBeforeRefusing) {
+    set_max_resident(1);
+    auto never_asked_for = random_metadata();
+    auto newcomer = random_metadata();
+    int loads = 0;
+    ASSERT_TRUE(pin(never_asked_for, &loads));
+
+    EXPECT_TRUE(pin(newcomer, &loads));
+    EXPECT_FALSE(is_resident(never_asked_for.source_ptr));
+    EXPECT_TRUE(is_resident(newcomer.source_ptr));
+    EXPECT_EQ(residency().count, 1u);
+    EXPECT_EQ(residency().admission_failures, 0u);
+}
+
+TEST_F(WasmCacheTest, TheBoundRefusesRatherThanDropAModuleInUse) {
+    // With N+1 transforms competing for N slots, dropping the one in use
+    // means it recompiles the next time its partition moves AND the newcomer
+    // that displaced it never gets used either - a loop of cold starts on the
+    // one thread that compiles. Refusing is strictly better than that.
+    set_max_resident(1);
+    auto in_use = random_metadata();
+    auto newcomer = random_metadata();
+    int loads = 0;
+    ASSERT_TRUE(pin(in_use, &loads));
+    // Asking the cache for it is the "residency paid off" signal.
+    ASSERT_TRUE(get_or_create_async(in_use, &loads).get());
+    ASSERT_EQ(loads, 1);
+
+    EXPECT_FALSE(pin(newcomer, &loads));
+    EXPECT_EQ(loads, 1) << "a refused pin fetched the binary anyway";
+    EXPECT_TRUE(is_resident(in_use.source_ptr));
+    EXPECT_FALSE(is_resident(newcomer.source_ptr));
+    EXPECT_EQ(residency().admission_failures, 1u);
+}
+
+TEST_F(WasmCacheTest, ConcurrentPinsCannotOvershootTheBound) {
+    // The slot is taken when admission is decided, before the loader runs.
+    // Deciding and then inserting after a suspension would make the bound
+    // advisory: two pins that both passed the check would both land.
+    set_max_resident(1);
+    auto first_meta = random_metadata();
+    auto second_meta = random_metadata();
+    int loads = 0;
+    auto first = pin_async(first_meta, &loads);
+    auto second = pin_async(second_meta, &loads);
+    EXPECT_TRUE(std::move(first).get());
+    EXPECT_FALSE(std::move(second).get());
+    EXPECT_EQ(loads, 1) << "the refused pin fetched a binary anyway";
+    EXPECT_EQ(residency().count, 1u);
+}
+
+TEST_F(WasmCacheTest, APinWhoseFetchFailsGivesTheSlotBack) {
+    set_max_resident(1);
+    ASSERT_FALSE(pin_failing(random_metadata()));
+    EXPECT_EQ(residency().count, 0u);
+    // A refused fetch is not an admission failure, and the slot has to be
+    // genuinely free rather than charged to a module that does not exist
+    // here.
+    EXPECT_EQ(residency().admission_failures, 0u);
+    int loads = 0;
+    EXPECT_TRUE(pin(random_metadata(), &loads));
+}
+
+TEST_F(WasmCacheTest, InvalidatingAModuleAlsoStopsKeepingItResident) {
+    // The regression that matters most: residency must not be able to revert
+    // the revocation guarantee. A pin is a strong reference, so a pin left
+    // behind would keep the module linked under the old grants alive and make
+    // the next sweep see this offset as already warm.
+    set_max_resident(1);
+    auto meta = random_metadata();
+    int loads = 0;
+    ASSERT_TRUE(pin(meta, &loads));
+    ASSERT_TRUE(is_resident(meta.source_ptr));
+    ASSERT_EQ(state()->factories, 1);
+
+    invalidate(meta.source_ptr);
+
+    EXPECT_FALSE(is_resident(meta.source_ptr));
+    EXPECT_EQ(state()->factories, 0)
+      << "the module with the revoked grants is still in memory";
+    auto after = get_or_create_async(meta, &loads).get();
+    EXPECT_EQ(loads, 2) << "the next start reused the revoked module";
+}
+
+TEST_F(WasmCacheTest, APinInterruptedByAnInvalidationIsNotKept) {
+    // Same reasoning as ACompileThatBeganBeforeAnInvalidateIsNotCached, one
+    // layer up: this compile was linked under grants that were revoked while
+    // it ran, so keeping it resident would hold the revoked module for as
+    // long as the transform exists.
+    set_max_resident(1);
+    auto meta = random_metadata();
+    int loads = 0;
+    auto pending = pin_async(meta, &loads);
+    ASSERT_TRUE(is_creating());
+
+    invalidate(meta.source_ptr);
+
+    EXPECT_FALSE(std::move(pending).get());
+    EXPECT_FALSE(is_resident(meta.source_ptr));
+    EXPECT_EQ(state()->factories, 0);
+}
+
+TEST_F(WasmCacheTest, ResidencyReportsTheExecutableMemoryItHolds) {
+    // The knob is a count, because a module's size is only knowable after the
+    // compile. This gauge is how an operator turns that count into a memory
+    // figure for their own binaries instead of guessing.
+    set_max_resident(2);
+    int loads = 0;
+    state()->next_factory_image_bytes = 4096;
+    ASSERT_TRUE(pin(random_metadata(), &loads));
+    EXPECT_EQ(residency().image_bytes, 4096u);
+
+    state()->next_factory_image_bytes = 1024;
+    ASSERT_TRUE(pin(random_metadata(), &loads));
+    EXPECT_EQ(residency().count, 2u);
+    EXPECT_EQ(residency().image_bytes, 4096u + 1024u);
+}
+
+TEST_F(WasmCacheTest, ResidentFactoriesListsThePinnedOffsets) {
+    set_max_resident(2);
+    auto first_meta = random_metadata();
+    auto second_meta = random_metadata();
+    int loads = 0;
+    ASSERT_TRUE(pin(first_meta, &loads));
+    ASSERT_TRUE(pin(second_meta, &loads));
+    EXPECT_EQ(
+      resident(),
+      (std::vector<model::offset>{
+        first_meta.source_ptr, second_meta.source_ptr}));
+
+    unpin(first_meta.source_ptr);
+    EXPECT_EQ(resident(), (std::vector<model::offset>{second_meta.source_ptr}));
+    EXPECT_EQ(state()->factories, 1);
+}
+
+TEST_F(WasmCacheTest, LoweringTheBoundReleasesModulesImmediately) {
+    // An operator turning residency down, or off, has to get the memory back
+    // now - not whenever every resident module happens to be invalidated.
+    set_max_resident(2);
+    auto first_meta = random_metadata();
+    auto second_meta = random_metadata();
+    int loads = 0;
+    ASSERT_TRUE(pin(first_meta, &loads));
+    ASSERT_TRUE(pin(second_meta, &loads));
+    // Both in use, so neither is the free choice that admission prefers.
+    ASSERT_TRUE(get_or_create_async(first_meta, &loads).get());
+    ASSERT_TRUE(get_or_create_async(second_meta, &loads).get());
+    ASSERT_EQ(state()->factories, 2);
+
+    set_max_resident(1);
+    EXPECT_EQ(residency().count, 1u);
+    EXPECT_EQ(state()->factories, 1);
+
+    set_max_resident(0);
+    EXPECT_EQ(residency().count, 0u);
+    EXPECT_EQ(state()->factories, 0)
+      << "turning residency off kept the memory anyway";
+}
+
+TEST_F(WasmCacheTest, StoppingReleasesResidentModules) {
+    // A resident module is a cached_factory, which holds a raw pointer to the
+    // runtime's per-shard engine caches. A pin outliving the runtime would be
+    // holding a dangling pointer, so the pins have to go before those caches
+    // are stopped.
+    set_max_resident(1);
+    int loads = 0;
+    ASSERT_TRUE(pin(random_metadata(), &loads));
+    ASSERT_EQ(state()->factories, 1);
+
+    stop_runtime();
+
+    EXPECT_EQ(state()->factories, 0);
 }
 
 } // namespace wasm

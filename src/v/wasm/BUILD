@@ -315,6 +315,7 @@ redpanda_cc_library(
         ":transform_probe",
         ":wasi_logger",
         "//src/v/base",
+        "//src/v/metrics",
         "//src/v/model",
         "//src/v/ssx:future_util",
         "//src/v/ssx:mutex",

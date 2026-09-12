@@ -1584,11 +1584,13 @@ public:
       model::transform_metadata meta,
       ss::foreign_ptr<ss::lw_shared_ptr<preinitialized_instance>>
         preinitialized,
-      schema::registry* sr)
+      schema::registry* sr,
+      size_t image_bytes)
       : _runtime(runtime)
       , _preinitialized(std::move(preinitialized))
       , _meta(std::move(meta))
-      , _sr(sr) {}
+      , _sr(sr)
+      , _image_bytes(image_bytes) {}
 
     // This can be invoked on any shard and must be thread safe.
     //
@@ -1606,11 +1608,18 @@ public:
           _runtime, _meta, std::move(copy), _sr, std::move(logger), relay);
     }
 
+    // Held as a plain member rather than read back through _preinitialized,
+    // which is a foreign_ptr: this is asked on whichever shard owns the
+    // module cache, and a size that never changes after the compile does not
+    // need a cross-shard hop to be read.
+    size_t image_bytes() const final { return _image_bytes; }
+
 private:
     wasmtime_runtime* _runtime;
     ss::foreign_ptr<ss::lw_shared_ptr<preinitialized_instance>> _preinitialized;
     model::transform_metadata _meta;
     schema::registry* _sr;
+    size_t _image_bytes;
 };
 
 wasmtime_runtime::wasmtime_runtime(
@@ -1896,7 +1905,8 @@ ss::future<ss::shared_ptr<factory>> wasmtime_runtime::make_factory(
       this,
       std::move(meta),
       ss::make_foreign(std::move(preinitialized)),
-      _sr.get());
+      _sr.get(),
+      memory_usage_size);
 }
 
 wasm_engine_t* wasmtime_runtime::engine() const { return _engine.get(); }
