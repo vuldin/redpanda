@@ -222,6 +222,30 @@ public:
         _ntp_index.clear();
     }
 
+    // Give every processor for this transform its one bounded chance to
+    // finish in-flight work, before a caller erases them. Mirrors
+    // drain_by_ntp, including skipping hint-placed processors: those do not
+    // follow leadership and have no in-flight read to finish.
+    ss::future<bool> drain_by_id(
+      model::transform_id target_id, model::timeout_clock::time_point d) {
+        auto it = _table.lower_bound(std::make_pair(target_id, min_ntp));
+        ss::chunked_fifo<ss::future<bool>> drains;
+        while (it != _table.end()) {
+            auto [id, ntp] = it->first;
+            if (id != target_id) {
+                break;
+            }
+            if (!it->second.hint_placed()) {
+                drains.push_back(it->second.processor()->drain(d));
+            }
+            ++it;
+            co_await ss::coroutine::maybe_yield();
+        }
+        auto results = co_await ss::when_all_succeed(
+          drains.begin(), drains.end());
+        co_return std::ranges::all_of(results, std::identity{});
+    }
+
     ss::future<> erase_by_id(model::transform_id target_id) {
         // Take advantage that the _table is sorted by id, then ntp.
         // we're looking for a range of ids in _table.
@@ -550,6 +574,35 @@ ss::future<> manager<ClockType>::drain_ntp(model::ntp ntp) {
     }
     co_await _processors->drain_by_ntp(
       std::move(ntp), model::timeout_clock::now() + *timeout);
+}
+
+template<typename ClockType>
+ss::future<> manager<ClockType>::rebuild_transform(model::transform_id id) {
+    // Drain first so the capability change does not cost duplicate output.
+    // A processor torn down mid-flight has its read-but-uncommitted work
+    // reprocessed by the next owner, and since each start takes a fresh
+    // producer_id that reprocessing is visible downstream as duplicates. A
+    // security action should not have to pay for that.
+    auto timeout = ::config::shard_local_cfg()
+                     .data_transforms_graceful_transfer_timeout_ms.value();
+    if (timeout.has_value()) {
+        auto drained = co_await _processors->drain_by_id(
+          id, model::timeout_clock::now() + *timeout);
+        if (!drained) {
+            // Not fatal, and deliberately not a reason to skip the rebuild:
+            // leaving a processor running with a capability the allowlist no
+            // longer grants it would be far worse than some duplicate output.
+            vlog(
+              tlog.warn,
+              "transform {} did not finish in-flight work before its "
+              "capabilities were reapplied; the remainder is reprocessed",
+              id);
+        }
+    }
+    // Reuses the redeploy path, which erases every processor for this
+    // transform and starts fresh ones - and a fresh engine is what picks up
+    // the new capability set.
+    co_await handle_plugin_change(id);
 }
 
 template<typename ClockType>

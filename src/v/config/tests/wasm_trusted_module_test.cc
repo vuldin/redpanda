@@ -142,3 +142,53 @@ SEASTAR_THREAD_TEST_CASE(has_capability_does_not_grant_by_adjacency) {
     BOOST_CHECK(!m.has_capability(config::wasm_capability::shared_memory));
     BOOST_CHECK(!m.has_capability(config::wasm_capability::relay_consumer));
 }
+
+// trusted_grant_changed is what decides whether a RUNNING transform gets torn
+// down and rebuilt, so a false negative leaves a module holding a capability
+// the allowlist no longer grants it. That is the failure these cover.
+SEASTAR_THREAD_TEST_CASE(grant_change_detects_both_directions) {
+    std::vector<config::wasm_trusted_module> none;
+    std::vector<config::wasm_trusted_module> granted{net_entry()};
+
+    // Granting and revoking both have to register.
+    BOOST_CHECK(config::trusted_grant_changed(none, granted, valid_sha));
+    BOOST_CHECK(config::trusted_grant_changed(granted, none, valid_sha));
+    // And an unrelated edit must not drag every transform through a rebuild.
+    BOOST_CHECK(!config::trusted_grant_changed(granted, granted, valid_sha));
+    BOOST_CHECK(!config::trusted_grant_changed(none, none, valid_sha));
+}
+
+SEASTAR_THREAD_TEST_CASE(grant_change_sees_edits_inside_an_entry) {
+    std::vector<config::wasm_trusted_module> before{net_entry()};
+
+    // Narrowing allowed_targets reduces what the module may reach just as
+    // surely as removing the capability. Comparing only the capability list
+    // would miss this and leave the module talking to a host the allowlist no
+    // longer names.
+    auto narrowed = net_entry();
+    narrowed.allowed_targets.clear();
+    narrowed.allowed_targets.emplace_back("somewhere.else", 443);
+    BOOST_CHECK(config::trusted_grant_changed(before, {narrowed}, valid_sha));
+
+    // Adding a capability counts too - the module should be rebuilt so it can
+    // actually use what it was just granted.
+    auto widened = net_entry();
+    widened.capabilities.push_back(config::wasm_capability::shared_memory);
+    BOOST_CHECK(config::trusted_grant_changed(before, {widened}, valid_sha));
+
+    // A change to a DIFFERENT binary must not rebuild this one.
+    auto other = net_entry();
+    other.sha256_hex = ss::sstring(
+      "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+    std::vector<config::wasm_trusted_module> after{net_entry(), other};
+    BOOST_CHECK(!config::trusted_grant_changed(before, after, valid_sha));
+}
+
+SEASTAR_THREAD_TEST_CASE(grant_change_ignores_a_binary_with_no_digest) {
+    // A transform with no recorded digest could never have matched the
+    // allowlist, so it has nothing to lose and must not be rebuilt on every
+    // unrelated allowlist edit.
+    std::vector<config::wasm_trusted_module> granted{net_entry()};
+    BOOST_CHECK(!config::trusted_grant_changed({}, granted, ""));
+    BOOST_CHECK(!config::trusted_grant_changed(granted, {}, ""));
+}

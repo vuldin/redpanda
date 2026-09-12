@@ -182,6 +182,7 @@ class processor_tracker : public processor_factory {
     public:
         tracked_processor(
           std::function<void(lifecycle_status)> cb,
+          std::function<void(model::timeout_clock::time_point)> drain_cb,
           model::transform_id id,
           model::ntp ntp,
           model::transform_metadata meta,
@@ -198,7 +199,8 @@ class processor_tracker : public processor_factory {
               std::make_unique<testing::fake_offset_tracker>(),
               p,
               ml)
-          , _track_fn(std::move(cb)) {
+          , _track_fn(std::move(cb))
+          , _drain_fn(std::move(drain_cb)) {
             _track_fn(lifecycle_status::created);
         }
         tracked_processor(const tracked_processor&) = delete;
@@ -229,6 +231,9 @@ class processor_tracker : public processor_factory {
         drain(model::timeout_clock::time_point deadline) override {
             ++_drains;
             _last_deadline = deadline;
+            // Reported outward as well, so the count outlives this object: a
+            // rebuild destroys the processor it has just drained.
+            _drain_fn(deadline);
             co_return true;
         }
         size_t drains() const { return _drains; }
@@ -241,6 +246,7 @@ class processor_tracker : public processor_factory {
 
     private:
         std::function<void(lifecycle_status)> _track_fn;
+        std::function<void(model::timeout_clock::time_point)> _drain_fn;
         size_t _drains = 0;
         std::optional<model::timeout_clock::time_point> _last_deadline;
     };
@@ -263,6 +269,9 @@ public:
           [this, id, ntp](lifecycle_status change) {
               handle_lifecycle_change(id, ntp, change);
           },
+          [this, ntp](model::timeout_clock::time_point deadline) {
+              record_drain(ntp, deadline);
+          },
           id,
           ntp,
           meta,
@@ -275,24 +284,29 @@ public:
         co_return std::move(p);
     }
 
-    // Total drains across every processor currently live for this ntp.
+    // Cumulative drains for this ntp, counting processors that have since
+    // been destroyed.
+    //
+    // Deliberately NOT a sum over the live processors: rebuilding a transform
+    // drains a processor and then replaces it, so by the time a test looks,
+    // the processor that was drained is gone and its replacement reports
+    // zero - a working drain would be indistinguishable from no drain.
     size_t drains_for(const model::ntp& ntp) const {
-        size_t n = 0;
-        for (const auto& [key, proc] : _live) {
-            if (key.second == ntp) {
-                n += proc->drains();
-            }
-        }
-        return n;
+        auto it = _drains.find(ntp);
+        return it == _drains.end() ? 0 : it->second;
     }
     std::optional<model::timeout_clock::time_point>
     last_drain_deadline(const model::ntp& ntp) const {
-        for (const auto& [key, proc] : _live) {
-            if (key.second == ntp && proc->last_deadline().has_value()) {
-                return proc->last_deadline();
-            }
+        auto it = _last_deadlines.find(ntp);
+        if (it == _last_deadlines.end()) {
+            return std::nullopt;
         }
-        return std::nullopt;
+        return it->second;
+    }
+    void record_drain(
+      const model::ntp& ntp, model::timeout_clock::time_point deadline) {
+        ++_drains[ntp];
+        _last_deadlines.insert_or_assign(ntp, deadline);
     }
 
     absl::flat_hash_map<
@@ -329,6 +343,9 @@ private:
       std::pair<model::transform_id, model::ntp>,
       tracked_processor*>
       _live;
+    absl::flat_hash_map<model::ntp, size_t> _drains;
+    absl::flat_hash_map<model::ntp, model::timeout_clock::time_point>
+      _last_deadlines;
 };
 
 using status_map = absl::flat_hash_map<std::string, lifecycle_status>;
@@ -460,6 +477,17 @@ public:
         auto it = _hooks.find(parse_ntp(np_str));
         ASSERT_TRUE(it != _hooks.end()) << "no quiesce hook installed";
         it->second().get();
+    }
+    // Stands in for the trust-registry watcher, which lives in
+    // transform::service - a type no test can construct. What the watcher
+    // decides is unit tested in config (trusted_grant_changed); this covers
+    // what it then does.
+    void rebuild_transform(std::string_view name) {
+        auto meta = parse_transform(name);
+        auto existing = _registry->lookup_by_name(meta.name);
+        ASSERT_TRUE(existing.has_value()) << "no such transform: " << name;
+        _manager->rebuild_transform(existing->first).get();
+        drain_queue();
     }
     size_t drains_for(std::string_view np_str) {
         return _tracker->drains_for(parse_ntp(np_str));
@@ -901,6 +929,76 @@ TEST_F(TransformManagerTest, DeleteDuringBackoff) {
     ss::manual_clock::advance(1s);
     drain_queue();
     EXPECT_THAT(status(), status_is("foo->bar/1", lifecycle_status::destroyed));
+}
+
+TEST_F(TransformManagerTest, RebuildDrainsBeforeReplacingTheProcessor) {
+    // Rebuilding is how a changed capability grant actually reaches a running
+    // module: the wasm engine reads the allowlist in its constructor, so only
+    // a fresh engine picks up the new grant. Draining first is what keeps that
+    // from costing duplicate output - a processor torn down mid-flight has its
+    // read-but-uncommitted work reprocessed by the next owner, and each start
+    // takes a fresh producer_id, so the reprocessing is visible downstream.
+    set_graceful_transfer_timeout(std::chrono::seconds(5));
+    become_leader("foo/1");
+    deploy_transform("foo->bar");
+    drain_queue();
+    ASSERT_EQ(drains_for("foo/1"), 0u);
+
+    rebuild_transform("foo->bar");
+
+    EXPECT_EQ(drains_for("foo/1"), 1u)
+      << "the processor was replaced without finishing in-flight work";
+    // Bounded by the configured budget, like every other drain - an unbounded
+    // one would hold a capability change open indefinitely.
+    auto deadline = last_drain_deadline("foo/1");
+    ASSERT_TRUE(deadline.has_value());
+    EXPECT_LE(*deadline, model::timeout_clock::now() + std::chrono::seconds(5));
+    // And it is running again afterwards. A rebuild that drained but never
+    // came back would silently stop the transform, which is worse than the
+    // stale-capability bug it exists to fix.
+    EXPECT_THAT(status(), status_is("foo->bar/1", lifecycle_status::active));
+}
+
+TEST_F(TransformManagerTest, RebuildStillReplacesWithNoDrainBudget) {
+    // The budget is opt-in and unset by default, so the common case is a
+    // rebuild with no drain. Revocation must not depend on the drain being
+    // configured: leaving a module running with a capability the allowlist no
+    // longer grants is the failure that matters most here.
+    become_leader("foo/1");
+    deploy_transform("foo->bar");
+    drain_queue();
+
+    rebuild_transform("foo->bar");
+
+    EXPECT_EQ(drains_for("foo/1"), 0u)
+      << "drained despite no configured budget";
+    EXPECT_THAT(status(), status_is("foo->bar/1", lifecycle_status::active));
+}
+
+TEST_F(TransformManagerTest, RebuildRestartsEveryPartitionOfTheTransform) {
+    // Trust is keyed on the binary, so a grant change affects every processor
+    // of that transform, not just one partition. Rebuilding only the first
+    // would leave the others running with the old grant - and with a single
+    // partition deployed, which is the usual test shape, that bug is
+    // invisible.
+    set_graceful_transfer_timeout(std::chrono::seconds(5));
+    become_leader("foo/1");
+    become_leader("foo/2");
+    deploy_transform("foo->bar");
+    drain_queue();
+
+    rebuild_transform("foo->bar");
+
+    EXPECT_EQ(drains_for("foo/1"), 1u);
+    EXPECT_EQ(drains_for("foo/2"), 1u)
+      << "only some partitions of the transform were rebuilt";
+    EXPECT_THAT(
+      status(),
+      status_is(
+        "foo->bar/1",
+        lifecycle_status::active,
+        "foo->bar/2",
+        lifecycle_status::active));
 }
 
 } // namespace transform

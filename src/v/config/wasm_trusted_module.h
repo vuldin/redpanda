@@ -109,6 +109,20 @@ consteval std::string_view detail::property_type_name<wasm_trusted_module>() {
 const wasm_trusted_module* find_trusted_module(
   const std::vector<wasm_trusted_module>& trusted, std::string_view sha256_hex);
 
+// Did this binary's grant change between two versions of the allowlist?
+//
+// Pure, and deliberately separated from the code that acts on the answer: the
+// acting side lives in transform::service, which no test can construct, while
+// the interesting cases are all here. Absent-to-present and present-to-absent
+// both count, and so does any change WITHIN an entry - a narrowed
+// allowed_targets list reduces what a module may reach just as surely as
+// dropping the capability does, and missing that would leave a module talking
+// to a host the allowlist no longer names.
+bool trusted_grant_changed(
+  const std::vector<wasm_trusted_module>& before,
+  const std::vector<wasm_trusted_module>& after,
+  std::string_view sha256_hex);
+
 template<class InputIt>
 std::optional<ss::sstring>
 validate_wasm_trusted_modules(const InputIt first, const InputIt last) {

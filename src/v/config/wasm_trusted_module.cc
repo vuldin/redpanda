@@ -107,6 +107,19 @@ const wasm_trusted_module* find_trusted_module(
     return it != trusted.end() ? &*it : nullptr;
 }
 
+bool trusted_grant_changed(
+  const std::vector<wasm_trusted_module>& before,
+  const std::vector<wasm_trusted_module>& after,
+  std::string_view sha256_hex) {
+    const auto* b = find_trusted_module(before, sha256_hex);
+    const auto* a = find_trusted_module(after, sha256_hex);
+    if (b == nullptr) {
+        return a != nullptr;
+    }
+    // Whole-entry comparison, not just the capability list - see the header.
+    return a == nullptr || !(*a == *b);
+}
+
 bool wasm_trusted_module::has_capability(wasm_capability c) const {
     return std::ranges::find(capabilities, c) != capabilities.end();
 }
