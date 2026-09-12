@@ -19,10 +19,11 @@
 namespace transform {
 
 trusted_module_reconciler::trusted_module_reconciler(
-  transforms_fn transforms, rebuild_fn rebuild)
+  transforms_fn transforms, invalidate_fn invalidate, rebuild_fn rebuild)
   : _binding(config::shard_local_cfg().wasm_trusted_modules.bind())
   , _applied(_binding())
   , _transforms(std::move(transforms))
+  , _invalidate(std::move(invalidate))
   , _rebuild(std::move(rebuild)) {}
 
 void trusted_module_reconciler::start() {
@@ -65,6 +66,10 @@ ss::future<> trusted_module_reconciler::reconcile() {
           "wasm_trusted_modules changed for transform {}; rebuilding it so "
           "the change takes effect",
           id);
+        // Before the rebuild, not after: the rebuild's restart is what asks
+        // for a factory, and it has to miss the cache to compile under the
+        // new grant.
+        _invalidate(meta);
         co_await _rebuild(id);
         co_await ss::coroutine::maybe_yield();
     }

@@ -75,6 +75,9 @@ public:
     void make_reconciler() {
         _r = std::make_unique<trusted_module_reconciler>(
           [this] { return _transforms; },
+          [this](const model::transform_metadata& meta) {
+              _invalidated.push_back(meta.binary_sha256);
+          },
           [this](model::transform_id id) {
               _rebuilt.push_back(id);
               return ss::now();
@@ -95,10 +98,12 @@ public:
 
     trusted_module_reconciler& reconciler() { return *_r; }
     const std::vector<model::transform_id>& rebuilt() const { return _rebuilt; }
+    const std::vector<ss::sstring>& invalidated() const { return _invalidated; }
 
 private:
     trusted_module_reconciler::transform_map _transforms;
     std::vector<model::transform_id> _rebuilt;
+    std::vector<ss::sstring> _invalidated;
     std::unique_ptr<trusted_module_reconciler> _r;
 };
 
@@ -196,6 +201,46 @@ TEST_F(ReconcilerTest, ASecondReconcileDiffsAgainstWhatWasApplied) {
     reconciler().reconcile().get();
     EXPECT_EQ(rebuilt().size(), 1u)
       << "the same revocation was applied twice; the snapshot did not advance";
+}
+
+TEST_F(ReconcilerTest, InvalidatesTheCompiledModuleBeforeRebuilding) {
+    // Rebuilding alone does not revoke anything. The factory cache is
+    // process-wide and holds weak references, so a compiled module stays
+    // alive while any shard's processor holds it - and this reconciler is per
+    // shard, rebuilding only its own. A shard could therefore drain, erase
+    // and restart its processors and have the restart handed back the
+    // still-live OLD-GRANT module, because a peer shard had not reconciled
+    // yet. Silent: nothing fails, the transform simply keeps a capability the
+    // allowlist no longer gives it.
+    //
+    // Ordering matters as much as the call. The restart is what asks for a
+    // factory, so invalidation has to happen first or the restart hits a
+    // cache that is still warm.
+    set_allowlist({entry(sha_a)});
+    add_transform(model::transform_id(1), sha_a);
+    make_reconciler();
+
+    set_allowlist({});
+    reconciler().reconcile().get();
+
+    EXPECT_EQ(invalidated(), std::vector<ss::sstring>{ss::sstring(sha_a)})
+      << "the compiled module was not discarded, so a restart could reuse it";
+    EXPECT_EQ(
+      rebuilt(), std::vector<model::transform_id>{model::transform_id(1)});
+}
+
+TEST_F(ReconcilerTest, DoesNotInvalidateAnUnaffectedBinary) {
+    // Invalidating costs a recompile on the next start, so an edge that does
+    // not touch a running binary must not trigger one.
+    set_allowlist({entry(sha_a)});
+    add_transform(model::transform_id(1), sha_a);
+    make_reconciler();
+
+    set_allowlist({entry(sha_a), entry(sha_b)});
+    reconciler().reconcile().get();
+
+    EXPECT_TRUE(invalidated().empty())
+      << "an unrelated allowlist edit forced a recompile";
 }
 
 } // namespace transform
