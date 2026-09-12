@@ -94,6 +94,24 @@ public:
       get_or_create_factory(model::transform_metadata, binary_loader_fn);
 
     /**
+     * Discard the cached factory for this deploy offset, so the next caller
+     * compiles a fresh one instead of reusing it.
+     *
+     * Exists because a factory's capability grants are baked in when it is
+     * compiled, so revoking a grant has no effect on a module that is already
+     * compiled. Dropping the cache entry is what makes the next compile pick
+     * the revocation up. Engines already built keep running on the old
+     * factory - they hold their own strong reference - which is deliberate:
+     * tearing them down here would turn a capability change into an
+     * unannounced data-plane interruption. What matters is that a processor
+     * RESTART does not silently inherit the old grants.
+     *
+     * Safe to call for an offset that is not cached, since the caller is a
+     * config watch that does not know what this broker has compiled.
+     */
+    void invalidate_factory(model::offset);
+
+    /**
      * True while some caller holds a factory-creation lock, i.e. a fetch or a
      * compile is in flight somewhere on this broker.
      *
@@ -129,6 +147,11 @@ private:
       _factory_creation_mu_map;
     std::unique_ptr<runtime> _underlying;
     absl::btree_map<model::offset, ss::weak_ptr<cached_factory>> _factory_cache;
+    // Bumped by every invalidate_factory. A creation in flight captures this
+    // before it suspends and re-checks it before caching, so an invalidation
+    // that lands mid-fetch or mid-compile is not immediately undone by the
+    // insert of a factory that was linked under the grants being revoked.
+    uint64_t _cache_epoch = 0;
     ss::sharded<engine_cache> _engine_caches;
     ss::lowres_clock::duration _gc_interval;
     ss::timer<ss::lowres_clock> _gc_timer;
