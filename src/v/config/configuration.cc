@@ -281,6 +281,28 @@ configuration::configuration()
       },
       10_MiB,
       {.min = 1_MiB, .max = 128_MiB})
+  , data_transforms_max_resident_factories(
+      *this,
+      "data_transforms_max_resident_factories",
+      "How many compiled data transform (Wasm) modules this broker may keep "
+      "in memory while no transform is using them, so that a transform "
+      "starting later - typically on the broker a partition has just moved "
+      "to - finds its module already compiled instead of fetching and "
+      "compiling it at that moment. A module is kept on every broker that "
+      "replicates the transform's input topic. Zero, the default, disables "
+      "this and gives back anything already held. Note this is a "
+      "process-wide count, not per core, unlike "
+      "`data_transforms_max_instances_per_core`. Sizing it is a "
+      "multiplication the operator has to do, because only compiling a "
+      "module reveals its size: use `wasm_binary_resident_memory_usage` "
+      "divided by `wasm_binary_resident_factories` to get the cost per "
+      "module for your own binaries. If the limit is reached and every "
+      "module held is in use, a module that would otherwise be kept is "
+      "refused rather than displacing one that is being used, and "
+      "`wasm_binary_resident_admission_failures` counts that.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      0,
+      {.min = 0, .max = 1024})
   , data_transforms_logging_buffer_capacity_bytes(
       *this,
       "data_transforms_logging_buffer_capacity_bytes",

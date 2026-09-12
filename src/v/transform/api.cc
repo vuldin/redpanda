@@ -38,6 +38,7 @@
 #include "raft/consensus.h"
 #include "relay/relay_service.h"
 #include "ssx/future-util.h"
+#include "transform/factory_residency.h"
 #include "transform/logging/log_manager.h"
 #include "transform/logging/rpc_client.h"
 #include "transform/relay_offset_tracker.h"
@@ -73,6 +74,42 @@
 namespace transform {
 
 namespace {
+
+// The shard that owns the process-wide wasm module cache, and therefore the
+// only shard allowed to compile, invalidate or keep a module resident.
+constexpr ss::shard_id creation_shard = 0;
+
+// Hands transform::factory_residency the module cache. Every method is a
+// forward, which is the point: residency takes an interface so that its own
+// logic is reachable from a test, and everything that is merely wiring - and
+// so cannot be tested here - collects in this one adapter.
+class runtime_factory_store final : public factory_store {
+public:
+    // Taken as a callback rather than reaching into the service, because the
+    // fetch it needs is the service's own RPC client.
+    using pin_fn
+      = ss::noncopyable_function<ss::future<bool>(model::transform_metadata)>;
+
+    runtime_factory_store(wasm::caching_runtime* runtime, pin_fn pin)
+      : _runtime(runtime)
+      , _pin(std::move(pin)) {}
+
+    ss::future<bool> pin(model::transform_metadata meta) final {
+        return _pin(std::move(meta));
+    }
+    void unpin(model::offset offset) final { _runtime->unpin_factory(offset); }
+    std::vector<model::offset> resident() const final {
+        return _runtime->resident_factories();
+    }
+    bool busy() const final { return _runtime->is_creating_factory(); }
+    void set_max_resident(size_t max) final {
+        _runtime->set_max_resident_factories(max);
+    }
+
+private:
+    wasm::caching_runtime* _runtime;
+    pin_fn _pin;
+};
 constexpr auto wasm_binary_timeout = std::chrono::seconds(3);
 constexpr auto metadata_timeout = std::chrono::seconds(1);
 
@@ -934,7 +971,6 @@ void service::register_notifications() {
           // Shard 0 owns the factory cache, so the invalidation has to land
           // there regardless of which shard noticed the allowlist change -
           // and every shard notices, since this reconciler is per shard.
-          constexpr ss::shard_id creation_shard = 0;
           if (ss::this_shard_id() == creation_shard) {
               _runtime->invalidate_factory(meta.source_ptr);
               return;
@@ -952,6 +988,26 @@ void service::register_notifications() {
       });
     _trusted_modules->start();
 
+    // Creation shard only: the module cache is process-wide and lives there,
+    // so a per-shard sweep would be several sweeps contending over one table.
+    // The wanted set is derived from cluster-wide metadata, which every shard
+    // has, so one sweep can see the whole picture without a fan-out.
+    if (ss::this_shard_id() == creation_shard) {
+        _factory_store = std::make_unique<runtime_factory_store>(
+          _runtime, [this](model::transform_metadata meta) {
+              return pin_factory(std::move(meta));
+          });
+        _residency = std::make_unique<factory_residency<ss::lowres_clock>>(
+          _factory_store.get(),
+          config::shard_local_cfg()
+            .data_transforms_max_resident_factories.bind(),
+          [this] { return _plugin_frontend->local().all_transforms(); },
+          [this](const model::topic_namespace& tp_ns) {
+              return replicates(tp_ns);
+          });
+        _residency->start();
+    }
+
     auto plugin_notif_id = _plugin_frontend->local().register_for_updates(
       [this](model::transform_id id) { _manager->on_plugin_change(id); });
     _notification_cleanups.emplace_back([this, plugin_notif_id] {
@@ -963,10 +1019,12 @@ void service::register_notifications() {
     using notify_current_state
       = cluster::partition_change_notifier::notify_current_state;
     using partition_state = cluster::partition_change_notifier::partition_state;
+    using notification_type
+      = cluster::partition_change_notifier::notification_type;
     auto partition_notif_id
       = _partition_change_notifier->register_partition_notifications(
         [this](
-          cluster::partition_change_notifier::notification_type,
+          cluster::partition_change_notifier::notification_type type,
           const model::ntp& ntp,
           std::optional<partition_state> state) {
             if (ntp.ns != model::kafka_namespace) {
@@ -975,6 +1033,21 @@ void service::register_notifications() {
             ntp_leader is_leader = state && state->is_leader ? ntp_leader::yes
                                                              : ntp_leader::no;
             _manager->on_leadership_change(ntp, is_leader);
+            // The notification type used to be discarded here, because
+            // everything downstream only cared whether this shard leads the
+            // partition. Residency follows the replica set instead, and only
+            // these two can change it: a leadership change cannot add or
+            // remove a replica, and re-deriving on every one of them would
+            // sweep continuously on a busy cluster to no effect.
+            switch (type) {
+            case notification_type::partition_replica_assigned:
+            case notification_type::partition_replica_unassigned:
+                poke_residency();
+                break;
+            case notification_type::leadership_change:
+            case notification_type::partition_properties_change:
+                break;
+            }
         },
         notify_current_state::yes);
     _notification_cleanups.emplace_back([this, partition_notif_id] {
@@ -987,6 +1060,11 @@ void service::unregister_notifications() { _notification_cleanups.clear(); }
 
 ss::future<> service::stop() {
     unregister_notifications();
+    // BEFORE the gate closes, because a sweep in flight may be fetching a
+    // wasm binary through this service's own rpc client.
+    if (_residency) {
+        co_await _residency->stop();
+    }
     co_await _gate.close();
     // BEFORE the manager: a reconcile in flight is calling
     // manager::rebuild_transform, so stopping the manager first would leave it
@@ -1156,10 +1234,73 @@ service::create_engine(model::ntp ntp, model::transform_metadata meta) {
       std::move(ntp), std::move(logger));
 }
 
+ss::noncopyable_function<ss::future<std::optional<model::wasm_binary_iobuf>>()>
+service::binary_loader(model::transform_name name, model::offset source) {
+    return [this,
+            name = std::move(name),
+            source]() -> ss::future<std::optional<model::wasm_binary_iobuf>> {
+        auto result = co_await _rpc_client->local().load_wasm_binary(
+          source, wasm_binary_timeout);
+        if (result.has_error()) {
+            vlog(
+              tlog.warn,
+              "unable to load wasm binary for transform {}: {}",
+              name,
+              cluster::error_category().message(int(result.error())));
+            co_return std::nullopt;
+        }
+        co_return std::move(result).value();
+    };
+}
+
+ss::future<bool> service::pin_factory(model::transform_metadata meta) {
+    vassert(
+      ss::this_shard_id() == creation_shard,
+      "residency runs on the shard that owns the module cache");
+    auto name = meta.name;
+    auto source = meta.source_ptr;
+    return _runtime->pin_factory(
+      std::move(meta), binary_loader(std::move(name), source));
+}
+
+bool service::replicates(const model::topic_namespace& tp_ns) const {
+    // topic_table holds cluster-wide metadata on every shard, so this is a
+    // local lookup rather than a fan-out across shards. Assignment is also
+    // the earlier signal than anything partition-manager based: it is true as
+    // soon as the controller decides the replica belongs to this broker.
+    auto assignments = _topic_table->local().get_topic_assignments(tp_ns);
+    if (!assignments) {
+        return false;
+    }
+    for (const auto& [_, assignment] : *assignments) {
+        for (const auto& replica : assignment.replicas) {
+            if (replica.node_id == _self) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void service::poke_residency() {
+    if (ss::this_shard_id() == creation_shard) {
+        if (_residency) {
+            _residency->poke();
+        }
+        return;
+    }
+    ssx::spawn_with_gate(_gate, [this] {
+        return container().invoke_on(creation_shard, [](service& s) {
+            if (s._residency) {
+                s._residency->poke();
+            }
+        });
+    });
+}
+
 ss::future<
   ss::optimized_optional<ss::foreign_ptr<ss::shared_ptr<wasm::factory>>>>
 service::get_factory(model::transform_metadata meta) {
-    constexpr ss::shard_id creation_shard = 0;
     // TODO(rockwood): Consider caching factories core local (or moving that
     // optimization into the caching runtime).
     if (ss::this_shard_id() != creation_shard) {
@@ -1178,22 +1319,7 @@ service::get_factory(model::transform_metadata meta) {
     auto name = meta.name;
     auto source = meta.source_ptr;
     auto factory = co_await _runtime->get_or_create_factory(
-      std::move(meta),
-      [this,
-       name = std::move(name),
-       source]() -> ss::future<std::optional<model::wasm_binary_iobuf>> {
-          auto result = co_await _rpc_client->local().load_wasm_binary(
-            source, wasm_binary_timeout);
-          if (result.has_error()) {
-              vlog(
-                tlog.warn,
-                "unable to load wasm binary for transform {}: {}",
-                name,
-                cluster::error_category().message(int(result.error())));
-              co_return std::nullopt;
-          }
-          co_return std::move(result).value();
-      });
+      std::move(meta), binary_loader(std::move(name), source));
     if (!factory) {
         co_return ss::foreign_ptr<ss::shared_ptr<wasm::factory>>(nullptr);
     }
