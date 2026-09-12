@@ -930,6 +930,23 @@ void service::register_notifications() {
     // only by reading it.
     _trusted_modules = std::make_unique<trusted_module_reconciler>(
       [this] { return _plugin_frontend->local().all_transforms(); },
+      [this](const model::transform_metadata& meta) {
+          // Shard 0 owns the factory cache, so the invalidation has to land
+          // there regardless of which shard noticed the allowlist change -
+          // and every shard notices, since this reconciler is per shard.
+          constexpr ss::shard_id creation_shard = 0;
+          if (ss::this_shard_id() == creation_shard) {
+              _runtime->invalidate_factory(meta.source_ptr);
+              return;
+          }
+          auto source = meta.source_ptr;
+          ssx::spawn_with_gate(_gate, [this, source] {
+              return container().invoke_on(
+                creation_shard, [source](service& s) {
+                    s._runtime->invalidate_factory(source);
+                });
+          });
+      },
       [this](model::transform_id id) {
           return _manager->rebuild_transform(id);
       });

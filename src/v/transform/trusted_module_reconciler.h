@@ -43,8 +43,9 @@ namespace transform {
  * moment, and whether every affected transform is dispatched rather than just
  * the first.
  *
- * Both collaborators are injected for the same reason: a test supplies a
- * transform list and records rebuilds, with no cluster involved.
+ * All three collaborators are injected for the same reason: a test supplies a
+ * transform list and records invalidations and rebuilds, with no cluster
+ * involved.
  */
 class trusted_module_reconciler {
 public:
@@ -53,11 +54,31 @@ public:
     /// Every transform this shard knows about. Called per reconcile, so a
     /// transform deployed after start-up is seen without extra bookkeeping.
     using transforms_fn = ss::noncopyable_function<transform_map()>;
+    /**
+     * Discard any compiled artifact for this binary, so the rebuild below
+     * compiles a fresh one instead of reusing a module that was linked under
+     * the old grant.
+     *
+     * Necessary because rebuilding alone is not enough. The factory cache is
+     * process-wide and holds weak references, so a compiled module survives
+     * while ANY shard's processor holds it - and this reconciler is per
+     * shard, rebuilding only its own. Without this, a shard can drain, erase
+     * and restart its processors and have the restart handed back the
+     * still-live old-grant module, because a peer shard had not reconciled
+     * yet. Nothing fails; the transform just keeps a capability the allowlist
+     * no longer gives it.
+     *
+     * Injected, like the other two, so this class need not know that a wasm
+     * factory cache - or a residency pin - is what is holding the module
+     * alive.
+     */
+    using invalidate_fn
+      = ss::noncopyable_function<void(const model::transform_metadata&)>;
     /// Drain and rebuild one transform, so it comes back under the new grant.
     using rebuild_fn
       = ss::noncopyable_function<ss::future<>(model::transform_id)>;
 
-    trusted_module_reconciler(transforms_fn, rebuild_fn);
+    trusted_module_reconciler(transforms_fn, invalidate_fn, rebuild_fn);
 
     /// Installs the config watch. Until this is called a change to the
     /// allowlist has no effect on anything already running.
@@ -85,6 +106,7 @@ private:
     // replaced by, the binding's current value on each reconcile.
     std::vector<config::wasm_trusted_module> _applied;
     transforms_fn _transforms;
+    invalidate_fn _invalidate;
     rebuild_fn _rebuild;
     size_t _reconciles = 0;
     ss::gate _gate;
