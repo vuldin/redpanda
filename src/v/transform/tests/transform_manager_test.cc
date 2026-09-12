@@ -732,7 +732,12 @@ TEST_F(TransformManagerTest, AFailedCreateRecordsNoBringup) {
       << "a failed create was recorded as a bring-up";
     // The create measurement, by contrast, SHOULD record a failed attempt -
     // a binary fetch that timed out is exactly the sample worth having.
-    EXPECT_EQ(last_create_create_samples(), uint64_t(1))
+    //
+    // Not an exact count: the probe now outlives the attempt that recorded
+    // into it, so repeated attempts accumulate rather than each starting a
+    // fresh probe. How many attempts one drain produces is a property of the
+    // manager's retry scheduling, not of this metric.
+    EXPECT_GE(last_create_create_samples(), uint64_t(1))
       << "a failed create was not timed";
 }
 
@@ -999,6 +1004,67 @@ TEST_F(TransformManagerTest, RebuildRestartsEveryPartitionOfTheTransform) {
         lifecycle_status::active,
         "foo->bar/2",
         lifecycle_status::active));
+}
+
+TEST_F(TransformManagerTest, KeepsATransformsMetricsPastItsLastProcessor) {
+    // Probes used to be owned by the processor-table entry, so a transform's
+    // metrics disappeared exactly when an operator would go looking for them:
+    // the moment its last processor on this shard did. A leadership move away
+    // from this broker is the common way that happens.
+    //
+    // Observed through the create histogram rather than the startup one: the
+    // fake processor here cancels the bring-up clock it is handed, so startup
+    // never records in this fixture. Compared rather than counted exactly,
+    // because how many creates one drain produces is the manager's business.
+    become_leader("foo/1");
+    deploy_transform("foo->bar");
+    drain_queue();
+    auto before = last_create_create_samples();
+    ASSERT_GT(before, uint64_t(0)) << "nothing was recorded to begin with";
+
+    // Leadership moves away, and every processor for this transform on this
+    // shard is torn down with it.
+    lose_leadership("foo/1");
+    drain_queue();
+
+    // Then it comes back. A retained probe carries its history forward; one
+    // owned by the processor-table entry died with that entry, so this
+    // bring-up would be recording into a fresh probe counting from zero.
+    become_leader("foo/1");
+    drain_queue();
+
+    EXPECT_GT(last_create_create_samples(), before)
+      << "the transform's metrics restarted when its last processor went";
+}
+
+TEST_F(TransformManagerTest, KeepsTheSampleFromACreateThatNeverProduced) {
+    // The create histogram's documented promise - that it records failed
+    // attempts - was only true in principle. A failed create returns without
+    // inserting a processor-table entry, and the entry was what owned the
+    // probe, so the sample was written into a probe that was destroyed before
+    // anything could scrape it, unless another partition of the same
+    // transform happened to be running already.
+    //
+    // This is the case most likely to matter in production: the binary fetch
+    // is an RPC with a 3s timeout, and a broker that cannot reach the
+    // wasm_binaries partition fails repeatedly while reporting nothing.
+    fail_creates(true);
+    become_leader("foo/1");
+    deploy_transform("foo->bar");
+    drain_queue();
+    auto after_failures = last_create_create_samples();
+    ASSERT_GT(after_failures, uint64_t(0)) << "a failed create was not timed";
+
+    // The manager retries on a delay. The retry succeeds, and finds what the
+    // failed attempts recorded still counted - whereas a probe owned by the
+    // processor-table entry never survived to be added to, so every attempt
+    // read as the first one.
+    fail_creates(false);
+    ss::manual_clock::advance(30s);
+    drain_queue();
+
+    EXPECT_GT(last_create_create_samples(), after_failures)
+      << "the failed attempts' samples went away with their probe";
 }
 
 } // namespace transform
