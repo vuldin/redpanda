@@ -12,6 +12,7 @@
 #pragma once
 
 #include "absl/container/btree_map.h"
+#include "metrics/metrics.h"
 #include "model/transform.h"
 #include "ssx/mutex.h"
 #include "wasm/engine.h"
@@ -23,6 +24,7 @@
 #include <seastar/util/noncopyable_function.hh>
 
 #include <optional>
+#include <vector>
 
 namespace wasm {
 
@@ -112,6 +114,77 @@ public:
     void invalidate_factory(model::offset);
 
     /**
+     * Keep this transform's compiled module in memory even while no processor
+     * is using it, so that a processor starting later - typically the one on
+     * the far side of a leadership move - finds it already compiled.
+     *
+     * Every entry in the module cache is a weak reference, so today a module
+     * dies with the last processor that used it and the next start pays the
+     * fetch and the compile again. That is the bulk of a cold start, and it
+     * is paid on the broker that just became responsible for the partition,
+     * at the moment it became responsible.
+     *
+     * Bounded by set_max_resident_factories(), and the bound counts modules
+     * rather than bytes because it has to be applied BEFORE the loader runs:
+     * a module's size is only known once it is compiled
+     * (factory::image_bytes), so a byte bound would have to fetch and compile
+     * in order to discover that it must refuse - spending the exact resource
+     * the bound exists to protect, on every sweep, forever. The byte figure
+     * is reported as a gauge instead, so the count can be sized against real
+     * binaries.
+     *
+     * Returns false when the pin was refused, when the binary could not be
+     * loaded, or when the pin was withdrawn or invalidated while the module
+     * was being compiled. None of those are errors: the caller is
+     * speculative, and the transform runs either way.
+     */
+    ss::future<bool> pin_factory(model::transform_metadata, binary_loader_fn);
+
+    /**
+     * Stop keeping this module in memory. The module still survives while a
+     * processor is using it - this only drops the reference that outlives
+     * them.
+     *
+     * Safe for an offset that is not pinned, since a caller reconciling
+     * against cluster state does not track what it has previously asked for.
+     */
+    void unpin_factory(model::offset);
+
+    /**
+     * Whether this offset is being kept resident. True from the moment a pin
+     * is admitted, so it covers a module that is still being compiled - which
+     * is what a caller reconciling towards a desired set wants, since asking
+     * again would be a no-op.
+     */
+    bool is_resident(model::offset) const;
+
+    /**
+     * The offsets currently kept resident, ascending, for a caller to diff
+     * against the set it wants.
+     */
+    std::vector<model::offset> resident_factories() const;
+
+    /**
+     * How many modules may be kept resident at once. Zero disables residency.
+     *
+     * Lowering this releases modules immediately rather than waiting for them
+     * to be invalidated, so that turning residency down - or off - actually
+     * returns the memory.
+     */
+    void set_max_resident_factories(size_t);
+
+    struct residency_stats {
+        // Slots in use, including a module still being compiled.
+        size_t count = 0;
+        // Executable memory held by the modules that are compiled. A slot
+        // whose compile has not finished contributes nothing yet.
+        size_t image_bytes = 0;
+        // Monotonic count of pins refused for want of a free slot.
+        uint64_t admission_failures = 0;
+    };
+    residency_stats residency() const;
+
+    /**
      * True while some caller holds a factory-creation lock, i.e. a fetch or a
      * compile is in flight somewhere on this broker.
      *
@@ -137,6 +210,48 @@ private:
     ss::future<int64_t> gc_factories();
     ss::future<int64_t> gc_engines();
 
+    /**
+     * The cache lookup without the side effect.
+     *
+     * get_cached_factory stamps the entry as used, because every caller of it
+     * is about to build an engine from what it gets back. Residency's own
+     * bookkeeping must not do that, or the module it just pinned would look
+     * like one a transform had asked for and stop being the first thing
+     * evicted.
+     */
+    ss::optimized_optional<ss::shared_ptr<factory>> find_cached(model::offset);
+
+    /**
+     * Drop the oldest resident module that no transform has ever asked for,
+     * returning false if every resident module has been used.
+     *
+     * Refusing a new pin rather than evicting a module in use is deliberate.
+     * With N+1 transforms competing for N slots, evicting the one being used
+     * means it recompiles the next time its partition moves AND the newcomer
+     * that displaced it never gets used either - a loop of cold starts on the
+     * single thread that compiles, which is worse than not pre-warming the
+     * newcomer at all.
+     */
+    bool evict_unused();
+
+    void register_metrics();
+
+    struct resident_entry {
+        // The strong reference that is the entire point: _factory_cache holds
+        // only weak ones. Null while the module is still being fetched and
+        // compiled - the entry is created the moment the pin is admitted, so
+        // the bound is decided once, before any work, and a pin that suspends
+        // cannot let a concurrent one overshoot it.
+        ss::shared_ptr<factory> strong;
+        size_t image_bytes = 0;
+        ss::lowres_clock::time_point pinned_at{};
+        // When a caller last took this module out of the cache in order to
+        // build an engine from it. Default-constructed means residency has
+        // never paid off here, which is what makes it the first candidate for
+        // eviction.
+        ss::lowres_clock::time_point last_used_at{};
+    };
+
     /*
      * This map holds locks for creating factories.
      *
@@ -152,10 +267,14 @@ private:
     // that lands mid-fetch or mid-compile is not immediately undone by the
     // insert of a factory that was linked under the grants being revoked.
     uint64_t _cache_epoch = 0;
+    absl::btree_map<model::offset, resident_entry> _resident;
+    size_t _max_resident_factories = 0;
+    uint64_t _resident_admission_failures = 0;
     ss::sharded<engine_cache> _engine_caches;
     ss::lowres_clock::duration _gc_interval;
     ss::timer<ss::lowres_clock> _gc_timer;
     ss::gate _gate;
+    metrics::public_metric_groups _public_metrics;
 };
 
 } // namespace wasm

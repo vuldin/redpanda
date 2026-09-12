@@ -12,6 +12,7 @@
 #include "wasm/cache.h"
 
 #include "logger.h"
+#include "metrics/prometheus_sanitize.h"
 #include "model/transform.h"
 #include "ssx/future-util.h"
 #include "wasm/wasi_logger.h"
@@ -23,6 +24,8 @@
 #include <seastar/core/when_all.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/util/optimized_optional.hh>
+
+#include <algorithm>
 
 namespace wasm {
 
@@ -233,10 +236,12 @@ public:
     cached_factory(
       ss::foreign_ptr<ss::shared_ptr<factory>> f,
       model::offset offset,
-      ss::sharded<engine_cache>* e)
+      ss::sharded<engine_cache>* e,
+      size_t image_bytes)
       : _offset(offset)
       , _underlying(std::move(f))
-      , _engine_cache(e) {}
+      , _engine_cache(e)
+      , _image_bytes(image_bytes) {}
 
     ss::future<ss::shared_ptr<engine>>
     make_engine(model::ntp ntp, std::unique_ptr<wasm::logger> logger) override {
@@ -274,10 +279,15 @@ public:
         });
     }
 
+    // Copied from the wrapped factory at construction time, on the shard that
+    // owns it, so that reporting it never reaches across a foreign_ptr.
+    size_t image_bytes() const final { return _image_bytes; }
+
 private:
     model::offset _offset;
     ss::foreign_ptr<ss::shared_ptr<factory>> _underlying;
     ss::sharded<engine_cache>* _engine_cache;
+    size_t _image_bytes;
 };
 
 caching_runtime::caching_runtime(std::unique_ptr<runtime> u)
@@ -296,12 +306,19 @@ caching_runtime::~caching_runtime() = default;
 ss::future<> caching_runtime::start(runtime::config c) {
     co_await _underlying->start(c);
     co_await _engine_caches.start();
+    register_metrics();
     _gc_timer.arm(_gc_interval);
 }
 
 ss::future<> caching_runtime::stop() {
     _gc_timer.cancel();
+    _public_metrics.clear();
     co_await _gate.close();
+    // Before _engine_caches.stop(), because a cached_factory holds a raw
+    // pointer to that sharded service. Nothing reaches a resident module
+    // after this point anyway, but the ordering is what makes that true
+    // rather than lucky.
+    _resident.clear();
     co_await _engine_caches.stop();
     co_await _underlying->stop();
 }
@@ -356,8 +373,12 @@ ss::future<ss::shared_ptr<factory>> caching_runtime::get_or_create_factory(
     }
     auto factory = co_await _underlying->make_factory(
       std::move(meta), std::move(*binary));
+    size_t image_bytes = factory->image_bytes();
     auto created = ss::make_shared<cached_factory>(
-      ss::make_foreign(std::move(factory)), offset, &_engine_caches);
+      ss::make_foreign(std::move(factory)),
+      offset,
+      &_engine_caches,
+      image_bytes);
     if (_cache_epoch == epoch_at_start) {
         _factory_cache.insert_or_assign(offset, created->weak_from_this());
     }
@@ -368,17 +389,201 @@ ss::future<ss::shared_ptr<factory>> caching_runtime::get_or_create_factory(
 }
 
 ss::optimized_optional<ss::shared_ptr<factory>>
-caching_runtime::get_cached_factory(const model::transform_metadata& meta) {
-    auto it = _factory_cache.find(meta.source_ptr);
+caching_runtime::find_cached(model::offset offset) {
+    auto it = _factory_cache.find(offset);
     if (it == _factory_cache.end() || !it->second) {
         return {};
     }
     return ss::static_pointer_cast<factory>(it->second->shared_from_this());
 }
 
+ss::optimized_optional<ss::shared_ptr<factory>>
+caching_runtime::get_cached_factory(const model::transform_metadata& meta) {
+    auto found = find_cached(meta.source_ptr);
+    if (found) {
+        // The only reason to take a factory out of the cache is to build an
+        // engine from it, so this is the "residency paid off here" signal,
+        // read off the path a processor already walks rather than reported
+        // separately.
+        auto resident = _resident.find(meta.source_ptr);
+        if (resident != _resident.end()) {
+            resident->second.last_used_at = ss::lowres_clock::now();
+        }
+    }
+    return found;
+}
+
 void caching_runtime::invalidate_factory(model::offset offset) {
     ++_cache_epoch;
     _factory_cache.erase(offset);
+    // A pin is a strong reference, so leaving it in place would keep the
+    // module compiled under the old grants alive - and, worse, make the next
+    // residency sweep see this offset as already warm and never recompile it.
+    _resident.erase(offset);
+}
+
+ss::future<bool> caching_runtime::pin_factory(
+  model::transform_metadata meta, binary_loader_fn load) {
+    model::offset offset = meta.source_ptr;
+    if (_resident.contains(offset)) {
+        co_return true;
+    }
+    if (_resident.size() >= _max_resident_factories && !evict_unused()) {
+        ++_resident_admission_failures;
+        vlog(
+          wasm_log.debug,
+          "not keeping the wasm module at offset {} resident: {} of {} slots "
+          "are in use and a transform is using all of them",
+          offset,
+          _resident.size(),
+          _max_resident_factories);
+        co_return false;
+    }
+    // Take the slot before suspending, so that admission is decided exactly
+    // once per pin no matter what else runs while this one compiles.
+    _resident.emplace(
+      offset, resident_entry{.pinned_at = ss::lowres_clock::now()});
+    auto epoch_at_start = _cache_epoch;
+    auto factory = co_await get_or_create_factory(
+      std::move(meta), std::move(load));
+    auto reservation = _resident.find(offset);
+    if (reservation == _resident.end()) {
+        // unpin_factory or invalidate_factory ran while this was compiling.
+        co_return false;
+    }
+    if (reservation->second.strong) {
+        // Withdrawn and then pinned again while this was compiling, and that
+        // later pin has already landed. Leave its result in place.
+        co_return true;
+    }
+    if (!factory || _cache_epoch != epoch_at_start) {
+        // Either the binary could not be loaded - the loader has already said
+        // why - or a capability change landed while this was compiling, in
+        // which case the module was linked under grants that have since been
+        // revoked and get_or_create_factory declined to cache it for that
+        // same reason. Give the slot back either way; the next sweep pins
+        // whatever gets compiled under the current allowlist.
+        _resident.erase(reservation);
+        co_return false;
+    }
+    reservation->second.image_bytes = factory->image_bytes();
+    reservation->second.strong = std::move(factory);
+    vlog(
+      wasm_log.debug,
+      "keeping the wasm module at offset {} resident ({} bytes of executable "
+      "memory)",
+      offset,
+      reservation->second.image_bytes);
+    co_return true;
+}
+
+void caching_runtime::unpin_factory(model::offset offset) {
+    _resident.erase(offset);
+}
+
+bool caching_runtime::is_resident(model::offset offset) const {
+    return _resident.contains(offset);
+}
+
+std::vector<model::offset> caching_runtime::resident_factories() const {
+    std::vector<model::offset> offsets;
+    offsets.reserve(_resident.size());
+    for (const auto& entry : _resident) {
+        offsets.push_back(entry.first);
+    }
+    return offsets;
+}
+
+void caching_runtime::set_max_resident_factories(size_t max) {
+    _max_resident_factories = max;
+    while (_resident.size() > max) {
+        if (evict_unused()) {
+            continue;
+        }
+        // Unlike admission, refusing is not available here: the operator has
+        // asked for a smaller footprint, so something in use has to go. Give
+        // up whichever module has gone longest without being asked for.
+        _resident.erase(
+          std::min_element(
+            _resident.begin(),
+            _resident.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.second.last_used_at < rhs.second.last_used_at;
+            }));
+    }
+}
+
+caching_runtime::residency_stats caching_runtime::residency() const {
+    residency_stats stats{
+      .count = _resident.size(),
+      .admission_failures = _resident_admission_failures,
+    };
+    for (const auto& entry : _resident) {
+        stats.image_bytes += entry.second.image_bytes;
+    }
+    return stats;
+}
+
+bool caching_runtime::evict_unused() {
+    auto victim = _resident.end();
+    for (auto it = _resident.begin(); it != _resident.end(); ++it) {
+        if (!it->second.strong) {
+            // Still being compiled, so dropping it would free nothing and
+            // throw away work that is already underway.
+            continue;
+        }
+        if (it->second.last_used_at != ss::lowres_clock::time_point{}) {
+            continue;
+        }
+        if (
+          victim == _resident.end()
+          || it->second.pinned_at < victim->second.pinned_at) {
+            victim = it;
+        }
+    }
+    if (victim == _resident.end()) {
+        return false;
+    }
+    vlog(
+      wasm_log.debug,
+      "dropping the resident wasm module at offset {}: no transform has "
+      "asked for it since it was kept",
+      victim->first);
+    _resident.erase(victim);
+    return true;
+}
+
+void caching_runtime::register_metrics() {
+    namespace sm = ss::metrics;
+    _public_metrics.add_group(
+      prometheus_sanitize::metrics_name("wasm_binary"),
+      {
+        sm::make_gauge(
+          "resident_factories",
+          [this] { return _resident.size(); },
+          sm::description(
+            "Number of compiled WebAssembly modules being kept "
+            "in memory so that a transform starting later does "
+            "not have to compile them again"))
+          .aggregate({sm::shard_label}),
+        sm::make_gauge(
+          "resident_memory_usage",
+          [this] { return residency().image_bytes; },
+          sm::description(
+            "The amount of executable memory held by WebAssembly modules "
+            "that are being kept in memory. Divided by the number of "
+            "resident modules, this is what sizing the resident module limit "
+            "costs for these binaries"))
+          .aggregate({sm::shard_label}),
+        sm::make_counter(
+          "resident_admission_failures",
+          [this] { return _resident_admission_failures; },
+          sm::description(
+            "Number of times a WebAssembly module could not be kept in "
+            "memory because the resident module limit was reached and every "
+            "resident module was in use"))
+          .aggregate({sm::shard_label}),
+      });
 }
 
 ss::future<int64_t> caching_runtime::do_gc() {
