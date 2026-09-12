@@ -151,6 +151,18 @@ public:
     // data_transforms_graceful_transfer_timeout_ms. Installed as raft's
     // pre-relinquish hook; a no-op when that property is unset.
     ss::future<> drain_ntp(model::ntp);
+
+    /**
+     * Drain and rebuild every processor for this transform, so a change to
+     * what its binary is allowed to do actually takes effect.
+     *
+     * The wasm engine reads config::wasm_trusted_modules once, in its
+     * constructor, so a running instance keeps whatever it was granted at
+     * start-up. Without this, removing an entry from the allowlist changes
+     * nothing for the module already running under it - and the property is
+     * needs_restart::no, which tells an operator the opposite.
+     */
+    ss::future<> rebuild_transform(model::transform_id);
     // Called when processors have state changes
     void on_transform_state_change(
       model::transform_id, model::ntp, processor::state);
@@ -171,6 +183,7 @@ private:
     ss::future<> handle_leadership_change(model::ntp, ntp_leader);
     // Implementation of `on_plugin_change`
     ss::future<> handle_plugin_change(model::transform_id);
+
     // Implementation of `on_transform_state_change` for errors
     ss::future<> handle_transform_error(model::transform_id, model::ntp);
     // Implementation of `on_transform_state_change` for running states

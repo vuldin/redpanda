@@ -4084,7 +4084,11 @@ configuration::configuration()
       "transform sandbox (e.g. real outbound networking to a fixed set of "
       "targets). Trust follows the exact binary, not the transform name - "
       "redeploying different code under an already-trusted transform name "
-      "does not inherit these capabilities.",
+      "does not inherit these capabilities. Editing this list takes effect on "
+      "running transforms: a transform whose entry changed is drained and "
+      "restarted so it is rebuilt against the new grant, which means removing "
+      "an entry revokes the capability rather than leaving it in place until "
+      "the next redeploy.",
       {
         .needs_restart = needs_restart::no,
         .example

@@ -32,6 +32,8 @@
 
 namespace transform {
 
+class trusted_module_reconciler;
+
 /** Request options for listing committed offsets. */
 struct list_committed_offsets_options {
     // If true, show transforms that we don't have metadata for, these likely
@@ -129,6 +131,7 @@ public:
 
 private:
     void register_notifications();
+
     void unregister_notifications();
 
     ss::future<> cleanup_wasm_binary(uuid_t);
@@ -171,6 +174,10 @@ private:
     // the relay isn't in use. Owned by the application, outlives this
     // service.
     ss::sharded<relay::service>* _relay;
+    // Applies allowlist edits to transforms already running - see
+    // trusted_module_reconciler for why that needs doing and why it is a
+    // separate type.
+    std::unique_ptr<trusted_module_reconciler> _trusted_modules;
 };
 
 } // namespace transform

@@ -94,6 +94,7 @@ redpanda_cc_library(
         "relay_source.cc",
         "transform_manager.cc",
         "transform_processor.cc",
+        "trusted_module_reconciler.cc",
     ],
     hdrs = [
         "io.h",
@@ -103,6 +104,7 @@ redpanda_cc_library(
         "transform_logger.h",
         "transform_manager.h",
         "transform_processor.h",
+        "trusted_module_reconciler.h",
     ],
     implementation_deps = [
         ":logger",

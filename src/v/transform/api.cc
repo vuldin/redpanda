@@ -49,6 +49,7 @@
 #include "transform_logger.h"
 #include "transform_manager.h"
 #include "transform_processor.h"
+#include "trusted_module_reconciler.h"
 #include "wasm/cache.h"
 #include "wasm/engine.h"
 #include "wasm/errc.h"
@@ -923,6 +924,17 @@ ss::future<> service::start() {
 }
 
 void service::register_notifications() {
+    // Keeps running transforms in step with the wasm trust allowlist. Lives
+    // in its own type so it can be tested: this service needs a dozen sharded
+    // dependencies to construct, so anything implemented here is verifiable
+    // only by reading it.
+    _trusted_modules = std::make_unique<trusted_module_reconciler>(
+      [this] { return _plugin_frontend->local().all_transforms(); },
+      [this](model::transform_id id) {
+          return _manager->rebuild_transform(id);
+      });
+    _trusted_modules->start();
+
     auto plugin_notif_id = _plugin_frontend->local().register_for_updates(
       [this](model::transform_id id) { _manager->on_plugin_change(id); });
     _notification_cleanups.emplace_back([this, plugin_notif_id] {
@@ -959,6 +971,13 @@ void service::unregister_notifications() { _notification_cleanups.clear(); }
 ss::future<> service::stop() {
     unregister_notifications();
     co_await _gate.close();
+    // BEFORE the manager: a reconcile in flight is calling
+    // manager::rebuild_transform, so stopping the manager first would leave it
+    // driving a stopped manager. Same start-may-never-have-happened guard as
+    // the members below.
+    if (_trusted_modules) {
+        co_await _trusted_modules->stop();
+    }
     // It's possible to call stop before start, so make sure we created the
     // manager.
     if (_manager) {
