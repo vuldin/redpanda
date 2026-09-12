@@ -1153,22 +1153,33 @@ service::get_factory(model::transform_metadata meta) {
           },
           std::move(meta));
     }
-    auto cached = _runtime->get_cached_factory(meta);
-    if (cached) {
-        co_return ss::make_foreign(*cached);
-    }
-    auto result = co_await _rpc_client->local().load_wasm_binary(
-      meta.source_ptr, wasm_binary_timeout);
-    if (result.has_error()) {
-        vlog(
-          tlog.warn,
-          "unable to load wasm binary for transform {}: {}",
-          meta.name,
-          cluster::error_category().message(int(result.error())));
+    // The fetch is handed over as a callback rather than performed here, so
+    // it runs inside the runtime's per-offset creation lock and therefore at
+    // most once per compile. Doing it here meant every partition of a
+    // transform pulled the same binary over RPC and all but one of those
+    // fetches was discarded by the cache check.
+    auto name = meta.name;
+    auto source = meta.source_ptr;
+    auto factory = co_await _runtime->get_or_create_factory(
+      std::move(meta),
+      [this,
+       name = std::move(name),
+       source]() -> ss::future<std::optional<model::wasm_binary_iobuf>> {
+          auto result = co_await _rpc_client->local().load_wasm_binary(
+            source, wasm_binary_timeout);
+          if (result.has_error()) {
+              vlog(
+                tlog.warn,
+                "unable to load wasm binary for transform {}: {}",
+                name,
+                cluster::error_category().message(int(result.error())));
+              co_return std::nullopt;
+          }
+          co_return std::move(result).value();
+      });
+    if (!factory) {
         co_return ss::foreign_ptr<ss::shared_ptr<wasm::factory>>(nullptr);
     }
-    auto factory = co_await _runtime->make_factory(
-      std::move(meta), std::move(result).value());
     co_return ss::make_foreign(factory);
 }
 

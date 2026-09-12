@@ -181,6 +181,33 @@ public:
         }).get();
     }
 
+    // Counts how many times the loader actually ran, which is the point of
+    // get_or_create_factory: the fetch must happen once per compile, not once
+    // per caller.
+    ss::future<ss::shared_ptr<factory>>
+    get_or_create_async(model::transform_metadata metadata, int* loads) {
+        return _caching_runtime->get_or_create_factory(
+          std::move(metadata),
+          [this,
+           loads]() -> ss::future<std::optional<model::wasm_binary_iobuf>> {
+              ++*loads;
+              // Yield, so a concurrent caller has a chance to observe the
+              // in-progress creation rather than racing past it.
+              co_await ss::yield();
+              co_return model::wasm_binary_iobuf(
+                std::make_unique<iobuf>(_wasm_module.copy()));
+          });
+    }
+    ss::future<ss::shared_ptr<factory>>
+    get_or_create_failing_async(model::transform_metadata metadata) {
+        return _caching_runtime->get_or_create_factory(
+          std::move(metadata),
+          []() -> ss::future<std::optional<model::wasm_binary_iobuf>> {
+              co_return std::nullopt;
+          });
+    }
+    bool is_creating() const { return _caching_runtime->is_creating_factory(); }
+
     int64_t gc() { return _caching_runtime->do_gc().get(); }
     auto* state() { return _fake_runtime->get_state(); }
 
@@ -359,6 +386,68 @@ TEST_F(WasmCacheTest, EngineReplacementBeforeGC) {
     // replaced in the cache instead of being inserted.
     engine = factory->make_engine(ntp, std::make_unique<fake_logger>()).get();
     EXPECT_EQ(state()->engines, 1);
+}
+
+TEST_F(WasmCacheTest, FetchesTheBinaryOncePerCompileNotOncePerCaller) {
+    // The case this exists for: after a leadership move, every partition of a
+    // transform on this broker asks for the same factory at once. The fetch is
+    // an RPC with a 3s timeout, so doing it per caller and discarding all but
+    // one is a real share of a cold start, not a rounding error.
+    auto meta = random_metadata();
+    int loads = 0;
+    auto a = get_or_create_async(meta, &loads);
+    auto b = get_or_create_async(meta, &loads);
+    auto c = get_or_create_async(meta, &loads);
+    auto fa = std::move(a).get();
+    auto fb = std::move(b).get();
+    auto fc = std::move(c).get();
+
+    EXPECT_EQ(loads, 1) << "the binary was fetched more than once";
+    EXPECT_EQ(state()->factories, 1);
+    // And all three callers got the same factory, not one real and two
+    // throwaways.
+    EXPECT_EQ(fa.get(), fb.get());
+    EXPECT_EQ(fb.get(), fc.get());
+}
+
+TEST_F(WasmCacheTest, ACachedFactoryIsReturnedWithoutFetchingAtAll) {
+    auto meta = random_metadata();
+    int loads = 0;
+    auto first = get_or_create_async(meta, &loads).get();
+    ASSERT_EQ(loads, 1);
+
+    auto second = get_or_create_async(meta, &loads).get();
+    EXPECT_EQ(loads, 1) << "a cache hit still fetched the binary";
+    EXPECT_EQ(first.get(), second.get());
+}
+
+TEST_F(WasmCacheTest, AFailedFetchCachesNothingSoTheNextCallerRetries) {
+    // A fetch can fail for reasons that do not recur - the binary topic's
+    // leader moving, an RPC timeout. Caching the failure would strand the
+    // transform until something else evicted it.
+    auto meta = random_metadata();
+    auto failed = get_or_create_failing_async(meta).get();
+    EXPECT_FALSE(failed);
+    EXPECT_EQ(state()->factories, 0);
+
+    int loads = 0;
+    auto retried = get_or_create_async(meta, &loads).get();
+    EXPECT_TRUE(retried);
+    EXPECT_EQ(loads, 1) << "the retry did not attempt a fetch";
+}
+
+TEST_F(WasmCacheTest, IsCreatingFactoryCoversTheFetchNotJustTheCompile) {
+    // Speculative work checks this before queueing behind a compile that a
+    // running transform is blocked on. If it only covered the compile, the
+    // fetch window would look idle.
+    EXPECT_FALSE(is_creating());
+    auto meta = random_metadata();
+    int loads = 0;
+    auto pending = get_or_create_async(meta, &loads);
+    // The loader yields, so creation is in flight here.
+    EXPECT_TRUE(is_creating()) << "a fetch in flight did not register";
+    std::move(pending).get();
+    EXPECT_FALSE(is_creating());
 }
 
 } // namespace wasm
