@@ -16,13 +16,17 @@
 #include "model/tests/random_batch.h"
 #include "model/timestamp.h"
 #include "model/transform.h"
+#include "relay/relay_service.h"
 #include "test_utils/async.h"
 #include "test_utils/random_bytes.h"
+#include "transform/relay_source.h"
+#include "transform/relay_source_env.h"
 #include "transform/tests/test_fixture.h"
 #include "transform/transform_processor.h"
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/condition-variable.hh>
+#include <seastar/core/sleep.hh>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -83,6 +87,9 @@ struct fixture_param {
     // for transform::transform_state_stm - see the guest-state-recovery
     // tests below.
     bool with_state_store = false;
+    // Hands the processor a relay::service, as the application does when
+    // relay consumers are enabled - see the RELAY_DELIVERY tests below.
+    bool with_relay = false;
 };
 
 model::transform_metadata with_max_retries(uint32_t max_retries) {
@@ -94,6 +101,13 @@ model::transform_metadata with_max_retries(uint32_t max_retries) {
 model::transform_metadata with_dead_letter(uint32_t max_retries) {
     auto meta = with_max_retries(max_retries);
     meta.failure_policy.dead_letter_topic = model::random_topic_namespace();
+    return meta;
+}
+
+model::transform_metadata with_relay_delivery(std::string_view mode) {
+    auto meta = testing::my_single_output_metadata;
+    meta.environment.insert_or_assign(
+      ss::sstring(relay_delivery_env_var), ss::sstring(mode));
     return meta;
 }
 
@@ -133,6 +147,9 @@ public:
             _state_store = ss_impl.get();
             state_store = std::move(ss_impl);
         }
+        if (param.with_relay) {
+            _relay.emplace(relay::service::config{.max_queue_size = 1024});
+        }
         _probe.setup_metrics(param.meta);
         _p = std::make_unique<transform::processor>(
           testing::my_transform_id,
@@ -150,7 +167,8 @@ public:
           &_probe,
           &_memory_limits,
           std::move(dead_letter_sink),
-          std::move(state_store));
+          std::move(state_store),
+          _relay ? &_relay.value() : nullptr);
         if (param.autostart) {
             _p->start(nullptr).get();
             // Wait for the initial offset to be committed so we know that the
@@ -377,6 +395,7 @@ public:
           .lag = _probe._lag,
         };
     }
+    relay::service* relay() { return &_relay.value(); }
 
 private:
     static constexpr kafka::offset start_offset = kafka::offset(0);
@@ -385,6 +404,8 @@ private:
       memory_limits::config{.read = 10_MiB, .write = 10_MiB});
     kafka::offset _offset = start_offset;
     model::timestamp _fixed_time = model::timestamp::min();
+    // Declared before _p so it outlives the processor that pushes to it.
+    std::optional<relay::service> _relay;
     std::unique_ptr<transform::processor> _p;
     testing::fake_wasm_engine* _engine = nullptr;
     testing::fake_source* _src = nullptr;
@@ -1314,5 +1335,91 @@ INSTANTIATE_TEST_SUITE_P(
   MultipleOutputsProcessorTest,
   MultipleOutputsProcessorTestFixture,
   ::testing::Values(fixture_param{testing::my_multiple_output_metadata}));
+
+using ProcessorRelayDeliveryTestFixture = ProcessorTestFixture;
+
+namespace {
+
+// Everything a relay consumer has been handed so far; read_batch moves out of
+// the queue, so each call returns only what arrived since the last one.
+int drain_relay(relay_source& consumer) {
+    ss::abort_source as;
+    auto reader = consumer.read_batch(kafka::offset{0}, &as).get();
+    auto batches
+      = model::consume_reader_to_memory(std::move(reader), model::no_timeout)
+          .get();
+    int total = 0;
+    for (const auto& b : batches) {
+        total += b.record_count();
+    }
+    return total;
+}
+
+bool wait_for_relay(relay_source& consumer, int n) {
+    using namespace std::chrono_literals;
+    int seen = 0;
+    for (int i = 0; i < 500 && seen < n; ++i) {
+        seen += drain_relay(consumer);
+        if (seen < n) {
+            ss::sleep(10ms).get();
+        }
+    }
+    return seen == n;
+}
+
+} // namespace
+
+// RELAY_DELIVERY=committed must not hand a record to relay consumers until
+// the write carrying it to the output topic has returned (on a real broker,
+// a quorum-acked produce). The default pushes from the transform callback,
+// before the write is even queued. The sink is corked to hold the write open
+// and make the difference observable; either way each record is relayed
+// exactly once.
+TEST_P(
+  ProcessorRelayDeliveryTestFixture, RelayWaitsForTheWriteOnlyWhenCommitted) {
+    using namespace std::chrono_literals;
+    const bool committed = relay_after_commit(GetParam().meta);
+    const auto output_index = model::output_topic_index(0);
+    relay_source consumer(
+      relay(),
+      model::ntp(
+        model::kafka_namespace,
+        GetParam().meta.output_topics.front().tp,
+        testing::my_ntp.tp.partition));
+    consumer.start().get();
+
+    cork_sink(output_index);
+    auto batch = make_records(1);
+    push_batch(batch);
+    if (committed) {
+        // Ample time for the guest to run and the write to reach the cork.
+        ss::sleep(200ms).get();
+        EXPECT_EQ(drain_relay(consumer), 0)
+          << "committed mode relayed a record before its write returned";
+    } else {
+        EXPECT_TRUE(wait_for_relay(consumer, 1))
+          << "precommit mode did not relay ahead of the corked write";
+    }
+
+    uncork_sink(output_index);
+    EXPECT_THAT(read_records(1), SameRecords(batch));
+    if (committed) {
+        EXPECT_TRUE(wait_for_relay(consumer, 1))
+          << "committed mode never relayed the record after its write";
+    }
+    ss::sleep(50ms).get();
+    EXPECT_EQ(drain_relay(consumer), 0) << "record relayed more than once";
+    EXPECT_TRUE(wait_for_all_committed());
+    consumer.stop().get();
+    EXPECT_EQ(error_count(), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  RelayDeliveryProcessorTest,
+  ProcessorRelayDeliveryTestFixture,
+  ::testing::Values(
+    fixture_param{.meta = with_relay_delivery("precommit"), .with_relay = true},
+    fixture_param{
+      .meta = with_relay_delivery("committed"), .with_relay = true}));
 
 } // namespace transform

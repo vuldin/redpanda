@@ -23,6 +23,7 @@
 #include "relay/relay_service.h"
 #include "ssx/abort_source.h"
 #include "ssx/future-util.h"
+#include "transform/relay_source_env.h"
 #include "wasm/engine.h"
 
 #include <seastar/core/abort_source.hh>
@@ -133,6 +134,7 @@ processor::processor(
   , _dead_letter_sink(std::move(dead_letter_sink))
   , _state_store(std::move(state_store))
   , _relay(relay)
+  , _relay_after_commit(relay_after_commit(_meta))
   , _task(ss::now())
   , _logger(tlog, ss::format("{}/{}", _meta.name(), _ntp.tp.partition())) {
     const auto& outputs = _meta.output_topics;
@@ -643,7 +645,9 @@ ss::future<> processor::run_transform_loop() {
                   // partition's ntp instead. A relay consumer that needs
                   // keyed output should consume the durable output topic
                   // directly.
-                  if (_relay && !partition_key) {
+                  // In committed mode the push happens in the producer loop,
+                  // after the durable write is acknowledged instead.
+                  if (_relay && !partition_key && !_relay_after_commit) {
                       model::topic out_topic
                         = topic ? model::topic(topic.value())
                                 : _meta.output_topics.front().tp;
@@ -743,6 +747,7 @@ ss::future<> processor::run_all_producers(
           output& out = entry.second;
           return run_producer_loop(
                    out.index,
+                   entry.first,
                    &out.queue,
                    out.sink.get(),
                    committed.at(out.index),
@@ -763,6 +768,7 @@ ss::future<> processor::run_all_producers(
 
 ss::future<> processor::run_producer_loop(
   model::output_topic_index index,
+  model::topic topic,
   transfer_queue<transformed_output>* queue,
   sink* sink,
   kafka::offset last_committed,
@@ -795,12 +801,25 @@ ss::future<> processor::run_producer_loop(
           std::optional<iobuf>,
           ss::chunked_fifo<model::transformed_data>>>
           grouped_records;
+        // RELAY_DELIVERY=committed: the records to hand to relay consumers
+        // once this cycle's writes are acknowledged. Same eligibility as the
+        // callback's push (unkeyed only); copied, since the record itself is
+        // moved into its output batch.
+        ss::chunked_fifo<iobuf> relay_after_write;
+        const bool collect_for_relay = _relay != nullptr
+                                       && _relay_after_commit;
         for (auto& entry : popped) {
             ss::visit(
               entry.data,
-              [&grouped_records, &suppress](keyed_transformed_data& kd) {
+              [&grouped_records,
+               &suppress,
+               &relay_after_write,
+               collect_for_relay](keyed_transformed_data& kd) {
                   if (suppress) {
                       return;
+                  }
+                  if (collect_for_relay && !kd.partition_key.has_value()) {
+                      relay_after_write.push_back(kd.data.value().copy());
                   }
                   auto it = std::ranges::find_if(
                     grouped_records, [&kd](const auto& group) {
@@ -875,6 +894,17 @@ ss::future<> processor::run_producer_loop(
                   std::move(batches),
                   partition_key ? std::optional<iobuf>(partition_key->copy())
                                 : std::nullopt);
+            }
+        }
+        // Every write above has returned, and each one awaits a quorum ack
+        // of its output batch (rpc produce with consistency_level::
+        // quorum_ack) - so these records are now as durable as anything a
+        // Kafka consumer of the output topic could fetch.
+        if (!relay_after_write.empty()) {
+            model::ntp relay_ntp(
+              model::kafka_namespace, topic, _ntp.tp.partition);
+            for (const auto& payload : relay_after_write) {
+                _relay->push(relay_ntp, payload);
             }
         }
         if (latest_offset > last_committed) {

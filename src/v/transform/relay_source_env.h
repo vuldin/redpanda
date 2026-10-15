@@ -63,4 +63,20 @@ relay_target_shard(const model::transform_metadata& meta) {
     return ss::shard_id(parsed);
 }
 
+// When the relay hands a producing transform's output to its in-broker
+// consumers. Unset or "precommit" (the default, and the only behaviour before
+// this existed): inside the output callback, before the record is even queued
+// for its durable write - the lowest latency, but a consumer can act on a
+// record that never becomes durable if the leader fails. "committed": only
+// after the output batch carrying it has been acknowledged by a quorum of the
+// output partition's replicas, i.e. what a Kafka consumer of the output topic
+// could read - at the cost of that replication round trip. Set on the
+// PRODUCING transform (the one whose output is relayed), at deploy time.
+inline constexpr std::string_view relay_delivery_env_var = "RELAY_DELIVERY";
+
+inline bool relay_after_commit(const model::transform_metadata& meta) {
+    auto it = meta.environment.find(ss::sstring(relay_delivery_env_var));
+    return it != meta.environment.end() && it->second == "committed";
+}
+
 } // namespace transform

@@ -191,6 +191,7 @@ private:
       absl::flat_hash_map<model::output_topic_index, kafka::offset>);
     ss::future<> run_producer_loop(
       model::output_topic_index,
+      model::topic,
       transfer_queue<transformed_output>*,
       sink*,
       kafka::offset,
@@ -292,6 +293,10 @@ private:
     // pay nothing for a relay they aren't using. Owned by the application,
     // outlives this processor.
     relay::service* _relay;
+    // RELAY_DELIVERY=committed (relay_source_env.h): relay consumers get a
+    // record only after its output write is quorum-acknowledged, pushed from
+    // the producer loop instead of from the transform callback.
+    bool _relay_after_commit;
     ss::lowres_clock::time_point _last_checkpoint_at
       = ss::lowres_clock::time_point::min();
 
