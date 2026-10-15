@@ -116,6 +116,24 @@ public:
         }
     }
 
+    // Guest-state persistence (transform_processor's checkpoint and restore)
+    // and the network/relay push paths all go through these. Without the
+    // forwarding the base-class defaults (false / nullopt) apply: every
+    // processor gets its engine through this wrapper, so checkpoints were
+    // silently never taken and a snapshot could never be restored, while
+    // the unit tests - which drive wasmtime_engine directly - passed.
+    //
+    // Synchronous and unlocked on purpose: the processor calls them between
+    // transform() calls for the one partition this cached engine serves,
+    // and the guest only ever runs inside transform(), so there is no
+    // invocation in flight to tear the region under.
+    bool write_shared_memory(bytes_view data) override {
+        return _underlying->write_shared_memory(data);
+    }
+    std::optional<iobuf> read_shared_memory() override {
+        return _underlying->read_shared_memory();
+    }
+
     ~shared_engine() override {
         vassert(
           _ref_count == 0, "expected engine to be stopped before destruction");
