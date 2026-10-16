@@ -31,6 +31,9 @@ public:
 
     void increment_read_bytes(uint64_t bytes);
     void increment_write_bytes(model::output_topic_index, uint64_t bytes);
+    /// The number of output topics this probe was set up for: its per-output
+    /// lag and write_bytes series exist for exactly that many.
+    size_t output_topic_count() const { return _write_bytes.size(); }
     void increment_failure();
     // A batch exhausted transform_failure_policy::max_retries and the
     // processor gave up on it (skipped it, or dead-lettered it first) -

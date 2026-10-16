@@ -602,7 +602,28 @@ ss::lw_shared_ptr<probe>
 manager<ClockType>::get_or_create_probe(const model::transform_metadata& meta) {
     auto it = _probes.find(meta.name());
     if (it != _probes.end()) {
-        return it->second;
+        if (it->second->output_topic_count() == meta.output_topics.size()) {
+            return it->second;
+        }
+        // The name was redeployed with a different number of output topics.
+        // Probes are cached by name and outlive a deletion, so the cached one
+        // still has the old deployment's per-output series: reusing it
+        // indexed past them (a broker crashed on 2026-10-16). Once nothing but
+        // this cache holds it - a delete erases every processor first - drop
+        // it, so its metrics deregister, and build one for the new outputs.
+        if (it->second.use_count() > 1) {
+            vlog(
+              tlog.warn,
+              "transform {} now has {} output topics but {} processor(s) of a "
+              "deployment with {} are still running; its per-output metrics "
+              "are incomplete until they stop",
+              meta.name,
+              meta.output_topics.size(),
+              it->second.use_count() - 1,
+              it->second->output_topic_count());
+            return it->second;
+        }
+        _probes.erase(it);
     }
     auto p = ss::make_lw_shared<transform::probe>();
     p->setup_metrics(meta);

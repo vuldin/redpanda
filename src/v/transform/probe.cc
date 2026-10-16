@@ -225,9 +225,18 @@ void probe::setup_metrics(const model::transform_metadata& meta) {
     _public_metrics.add_group(
       prometheus_sanitize::metrics_name("transform"), metric_defs);
 }
+// Both per-output updates ignore an index past the outputs this probe was set
+// up for rather than fault: a transform manager that ever hands a processor a
+// probe from a deployment with fewer output topics loses a metric instead of
+// the broker. (_write_bytes[idx] here trapped with SIGILL under hardened
+// libc++ on 2026-10-16; report_lag's .at() made the transform fail with
+// std::out_of_range.) transform_manager::get_or_create_probe is what should
+// keep that from happening.
 void probe::increment_write_bytes(
   model::output_topic_index idx, uint64_t bytes) {
-    _write_bytes[idx()] += bytes;
+    if (idx() < _write_bytes.size()) {
+        _write_bytes[idx()] += bytes;
+    }
 }
 void probe::increment_read_bytes(uint64_t bytes) { _read_bytes += bytes; }
 void probe::increment_failure() { ++_failures; }
@@ -242,7 +251,10 @@ void probe::state_change(processor_state_change change) {
     }
 }
 void probe::report_lag(model::output_topic_index idx, int64_t delta) {
-    _lag.at(idx()) += delta;
+    if (idx() >= _lag.size()) {
+        return;
+    }
+    _lag[idx()] += delta;
 }
 void probe::record_input_delay(model::timestamp source_batch_timestamp) {
     if (auto delay = delay_since(source_batch_timestamp); delay.has_value()) {

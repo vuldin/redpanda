@@ -173,9 +173,12 @@ std::ostream& operator<<(std::ostream& os, lifecycle_status s) {
 
 class processor_tracker : public processor_factory {
     class tracked_processor : public processor {
-        static std::vector<std::unique_ptr<sink>> make_sink() {
+        // One per output topic: the processor asserts the two match.
+        static std::vector<std::unique_ptr<sink>> make_sinks(size_t outputs) {
             std::vector<std::unique_ptr<sink>> sinks;
-            sinks.push_back(std::make_unique<testing::fake_sink>());
+            for (size_t i = 0; i < outputs; ++i) {
+                sinks.push_back(std::make_unique<testing::fake_sink>());
+            }
             return sinks;
         }
 
@@ -191,11 +194,13 @@ class processor_tracker : public processor_factory {
           : processor(
               id,
               std::move(ntp),
-              std::move(meta),
+              // A copy, not a move: make_sinks below reads it, and argument
+              // evaluation order is unspecified.
+              meta,
               ss::make_shared<testing::fake_wasm_engine>(),
               [](auto, auto, auto) {},
               std::make_unique<testing::fake_source>(),
-              make_sink(),
+              make_sinks(meta.output_topics.size()),
               std::make_unique<testing::fake_offset_tracker>(),
               p,
               ml)
@@ -424,6 +429,18 @@ public:
         auto id = _registry->put_transform(meta);
         _manager->on_plugin_change(id);
     }
+    // Deploys `name` with `outputs` output topics (out0, out1, ...), keeping
+    // the name fixed - parse_transform derives the name from the topics.
+    void deploy_with_outputs(std::string_view name, size_t outputs) {
+        auto meta = parse_transform(name);
+        meta.output_topics.clear();
+        for (size_t i = 0; i < outputs; ++i) {
+            meta.output_topics.push_back(
+              {model::kafka_namespace, model::topic(ss::format("out{}", i))});
+        }
+        auto id = _registry->put_transform(meta);
+        _manager->on_plugin_change(id);
+    }
     void delete_transform(std::string_view name) {
         auto meta = parse_transform(name);
         auto id = _registry->delete_transform(meta.name);
@@ -463,6 +480,17 @@ public:
                  ? 0
                  : pr->_processor_create_latency.public_histogram_logform()
                      .sample_count;
+    }
+    size_t last_probe_outputs() const {
+        auto* pr = _tracker->last_probe();
+        return pr == nullptr ? 0 : pr->output_topic_count();
+    }
+    // Updates for an output index the probe was not set up for are dropped.
+    void poke_last_probe_past_its_outputs() {
+        auto* pr = _tracker->last_probe();
+        auto past = model::output_topic_index(pr->output_topic_count() + 2);
+        pr->increment_write_bytes(past, 100);
+        pr->report_lag(past, 1);
     }
     bool a_create_was_attempted() const {
         return _tracker->last_probe() != nullptr;
@@ -762,6 +790,30 @@ TEST_F(TransformManagerTest, DeleteTransform) {
     delete_transform("foo->bar");
     drain_queue();
     EXPECT_THAT(status(), status_is("foo->bar/1", lifecycle_status::destroyed));
+}
+
+// A transform deleted and redeployed under the same name with more output
+// topics must get a probe sized for the new outputs. The cached one from the
+// first deployment made the new processor index past its per-output series:
+// std::out_of_range, or a SIGILL that took a broker down (2026-10-16).
+TEST_F(TransformManagerTest, RedeployWithMoreOutputsGetsAProbeSizedForThem) {
+    become_leader("foo/1");
+    deploy_with_outputs("foo->bar", 1);
+    drain_queue();
+    EXPECT_EQ(last_probe_outputs(), 1);
+    delete_transform("foo->bar");
+    drain_queue();
+    deploy_with_outputs("foo->bar", 3);
+    drain_queue();
+    EXPECT_EQ(last_probe_outputs(), 3);
+}
+
+TEST_F(TransformManagerTest, AProbeIgnoresAnOutputIndexItWasNotSetUpFor) {
+    become_leader("foo/1");
+    deploy_with_outputs("foo->bar", 1);
+    drain_queue();
+    poke_last_probe_past_its_outputs(); // neither throws nor faults
+    EXPECT_EQ(last_probe_outputs(), 1);
 }
 
 TEST_F(TransformManagerTest, DeleteTransformWithLostLeader) {
