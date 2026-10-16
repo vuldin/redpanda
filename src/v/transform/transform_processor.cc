@@ -348,6 +348,8 @@ ss::future<> processor::stop() {
     }
     co_await _source->stop();
     co_await _offset_tracker->stop();
+    // A background checkpoint must finish (or fail) before its store goes.
+    co_await std::exchange(_checkpoint_in_flight, ss::now());
     if (_state_store) {
         co_await _state_store->stop();
     }
@@ -426,6 +428,13 @@ ss::future<> processor::maybe_checkpoint_state(bool force) {
       && now - _last_checkpoint_at < checkpoint_interval) {
         co_return;
     }
+    // A periodic checkpoint never waits for the previous one: if it is still
+    // replicating, skip this round and try again after the next batch.
+    if (!force && !_checkpoint_in_flight.available()) {
+        co_return;
+    }
+    // The copy is taken here, between invocations, so it is consistent as
+    // of the last record; only replicating it happens in the background.
     auto state = _engine->read_shared_memory();
     if (!state) {
         // No shared_memory capability grant, or no region registered -
@@ -434,8 +443,25 @@ ss::future<> processor::maybe_checkpoint_state(bool force) {
         _last_checkpoint_at = now;
         co_return;
     }
-    co_await _state_store->save_state(std::move(*state));
     _last_checkpoint_at = now;
+    if (force) {
+        // A drain: the caller needs this checkpoint durable before handing
+        // the partition over, and it must land after any older one.
+        co_await std::exchange(_checkpoint_in_flight, ss::now());
+        co_await _state_store->save_state(std::move(*state));
+        co_return;
+    }
+    // Not awaited by the transform loop. Replicating a multi-MB region
+    // through this partition's raft group used to stall the loop for the
+    // whole round trip every checkpoint_interval.
+    _checkpoint_in_flight = _state_store->save_state(std::move(*state))
+                              .handle_exception([this](
+                                                  const std::exception_ptr& e) {
+                                  vlog(
+                                    _logger.warn,
+                                    "background state checkpoint failed: {}",
+                                    e);
+                              });
 }
 
 ss::future<absl::flat_hash_map<model::output_topic_index, kafka::offset>>

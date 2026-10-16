@@ -117,10 +117,20 @@ public:
     }
 
     ss::future<> save_state(iobuf state) override {
+        ++_saves_started;
+        co_await _uncorked.wait([this] { return !_corked; });
         _state = std::move(state);
         ++_save_count;
-        return ss::now();
     }
+
+    // Hold every save open until uncork_saves(), the way a slow replication
+    // round trip would.
+    void cork_saves() { _corked = true; }
+    void uncork_saves() {
+        _corked = false;
+        _uncorked.broadcast();
+    }
+    uint64_t saves_started() const { return _saves_started; }
 
     // Simulates a snapshot already persisted from a previous run, e.g.
     // before a simulated restart.
@@ -132,6 +142,9 @@ public:
 private:
     std::optional<iobuf> _state;
     uint64_t _save_count = 0;
+    uint64_t _saves_started = 0;
+    bool _corked = false;
+    ss::condition_variable _uncorked;
 };
 
 class fake_source : public source {

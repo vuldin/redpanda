@@ -110,7 +110,13 @@ ss::future<result<model::offset, cluster::errc>> transform_state_stm::replicate(
       raft::consistency_level::quorum_ack,
       _insync_term,
       std::chrono::milliseconds(timeout / 1ms));
-    r_opts.set_force_flush();
+    // No force flush. A guest-state checkpoint describes records already in
+    // this partition's log, so it needs no stronger durability than those
+    // records got - under write caching, a quorum ack held in memory. Forcing
+    // a flush here fsynced the whole partition log every checkpoint, and with
+    // write caching on that put every client produce on the partition behind
+    // it: the produce-leg p99.9 sat at ~3-9ms with snapshots on (2026-10-16,
+    // depth 10,000) against ~1ms without.
     auto r = co_await _raft->replicate(std::move(batch), r_opts);
     if (r.has_error()) {
         vlog(

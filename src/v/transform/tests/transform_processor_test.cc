@@ -317,6 +317,11 @@ public:
     void prime_persisted_state(iobuf state) {
         _state_store->prime_state(std::move(state));
     }
+    void cork_state_saves() { _state_store->cork_saves(); }
+    void uncork_state_saves() { _state_store->uncork_saves(); }
+    uint64_t state_saves_started() const {
+        return _state_store ? _state_store->saves_started() : 0;
+    }
     uint64_t state_store_save_count() const {
         return _state_store ? _state_store->save_count() : 0;
     }
@@ -1095,6 +1100,37 @@ TEST_P(
     auto restored = current_shared_memory();
     ASSERT_TRUE(restored.has_value());
     EXPECT_EQ(*restored, state);
+}
+
+// A checkpoint replicates through the partition's raft group, which takes a
+// round trip and, for a large region, a multi-MB write. The transform loop
+// used to await it, so every checkpoint stalled processing for that long.
+// It now replicates in the background: with the save held open, records keep
+// flowing and offsets keep committing, and the save lands once released.
+TEST_P(
+  ProcessorStateRecoveryTestFixture, SlowCheckpointDoesNotBlockProcessing) {
+    set_shared_memory_registered(true);
+    ASSERT_TRUE(write_shared_memory(tests::random_iobuf()));
+    cork_state_saves();
+
+    // The first batch starts a checkpoint that cannot finish...
+    auto first = make_records(1);
+    push_batch(first);
+    EXPECT_THAT(read_records(1), SameRecords(first));
+    tests::drain_task_queue().get();
+    EXPECT_EQ(state_saves_started(), 1u);
+    EXPECT_EQ(state_store_save_count(), 0u);
+
+    // ...and the processor carries on regardless.
+    auto more = make_records(3);
+    push_batch(more);
+    EXPECT_THAT(read_records(3), SameRecords(more));
+    EXPECT_TRUE(wait_for_all_committed());
+
+    uncork_state_saves();
+    tests::drain_task_queue().get();
+    EXPECT_EQ(state_store_save_count(), 1u);
+    EXPECT_EQ(error_count(), 0);
 }
 
 TEST_P(

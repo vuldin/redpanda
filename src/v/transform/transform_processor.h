@@ -299,6 +299,10 @@ private:
     bool _relay_after_commit;
     ss::lowres_clock::time_point _last_checkpoint_at
       = ss::lowres_clock::time_point::min();
+    // The periodic checkpoint replicating in the background, if any (see
+    // maybe_checkpoint_state). At most one is in flight; a forced
+    // checkpoint and stop() wait for it.
+    ss::future<> _checkpoint_in_flight = ss::now();
 
     ss::abort_source _as;
     ss::future<> _task;
