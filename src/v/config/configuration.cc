@@ -434,6 +434,22 @@ configuration::configuration()
       },
       4_MiB,
       {.min = 64_KiB, .max = 64_MiB})
+  , data_transforms_state_checkpoint_inline(
+      *this,
+      "data_transforms_state_checkpoint_inline",
+      "How a transform's periodic guest-state checkpoint is written. false "
+      "(the default): the region is copied inline and replicated in the "
+      "background, with the same durability as the partition's records. "
+      "true: the transform loop waits for every checkpoint to replicate, and "
+      "each one forces a flush of the partition log - the original "
+      "behaviour, which stalls processing and the partition's produces for "
+      "the round trip every checkpoint. A drain's forced checkpoint is "
+      "always waited for. Takes effect live.",
+      {
+        .needs_restart = needs_restart::no,
+        .visibility = visibility::tunable,
+      },
+      false)
   , topic_memory_per_partition(
       *this,
       "topic_memory_per_partition",

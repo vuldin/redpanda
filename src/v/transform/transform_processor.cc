@@ -444,9 +444,12 @@ ss::future<> processor::maybe_checkpoint_state(bool force) {
         co_return;
     }
     _last_checkpoint_at = now;
-    if (force) {
+    if (
+      force
+      || config::shard_local_cfg().data_transforms_state_checkpoint_inline()) {
         // A drain: the caller needs this checkpoint durable before handing
-        // the partition over, and it must land after any older one.
+        // the partition over, and it must land after any older one. (Or the
+        // operator asked for the original inline checkpoint.)
         co_await std::exchange(_checkpoint_in_flight, ss::now());
         co_await _state_store->save_state(std::move(*state));
         co_return;

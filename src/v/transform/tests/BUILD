@@ -163,6 +163,7 @@ redpanda_cc_gtest(
     deps = [
         ":test_fixture",
         "//src/v/base",
+        "//src/v/config",
         "//src/v/model",
         "//src/v/model/tests:random",
         "//src/v/relay:relay",

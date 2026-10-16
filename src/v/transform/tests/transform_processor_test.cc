@@ -9,6 +9,7 @@
  * by the Apache License, Version 2.0
  */
 
+#include "config/configuration.h"
 #include "gmock/gmock.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -1131,6 +1132,32 @@ TEST_P(
     tests::drain_task_queue().get();
     EXPECT_EQ(state_store_save_count(), 1u);
     EXPECT_EQ(error_count(), 0);
+}
+
+// data_transforms_state_checkpoint_inline=true restores the original
+// behaviour: the loop waits for every checkpoint, so a held save holds
+// processing until it is released.
+TEST_P(
+  ProcessorStateRecoveryTestFixture, InlineCheckpointBlocksUntilSaved) {
+    using namespace std::chrono_literals;
+    config::shard_local_cfg().data_transforms_state_checkpoint_inline.set_value(
+      true);
+    set_shared_memory_registered(true);
+    ASSERT_TRUE(write_shared_memory(tests::random_iobuf()));
+    cork_state_saves();
+
+    auto first = make_records(1);
+    push_batch(first);
+    EXPECT_THAT(read_records(1), SameRecords(first));
+    auto more = make_records(1);
+    push_batch(more);
+    EXPECT_THROW(read_records_within({}, 1, 200ms), ss::condition_variable_timed_out);
+
+    uncork_state_saves();
+    EXPECT_THAT(read_records(1), SameRecords(more));
+    EXPECT_EQ(state_store_save_count(), 1u);
+    config::shard_local_cfg().data_transforms_state_checkpoint_inline.set_value(
+      false);
 }
 
 TEST_P(

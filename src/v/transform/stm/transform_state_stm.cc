@@ -11,6 +11,8 @@
 
 #include "transform/stm/transform_state_stm.h"
 
+#include "config/configuration.h"
+
 #include "cluster/errc.h"
 #include "model/namespace.h"
 #include "model/record.h"
@@ -116,7 +118,11 @@ ss::future<result<model::offset, cluster::errc>> transform_state_stm::replicate(
     // a flush here fsynced the whole partition log every checkpoint, and with
     // write caching on that put every client produce on the partition behind
     // it: the produce-leg p99.9 sat at ~3-9ms with snapshots on (2026-10-16,
-    // depth 10,000) against ~1ms without.
+    // depth 10,000) against ~1ms without. The original forced flush is kept
+    // behind data_transforms_state_checkpoint_inline for comparison.
+    if (config::shard_local_cfg().data_transforms_state_checkpoint_inline()) {
+        r_opts.set_force_flush();
+    }
     auto r = co_await _raft->replicate(std::move(batch), r_opts);
     if (r.has_error()) {
         vlog(
