@@ -163,6 +163,9 @@ struct configuration final : public config_store {
     bounded_property<int16_t> data_transforms_scheduling_group_shares;
     bounded_property<size_t> data_transforms_state_snapshot_max_size;
     property<bool> data_transforms_state_checkpoint_inline;
+    bounded_property<std::chrono::milliseconds>
+      data_transforms_state_checkpoint_interval_ms;
+    bounded_property<size_t> data_transforms_state_checkpoint_chunk_bytes;
 
     // Controller
     bounded_property<std::optional<std::size_t>> topic_memory_per_partition;

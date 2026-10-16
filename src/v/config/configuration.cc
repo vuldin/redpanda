@@ -450,6 +450,39 @@ configuration::configuration()
         .visibility = visibility::tunable,
       },
       false)
+  , data_transforms_state_checkpoint_interval_ms(
+      *this,
+      "data_transforms_state_checkpoint_interval_ms",
+      "Minimum time between a transform's periodic guest-state checkpoints. "
+      "Each checkpoint replicates the guest's registered region through the "
+      "input partition's raft group, so a longer interval means less "
+      "replication on the partition and an older snapshot to restore (and "
+      "more input to replay) after a crash. A drain still checkpoints "
+      "immediately. Takes effect live.",
+      {
+        .needs_restart = needs_restart::no,
+        .example = "5000",
+        .visibility = visibility::tunable,
+      },
+      5s,
+      {.min = 100ms, .max = 1h})
+  , data_transforms_state_checkpoint_chunk_bytes(
+      *this,
+      "data_transforms_state_checkpoint_chunk_bytes",
+      "Split each guest-state checkpoint larger than this into records of at "
+      "most this many bytes, replicated one after another, so the "
+      "partition's produce requests interleave between them instead of "
+      "queueing behind one multi-megabyte entry. A checkpoint becomes "
+      "visible only when all its chunks have applied; a partial one is never "
+      "restored. 0 (the default) writes every checkpoint as one record. "
+      "Takes effect live.",
+      {
+        .needs_restart = needs_restart::no,
+        .example = "65536",
+        .visibility = visibility::tunable,
+      },
+      0,
+      {.min = 0, .max = 64_MiB})
   , topic_memory_per_partition(
       *this,
       "topic_memory_per_partition",

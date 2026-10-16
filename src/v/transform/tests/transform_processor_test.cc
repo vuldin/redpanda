@@ -1160,6 +1160,37 @@ TEST_P(
       false);
 }
 
+// data_transforms_state_checkpoint_interval_ms sets the minimum time between
+// periodic checkpoints, live. With the old fixed 5s the second checkpoint
+// below would never come.
+TEST_P(ProcessorStateRecoveryTestFixture, CheckpointIntervalIsAProperty) {
+    using namespace std::chrono_literals;
+    config::shard_local_cfg()
+      .data_transforms_state_checkpoint_interval_ms.set_value(100ms);
+    set_shared_memory_registered(true);
+    ASSERT_TRUE(write_shared_memory(tests::random_iobuf()));
+
+    push_batch(make_records(1));
+    EXPECT_EQ(read_records(1).size(), 1u);
+    tests::drain_task_queue().get();
+    EXPECT_EQ(state_store_save_count(), 1u);
+
+    // Inside the interval: no second checkpoint.
+    push_batch(make_records(1));
+    EXPECT_EQ(read_records(1).size(), 1u);
+    tests::drain_task_queue().get();
+    EXPECT_EQ(state_store_save_count(), 1u);
+
+    // Past it: the next batch checkpoints again.
+    ss::sleep(250ms).get();
+    push_batch(make_records(1));
+    EXPECT_EQ(read_records(1).size(), 1u);
+    tests::drain_task_queue().get();
+    EXPECT_EQ(state_store_save_count(), 2u);
+    config::shard_local_cfg()
+      .data_transforms_state_checkpoint_interval_ms.reset();
+}
+
 TEST_P(
   ProcessorRequiredStateRecoveryTestFixture,
   FailsLoudlyWhenRequiredStateCannotBeRestored) {

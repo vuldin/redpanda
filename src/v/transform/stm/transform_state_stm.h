@@ -17,6 +17,7 @@
 #include "config/property.h"
 #include "model/transform.h"
 #include "raft/persisted_stm.h"
+#include "transform/stm/state_chunks.h"
 
 #include <absl/container/flat_hash_map.h>
 
@@ -126,6 +127,8 @@ private:
     void apply_record(model::record);
 
     static model::record_batch make_batch(model::transform_id, iobuf state);
+    static model::record_batch
+      make_chunk_batch(model::transform_id, const state_chunk_info&, iobuf);
 
     ss::future<result<model::offset, cluster::errc>>
       replicate(model::record_batch, model::timeout_clock::duration);
@@ -143,6 +146,14 @@ private:
     // anyway, so this is unambiguous.
     absl::flat_hash_map<model::transform_id, iobuf> _state;
     ssx::mutex _write_mutex{"transform::transform_state_stm::write"};
+
+    // Chunked checkpoints in the middle of arriving; see state_chunks.h. Not
+    // part of any snapshot: a replica that installs one mid-checkpoint keeps
+    // the previous complete state until the next checkpoint completes.
+    state_chunk_assembler _chunks;
+    // Seeded from the clock so a new leader's first generation cannot equal
+    // one its predecessor left half-written.
+    uint64_t _next_generation;
 };
 
 class transform_state_stm_factory : public cluster::state_machine_factory {

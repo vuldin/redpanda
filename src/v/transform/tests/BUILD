@@ -27,6 +27,26 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
+    name = "state_chunks_test",
+    timeout = "short",
+    srcs = [
+        "state_chunks_test.cc",
+    ],
+    cpu = 1,
+    memory = "64MiB",
+    deps = [
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:iobuf_parser",
+        "//src/v/model",
+        "//src/v/serde",
+        "//src/v/test_utils:gtest",
+        "//src/v/transform/stm:state_chunks",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
     name = "memory_limiter_test",
     timeout = "short",
     srcs = [

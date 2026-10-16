@@ -51,13 +51,13 @@ namespace {
 // than stalling indefinitely.
 constexpr auto fallback_wait_interval = std::chrono::seconds(1);
 
-// Minimum time between guest-state checkpoints (see
+// The minimum time between guest-state checkpoints is the live property
+// data_transforms_state_checkpoint_interval_ms (default 5s; see
 // processor::maybe_checkpoint_state). A checkpoint replicates through this
 // partition's own raft group, so pacing it well below batch-processing
 // frequency keeps it a coarse, occasional durability improvement rather
 // than a per-record cost on the hot path this whole roadmap exists to keep
 // fast.
-constexpr auto checkpoint_interval = std::chrono::seconds(5);
 
 class queue_output_consumer {
     static constexpr size_t buffer_chunk_size = 8;
@@ -422,10 +422,12 @@ ss::future<> processor::maybe_checkpoint_state(bool force) {
     // than via `now - _last_checkpoint_at`, which overflows the
     // underlying duration when subtracting from min() and would
     // otherwise wrap around to a value that looks smaller than
-    // checkpoint_interval, silently skipping that first checkpoint.
+    // the checkpoint interval, silently skipping that first checkpoint.
     if (
       !force && _last_checkpoint_at != ss::lowres_clock::time_point::min()
-      && now - _last_checkpoint_at < checkpoint_interval) {
+      && now - _last_checkpoint_at
+           < config::shard_local_cfg()
+               .data_transforms_state_checkpoint_interval_ms()) {
         co_return;
     }
     // A periodic checkpoint never waits for the previous one: if it is still

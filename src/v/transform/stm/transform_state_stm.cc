@@ -17,6 +17,7 @@
 #include "model/namespace.h"
 #include "model/record.h"
 #include "model/record_batch_types.h"
+#include "model/timestamp.h"
 #include "raft/consensus.h"
 #include "serde/rw/rw.h"
 #include "storage/record_batch_builder.h"
@@ -56,7 +57,9 @@ transform_state_stm::transform_state_stm(
   config::binding<size_t> max_snapshot_size)
   : raft::persisted_stm<raft::kvstore_backed_stm_snapshot>(
       "transform_state_stm.snapshot", logger, raft, kvstore)
-  , _max_snapshot_size(std::move(max_snapshot_size)) {}
+  , _max_snapshot_size(std::move(max_snapshot_size))
+  , _next_generation(
+      static_cast<uint64_t>(model::timestamp::now().value()) << 16) {}
 
 ss::future<result<model::offset, cluster::errc>> transform_state_stm::put_state(
   model::transform_id id, iobuf state, model::timeout_clock::duration timeout) {
@@ -74,7 +77,37 @@ ss::future<result<model::offset, cluster::errc>> transform_state_stm::put_state(
     if (!co_await sync(timeout)) {
         co_return cluster::errc::not_leader;
     }
-    co_return co_await replicate(make_batch(id, std::move(state)), timeout);
+    const size_t chunk
+      = config::shard_local_cfg().data_transforms_state_checkpoint_chunk_bytes();
+    if (chunk == 0 || state.size_bytes() <= chunk) {
+        co_return co_await replicate(make_batch(id, std::move(state)), timeout);
+    }
+    // One record per chunk, each replicated before the next is issued, so
+    // the partition's own produces interleave between them. The write mutex
+    // keeps another checkpoint's chunks from interleaving with these.
+    vlog(
+      stm_log.debug,
+      "checkpoint for transform {}: {} bytes as {} chunks of <= {} bytes",
+      id,
+      state.size_bytes(),
+      (state.size_bytes() + chunk - 1) / chunk,
+      chunk);
+    auto parts = split_state(std::move(state), chunk);
+    state_chunk_info info{
+      .generation = _next_generation++,
+      .index = 0,
+      .count = static_cast<uint32_t>(parts.size())};
+    model::offset last;
+    for (auto& part : parts) {
+        auto r = co_await replicate(
+          make_chunk_batch(id, info, std::move(part)), timeout);
+        if (r.has_error()) {
+            co_return r;
+        }
+        last = r.value();
+        ++info.index;
+    }
+    co_return last;
 }
 
 ss::future<result<model::offset, cluster::errc>>
@@ -149,6 +182,20 @@ transform_state_stm::make_batch(model::transform_id id, iobuf state) {
     return std::move(builder).build();
 }
 
+model::record_batch transform_state_stm::make_chunk_batch(
+  model::transform_id id, const state_chunk_info& info, iobuf part) {
+    storage::record_batch_builder builder(
+      model::record_batch_type::transform_state_update, model::offset{});
+    chunked_vector<model::record_header> headers;
+    auto k = iobuf::from(state_chunk_header_key);
+    auto v = serde::to_iobuf(info);
+    auto ksz = static_cast<int32_t>(k.size_bytes());
+    auto vsz = static_cast<int32_t>(v.size_bytes());
+    headers.emplace_back(ksz, std::move(k), vsz, std::move(v));
+    builder.add_raw_kw(serde::to_iobuf(id), std::move(part), std::move(headers));
+    return std::move(builder).build();
+}
+
 ss::future<> transform_state_stm::do_apply(const model::record_batch& b) {
     if (b.header().type != model::record_batch_type::transform_state_update) {
         co_return;
@@ -157,8 +204,16 @@ ss::future<> transform_state_stm::do_apply(const model::record_batch& b) {
 }
 
 void transform_state_stm::apply_record(model::record r) {
+    auto chunk = state_chunk_of(r);
     auto id = serde::from_iobuf<model::transform_id>(r.release_key());
     auto value = r.release_value();
+    if (chunk) {
+        if (auto whole = _chunks.add(id, *chunk, std::move(value))) {
+            _state.insert_or_assign(id, std::move(*whole));
+        }
+        return;
+    }
+    _chunks.forget(id);
     if (value.empty()) {
         // Tombstone - see remove_state.
         _state.erase(id);
@@ -169,6 +224,7 @@ void transform_state_stm::apply_record(model::record r) {
 
 ss::future<> transform_state_stm::apply_raft_snapshot(const iobuf& buffer) {
     _state.clear();
+    _chunks.clear();
     if (buffer.empty()) {
         co_return;
     }
@@ -191,6 +247,7 @@ ss::future<raft::local_snapshot_applied>
 transform_state_stm::apply_local_snapshot(
   raft::stm_snapshot_header, iobuf&& buffer) {
     _state.clear();
+    _chunks.clear();
     auto snap = serde::from_iobuf<local_snapshot>(std::move(buffer));
     for (auto& entry : snap.entries) {
         _state.insert_or_assign(entry.id, std::move(entry.state));
