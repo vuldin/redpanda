@@ -1,4 +1,4 @@
-load("//bazel:test.bzl", "redpanda_cc_gtest", "redpanda_test_cc_library")
+load("//bazel:test.bzl", "redpanda_cc_btest", "redpanda_cc_gtest", "redpanda_test_cc_library")
 
 redpanda_cc_gtest(
     name = "commit_batcher_test",
@@ -256,5 +256,41 @@ redpanda_cc_gtest(
         "//src/v/transform:logger",
         "@googletest//:gtest",
         "@seastar",
+    ],
+)
+
+# josh-432: cost of reading a transform's input partition from another shard.
+# Prints a table rather than asserting; see the file's header.
+redpanda_cc_btest(
+    name = "cross_shard_read_bench",
+    timeout = "moderate",
+    srcs = [
+        "cross_shard_read_bench.cc",
+    ],
+    cpu = 2,
+    memory = "4GiB",
+    deps = [
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/cluster:cluster_link_table",
+        "//src/v/cluster:cluster_link_types",
+        "//src/v/cluster:controller_log_limiter",
+        "//src/v/cluster:data_migration_table",
+        "//src/v/cluster:feature_backend",
+        "//src/v/cluster:leader_balancer_strategy",
+        "//src/v/cluster:node_status_backend",
+        "//src/v/cluster:self_test",
+        "//src/v/cluster:topic_metrics_watcher",
+        "//src/v/kafka/data:partition_proxy",
+        "//src/v/kafka/server",
+        "//src/v/model",
+        "//src/v/random:generators",
+        "//src/v/redpanda/tests:fixture",
+        "//src/v/storage:record_batch_builder",
+        "//src/v/test_utils:seastar_boost",
+        "@boost//:test",
+        "@fmt",
+        "@seastar",
+        "@seastar//:testing",
     ],
 )
