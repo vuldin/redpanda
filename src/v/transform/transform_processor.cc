@@ -728,6 +728,7 @@ ss::future<> processor::run_transform_loop() {
         // producer can report end-to-end latency against the input record's
         // own append time.
         auto source_timestamp = batch->header().max_timestamp;
+        auto dequeued_at = std::chrono::steady_clock::now();
         ss::chunked_fifo<model::transformed_data> transformed;
         vlog(_logger.trace, "transforming offset {}", offset);
         // Only copied when dead-lettering is actually configured - the one
@@ -851,7 +852,9 @@ ss::future<> processor::run_transform_loop() {
         for (auto& [_, output] : _outputs) {
             co_await output.queue.push(
               {progress_marker{
-                .offset = offset, .source_timestamp = source_timestamp}},
+                .offset = offset,
+                .source_timestamp = source_timestamp,
+                .dequeued_at = dequeued_at}},
               &_as);
         }
         // Still between invocations - the next batch has not reached the
@@ -927,6 +930,7 @@ ss::future<> processor::run_producer_loop(
         }
         kafka::offset latest_offset = last_committed;
         std::optional<model::timestamp> latest_source_timestamp;
+        std::optional<std::chrono::steady_clock::time_point> latest_dequeued_at;
         // Grouped by output partition key so records with different
         // keys - and therefore different
         // target partitions - never get merged into the same output
@@ -975,6 +979,7 @@ ss::future<> processor::run_producer_loop(
               },
               [&latest_offset,
                &latest_source_timestamp,
+               &latest_dequeued_at,
                &suppress,
                last_committed](const progress_marker& marker) {
                   // Stop supressing new records when we see new records from
@@ -983,6 +988,9 @@ ss::future<> processor::run_producer_loop(
                   // have to replay history.
                   suppress = last_committed > marker.offset;
                   latest_offset = marker.offset;
+                  if (marker.dequeued_at.has_value()) {
+                      latest_dequeued_at = marker.dequeued_at;
+                  }
                   if (marker.source_timestamp.has_value()) {
                       latest_source_timestamp = marker.source_timestamp;
                   }
@@ -1086,6 +1094,10 @@ ss::future<> processor::run_producer_loop(
             // through the pipeline.
             if (latest_source_timestamp.has_value()) {
                 _probe->record_e2e_latency(*latest_source_timestamp);
+            }
+            if (latest_dequeued_at.has_value()) {
+                _probe->record_processing_latency(
+                  std::chrono::steady_clock::now() - *latest_dequeued_at);
             }
         }
     }

@@ -385,6 +385,14 @@ public:
         return _probe._output_write_latency.public_histogram_logform()
           .sample_count;
     }
+    // Read through the seconds-scaled fine-bucket form /public_metrics uses.
+    uint64_t processing_samples() const {
+        return _probe._processing_latency.relay_histogram_logform()
+          .sample_count;
+    }
+    double processing_sum_seconds() const {
+        return _probe._processing_latency.relay_histogram_logform().sample_sum;
+    }
     uint64_t state_restore_samples() const {
         return _probe._state_restore_latency.public_histogram_logform()
           .sample_count;
@@ -1660,6 +1668,23 @@ INSTANTIATE_TEST_SUITE_P(
 
 // josh-425: every output batch write is timed, so a run can split committed
 // relay delivery's wait into replication and the write path around it.
+// The in-broker part of the path is timed on a microsecond clock from the
+// dequeue, once per committed output, so it resolves what the
+// millisecond-timestamp e2e cannot: locally a record goes through in well
+// under a millisecond, which e2e records as 0.
+TEST_P(ProcessorTestFixture, ProcessingLatencyIsTimedInMicroseconds) {
+    auto before = processing_samples();
+    for (int i = 0; i < 3; ++i) {
+        push_batch(make_records(1));
+        EXPECT_EQ(read_records(1).size(), 1u);
+    }
+    EXPECT_TRUE(wait_for_all_committed());
+    EXPECT_GE(processing_samples(), before + 3);
+    EXPECT_GT(processing_sum_seconds(), 0.0)
+      << "every sample was zero: not timed at sub-millisecond resolution";
+    EXPECT_LT(processing_sum_seconds() / double(processing_samples()), 1.0);
+}
+
 TEST_P(ProcessorTestFixture, EveryOutputWriteIsTimed) {
     auto before = output_write_samples();
     for (int i = 0; i < 3; ++i) {

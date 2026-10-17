@@ -117,6 +117,20 @@ void probe::setup_metrics(const model::transform_metadata& meta) {
 
     metric_defs.emplace_back(
       sm::make_histogram(
+        "processing_latency_seconds",
+        sm::description(
+          "A histogram of the time in seconds from the transform loop taking "
+          "a record batch off its input pipe to the resulting output being "
+          "written and its progress committed: the in-broker part of "
+          "e2e_latency_seconds (guest call, queueing, output write, commit) "
+          "at microsecond resolution. e2e_latency_seconds is timed from the "
+          "batch's own timestamp, which is whole milliseconds"),
+        labels,
+        [this] { return _processing_latency.relay_histogram_logform(); })
+        .aggregate({sm::shard_label}));
+
+    metric_defs.emplace_back(
+      sm::make_histogram(
         "output_write_latency_seconds",
         sm::description(
           "A histogram of how long one write of an output batch took, from "

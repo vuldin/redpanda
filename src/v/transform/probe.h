@@ -78,6 +78,19 @@ public:
     void record_e2e_latency(model::timestamp source_batch_timestamp);
 
     /**
+     * Record the time from the transform loop taking a batch off its input
+     * pipe to the output derived from it being written and its progress
+     * committed: the part of the e2e path inside this processor, at
+     * microsecond resolution. e2e_latency is timed from the batch's own
+     * timestamp, which is whole milliseconds, so it cannot resolve this.
+     * One sample per output topic, like e2e_latency.
+     */
+    void record_processing_latency(std::chrono::steady_clock::duration d) {
+        _processing_latency.record(
+          std::chrono::duration_cast<std::chrono::microseconds>(d));
+    }
+
+    /**
      * Time the phases of bringing a processor up.
      *
      * Startup is what a transform pays every time its input partition changes
@@ -156,6 +169,10 @@ private:
       _processor_state;
     hist_t _input_delay;
     hist_t _e2e_latency;
+    // log_hist_internal, not hist_t: its first bucket is 8us rather than
+    // 256us, so the tens-of-microseconds range resolves (exported in
+    // seconds through relay_histogram_logform, as the relay's are).
+    log_hist_internal _processing_latency;
     hist_t _output_write_latency;
     hist_t _startup_latency;
     hist_t _processor_create_latency;

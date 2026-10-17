@@ -74,6 +74,12 @@ struct memory_limits {
 struct progress_marker {
     kafka::offset offset;
     std::optional<model::timestamp> source_timestamp;
+    // When the transform loop took the source batch off the input pipe, on
+    // a microsecond clock: the batch's own timestamp is whole milliseconds
+    // (Kafka's format), too coarse for the in-broker part of the path, so
+    // the producer times dequeue -> written and committed from this
+    // (transform_processing_latency_seconds). nullopt for the priming marker.
+    std::optional<std::chrono::steady_clock::time_point> dequeued_at;
 };
 
 /**
