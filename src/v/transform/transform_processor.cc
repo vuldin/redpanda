@@ -23,6 +23,7 @@
 #include "relay/relay_service.h"
 #include "ssx/abort_source.h"
 #include "ssx/future-util.h"
+#include "transform/partitioned_writes.h"
 #include "transform/relay_source_env.h"
 #include "wasm/engine.h"
 
@@ -881,6 +882,15 @@ ss::future<> processor::run_producer_loop(
                   }
               });
         }
+        // Built here, written below by write_by_partition: different output
+        // partitions concurrently, each partition's batches in order. Written
+        // one after another, a cycle touching N partitions cost N quorum
+        // round trips (keyed demux to 80 partitions: ~25ms per cycle).
+        struct pending_write {
+            std::optional<iobuf> partition_key;
+            ss::chunked_fifo<model::record_batch> batches;
+        };
+        std::vector<pending_write> writes;
         for (auto& [partition_key, records] : grouped_records) {
             while (!records.empty()) {
                 // TODO: Look up the output topic's actual max batch size
@@ -921,12 +931,25 @@ ss::future<> processor::run_producer_loop(
                 // Copied (not moved) so the key survives for any further
                 // size-bounded sub-batches of this same group - iobuf has
                 // no copy constructor, only an explicit copy().
-                co_await sink->write(
-                  std::move(batches),
-                  partition_key ? std::optional<iobuf>(partition_key->copy())
-                                : std::nullopt);
+                writes.push_back(
+                  pending_write{
+                    .partition_key = partition_key
+                                       ? std::optional<iobuf>(
+                                           partition_key->copy())
+                                       : std::nullopt,
+                    .batches = std::move(batches)});
             }
         }
+        co_await write_by_partition(
+          std::move(writes),
+          [sink](const pending_write& w) {
+              return sink->output_partition(w.partition_key);
+          },
+          [sink](pending_write& w) {
+              return sink->write(
+                std::move(w.batches), std::move(w.partition_key));
+          },
+          max_concurrent_partition_writes);
         // Every write above has returned, and each one awaits a quorum ack
         // of its output batch (rpc produce with consistency_level::
         // quorum_ack) - so these records are now as durable as anything a

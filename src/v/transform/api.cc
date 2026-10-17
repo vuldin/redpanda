@@ -179,6 +179,11 @@ public:
         }
     }
 
+    std::optional<model::partition_id>
+    output_partition(const std::optional<iobuf>& partition_key) override {
+        return compute_output_partition(partition_key);
+    }
+
 private:
     model::partition_id
     compute_output_partition(const std::optional<iobuf>& partition_key) {

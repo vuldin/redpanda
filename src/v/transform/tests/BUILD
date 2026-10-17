@@ -47,6 +47,23 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
+    name = "partitioned_writes_test",
+    timeout = "short",
+    srcs = [
+        "partitioned_writes_test.cc",
+    ],
+    cpu = 1,
+    memory = "64MiB",
+    deps = [
+        "//src/v/model",
+        "//src/v/test_utils:gtest",
+        "//src/v/transform:partitioned_writes",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
     name = "memory_limiter_test",
     timeout = "short",
     srcs = [

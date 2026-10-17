@@ -12,6 +12,7 @@
 #pragma once
 
 #include "bytes/iobuf.h"
+#include "model/fundamental.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
 #include "model/timeout_clock.h"
@@ -40,6 +41,17 @@ public:
     virtual ss::future<> write(
       ss::chunked_fifo<model::record_batch>,
       std::optional<iobuf> partition_key) = 0;
+
+    /**
+     * The output partition a write with `partition_key` goes to, or
+     * std::nullopt if this sink cannot say. The processor uses it to write
+     * different partitions concurrently and each partition in order; a sink
+     * that answers std::nullopt has all its writes made one after another.
+     */
+    virtual std::optional<model::partition_id>
+    output_partition(const std::optional<iobuf>& /*partition_key*/) {
+        return std::nullopt;
+    }
 };
 
 /**

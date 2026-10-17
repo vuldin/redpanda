@@ -39,6 +39,18 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "partitioned_writes",
+    hdrs = [
+        "partitioned_writes.h",
+    ],
+    visibility = ["//src/v/transform:__subpackages__"],
+    deps = [
+        "//src/v/model",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "transfer_queue",
     hdrs = [
         "transfer_queue.h",
@@ -110,6 +122,7 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":logger",
+        ":partitioned_writes",
         ":relay_source_env",
         "//src/v/config",
         "//src/v/metrics",
