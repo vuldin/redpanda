@@ -297,6 +297,16 @@ public:
     ss::future<model::record_batch_reader>
     read_batch(kafka::offset offset, ss::abort_source* as) final {
         auto _ = _gate.hold();
+        // What raft had made visible when this read started. An empty read
+        // then waits for the index after it (wait_for_offset), as the fetch
+        // handler's long-poll does: anything appended during the read has
+        // already moved it, so that wait returns at once and nothing is
+        // missed.
+        auto consensus = _partition_for_wait ? _partition_for_wait->raft()
+                                             : nullptr;
+        if (consensus) {
+            _visible_at_read = consensus->last_visible_index();
+        }
         // There currently no way to abort the call to get the sync start, so
         // instead we wrap the resulting future in our abort source.
         auto result = co_await ssx::with_timeout_abortable(
@@ -372,13 +382,17 @@ public:
               .handle_exception([](const std::exception_ptr&) {});
             co_return;
         }
-        // This only promises that `offset` is *likely* visible once it
-        // resolves - `_last_applied` tracks Raft's visible offset, which can
-        // momentarily lead the Kafka last stable offset while a transaction is
-        // open. Callers always re-check via `read_batch` regardless, so a
-        // spurious wakeup here just costs one extra (still empty) read.
+        // Wait for raft to make visible anything past what it had when the
+        // last read started. Not `offset` itself: that is a kafka offset, and
+        // raft's monitor counts log offsets, which run ahead of kafka offsets
+        // by every configuration batch - waiting on it as a log offset is
+        // satisfied at once, and a caught-up processor re-read in a tight
+        // loop (josh-431). The visible index can lead the Kafka last stable
+        // offset while a transaction is open; callers always re-check via
+        // `read_batch`, so such a wakeup just costs one extra empty read.
+        (void)offset;
         co_await consensus->visible_offset_monitor()
-          .wait(kafka::offset_cast(offset), deadline, *as)
+          .wait(model::next_offset(_visible_at_read), deadline, *as)
           .handle_exception([](const std::exception_ptr&) {});
     }
 
@@ -393,6 +407,8 @@ private:
     // construction time, in which case waits just fall back to their
     // deadline.
     ss::lw_shared_ptr<cluster::partition> _partition_for_wait;
+    // Raft's last visible index when the latest read_batch started.
+    model::offset _visible_at_read;
 };
 
 class registry_adapter : public registry {
