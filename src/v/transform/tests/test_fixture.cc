@@ -236,6 +236,7 @@ ss::future<> fake_wasm_engine::transform(
         --_failures_remaining;
         throw std::runtime_error("simulated transform failure");
     }
+    ++_batches_transformed;
     auto it = model::record_batch_copy_iterator::create(batch);
     while (it.has_next()) {
         auto transformed = model::transformed_data::from_record(it.next());

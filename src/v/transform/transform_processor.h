@@ -26,6 +26,7 @@
 #include "wasm/fwd.h"
 
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/util/noncopyable_function.hh>
@@ -220,7 +221,17 @@ private:
     // `force` skips the interval check, for a drain that needs the guest's
     // state written at the same point its offsets were committed rather than
     // whenever the periodic timer next comes round.
-    ss::future<> maybe_checkpoint_state(bool force = false);
+    //
+    // `through` is the last input offset the guest has applied - the copy is
+    // taken between invocations, so the state is exactly that - and is
+    // persisted with it (state_envelope.h). The checkpoint is only written
+    // once every output has written its records through `through`: a state
+    // ahead of its outputs would, after a crash, resume past outputs that
+    // were never written (and that a precommit relay consumer may have seen).
+    ss::future<> maybe_checkpoint_state(kafka::offset through, bool force = false);
+    // Resolves once every output has written (or skipped as already durable)
+    // its records through `offset`, or on stop.
+    ss::future<> wait_written_through(kafka::offset offset);
 
     template<typename... Future>
     ss::future<> when_all_shutdown(Future&&...);
@@ -303,6 +314,26 @@ private:
     // maybe_checkpoint_state). At most one is in flight; a forced
     // checkpoint and stop() wait for it.
     ss::future<> _checkpoint_in_flight = ss::now();
+    // The input offset the restored guest state reflects (state_envelope.h);
+    // std::nullopt with no snapshot, or one from before the envelope. When
+    // set, the input resumes right after it instead of at the committed
+    // output offsets, so the state is replayed forward exactly.
+    std::optional<kafka::offset> _restored_input_offset;
+    // Last input offset the guest applied, for a drain's checkpoint.
+    kafka::offset _last_transformed_offset = kafka::offset::min();
+    // The input offset of the batch being transformed right now: the relay
+    // callback skips records already delivered before a restart.
+    kafka::offset _current_input_offset = kafka::offset::min();
+    // Input records at or below this were delivered before this lifetime:
+    // their outputs are durable (committed) on every output, so a replay of
+    // them from the restored state must not push them to relay consumers
+    // again.
+    kafka::offset _relay_replay_through = kafka::offset::min();
+    // Per output, the input offset its producer has written (or skipped as
+    // already durable) through; signalled on every advance.
+    absl::flat_hash_map<model::output_topic_index, kafka::offset>
+      _written_through;
+    ss::condition_variable _written_cv;
 
     ss::abort_source _as;
     ss::future<> _task;

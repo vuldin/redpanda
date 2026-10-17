@@ -25,6 +25,7 @@
 #include "ssx/future-util.h"
 #include "transform/partitioned_writes.h"
 #include "transform/relay_source_env.h"
+#include "transform/state_envelope.h"
 #include "wasm/engine.h"
 
 #include <seastar/core/abort_source.hh>
@@ -182,6 +183,11 @@ processor::start(std::unique_ptr<probe::hist_t::measurement> bringup) {
     _startup_m = bringup ? std::move(bringup) : _probe->startup_measurement();
     _consumer_as = {};
     _last_read_offset = kafka::offset::min();
+    _restored_input_offset.reset();
+    _last_transformed_offset = kafka::offset::min();
+    _current_input_offset = kafka::offset::min();
+    _relay_replay_through = kafka::offset::min();
+    _written_through.clear();
     // A new lifetime gets a new bounded chance to drain; the previous owner's
     // verdict says nothing about this one's in-flight work.
     _drain_outcome.reset();
@@ -216,6 +222,39 @@ processor::start(std::unique_ptr<probe::hist_t::measurement> bringup) {
                 // next_offset is used here because we want to start at the
                 // offset **after** the last one we've processed.
                 min = std::min(min, kafka::next_offset(offset));
+                _relay_replay_through = std::max(_relay_replay_through, offset);
+            }
+            // A restored state resumes right after the input offset it
+            // reflects, not at the committed offsets: those can be seconds
+            // either side of the state (the two are checkpointed apart), and
+            // resuming from them either re-applies records the state already
+            // has or skips ones it lacks. From the state's own offset the
+            // replay is exact, and outputs already durable are skipped by
+            // the producers as on any replay (`suppress`). Only if the input
+            // no longer holds the records after the state's offset (retention)
+            // is that impossible, and then the committed offsets are all
+            // there is.
+            if (_restored_input_offset) {
+                auto from_state = kafka::next_offset(*_restored_input_offset);
+                if (from_state >= _source->start_offset()) {
+                    vlog(
+                      _logger.info,
+                      "resuming at input offset {}, after the restored "
+                      "state's {} (committed outputs resume at {})",
+                      from_state,
+                      *_restored_input_offset,
+                      min);
+                    min = from_state;
+                } else {
+                    vlog(
+                      _logger.warn,
+                      "the restored state reflects input offset {} but the "
+                      "log now starts at {}: resuming at the committed "
+                      "offsets ({}), the state may be skewed against them",
+                      *_restored_input_offset,
+                      _source->start_offset(),
+                      min);
+                }
             }
             // Mark that we're running now that the start offset is loaded.
             // Stopping the startup clock here rather than when start() returns
@@ -300,7 +339,7 @@ ss::future<bool> processor::drain(model::timeout_clock::time_point deadline) {
     // outside a drain a restored snapshot can be skewed against the resumed
     // offset in either direction.
     if (_state_store && drained) {
-        co_await maybe_checkpoint_state(/*force=*/true)
+        co_await maybe_checkpoint_state(_last_transformed_offset, /*force=*/true)
           .handle_exception([this](const std::exception_ptr& e) {
               // A failed checkpoint is not a failed drain: offsets are already
               // committed, so the next owner replays from the right place with
@@ -334,6 +373,9 @@ ss::future<> processor::stop() {
         _consumer_as.request_abort_ex(ex);
     }
     _as.request_abort_ex(ex);
+    // A checkpoint waiting for outputs that will now never be written gives
+    // up rather than holding stop() (wait_written_through checks _as).
+    _written_cv.broadcast();
     co_await std::exchange(_task, ss::now());
     if (_startup_m) {
         // Torn down before reaching `running`. Cancel so this abandoned start
@@ -387,13 +429,26 @@ ss::future<> processor::restore_guest_state() {
         // something inferred here.
         co_return;
     }
-    if (_engine->write_shared_memory(iobuf_to_bytes(*state))) {
-        vlog(
-          _logger.info,
-          "restored a persisted guest-state snapshot ({} bytes)",
-          state->size_bytes());
+    auto unwrapped = unwrap_state(std::move(*state));
+    if (_engine->write_shared_memory(iobuf_to_bytes(unwrapped.state))) {
+        _restored_input_offset = unwrapped.input_offset;
+        if (unwrapped.input_offset) {
+            vlog(
+              _logger.info,
+              "restored a persisted guest-state snapshot ({} bytes) "
+              "reflecting input offset {}",
+              unwrapped.state.size_bytes(),
+              *unwrapped.input_offset);
+        } else {
+            vlog(
+              _logger.info,
+              "restored a persisted guest-state snapshot ({} bytes) with no "
+              "input offset (written before checkpoints carried one)",
+              unwrapped.state.size_bytes());
+        }
         co_return;
     }
+    state = std::move(unwrapped.state);
     // We have a persisted snapshot but couldn't deliver it into the
     // guest's memory - the binary may have lost its shared_memory
     // capability grant since the snapshot was taken, or this instance's
@@ -413,7 +468,23 @@ ss::future<> processor::restore_guest_state() {
     }
 }
 
-ss::future<> processor::maybe_checkpoint_state(bool force) {
+ss::future<> processor::wait_written_through(kafka::offset offset) {
+    return _written_cv.wait([this, offset] {
+        if (_as.abort_requested()) {
+            return true;
+        }
+        for (const auto& [_, out] : _outputs) {
+            auto it = _written_through.find(out.index);
+            if (it == _written_through.end() || it->second < offset) {
+                return false;
+            }
+        }
+        return true;
+    });
+}
+
+ss::future<>
+processor::maybe_checkpoint_state(kafka::offset through, bool force) {
     if (!_state_store) {
         co_return;
     }
@@ -447,6 +518,12 @@ ss::future<> processor::maybe_checkpoint_state(bool force) {
         co_return;
     }
     _last_checkpoint_at = now;
+    // Tagged with the input offset it reflects, unless nothing has been
+    // applied yet (an empty drain): that one restores like a checkpoint from
+    // before the envelope, at the committed offsets.
+    iobuf payload = through == kafka::offset::min()
+                      ? std::move(*state)
+                      : wrap_state(through, std::move(*state));
     if (
       force
       || config::shard_local_cfg().data_transforms_state_checkpoint_inline()) {
@@ -454,13 +531,25 @@ ss::future<> processor::maybe_checkpoint_state(bool force) {
         // the partition over, and it must land after any older one. (Or the
         // operator asked for the original inline checkpoint.)
         co_await std::exchange(_checkpoint_in_flight, ss::now());
-        co_await _state_store->save_state(std::move(*state));
+        co_await wait_written_through(through);
+        if (_as.abort_requested()) {
+            co_return;
+        }
+        co_await _state_store->save_state(std::move(payload));
         co_return;
     }
     // Not awaited by the transform loop. Replicating a multi-MB region
     // through this partition's raft group used to stall the loop for the
-    // whole round trip every checkpoint_interval.
-    _checkpoint_in_flight = _state_store->save_state(std::move(*state))
+    // whole round trip every checkpoint_interval. Nor is the wait for the
+    // outputs to be written through `through`: that is a few produce round
+    // trips, and the checkpoint is held, not the loop.
+    _checkpoint_in_flight = wait_written_through(through)
+                              .then([this, p = std::move(payload)]() mutable {
+                                  if (_as.abort_requested()) {
+                                      return ss::now();
+                                  }
+                                  return _state_store->save_state(std::move(p));
+                              })
                               .handle_exception([this](
                                                   const std::exception_ptr& e) {
                                   vlog(
@@ -634,6 +723,7 @@ ss::future<> processor::run_transform_loop() {
             continue;
         }
         auto offset = model::offset_cast(batch->last_offset());
+        _current_input_offset = offset;
         // Captured before the batch is handed to the engine so that the
         // producer can report end-to-end latency against the input record's
         // own append time.
@@ -650,6 +740,11 @@ ss::future<> processor::run_transform_loop() {
             batch_for_dead_letter = batch->copy();
         }
         bool gave_up_on_batch = false;
+        // Checkpointed only after this batch's progress markers are queued
+        // below: a checkpoint waits for the outputs to be written through
+        // this offset, which needs those markers - taken before them, an
+        // inline or forced checkpoint would wait forever.
+        bool checkpoint_after = false;
         try {
             co_await _engine->transform(
               std::move(*batch),
@@ -679,7 +774,12 @@ ss::future<> processor::run_transform_loop() {
                   // directly.
                   // In committed mode the push happens in the producer loop,
                   // after the durable write is acknowledged instead.
-                  if (_relay && !partition_key && !_relay_after_commit) {
+                  // A record replayed from a restored state whose output
+                  // was durable before the restart was delivered then: not
+                  // again.
+                  if (
+                    _relay && !partition_key && !_relay_after_commit
+                    && _current_input_offset > _relay_replay_through) {
                       model::topic out_topic
                         = topic ? model::topic(topic.value())
                                 : _meta.output_topics.front().tp;
@@ -706,7 +806,8 @@ ss::future<> processor::run_transform_loop() {
                     .then([] { return wasm::write_success::yes; });
               });
             _consecutive_transform_failures = 0;
-            co_await maybe_checkpoint_state();
+            _last_transformed_offset = offset;
+            checkpoint_after = true;
         } catch (...) {
             // co_await isn't usable inside a catch handler, so this only
             // decides whether to give up - the actual dead-letter write (if
@@ -752,6 +853,11 @@ ss::future<> processor::run_transform_loop() {
               {progress_marker{
                 .offset = offset, .source_timestamp = source_timestamp}},
               &_as);
+        }
+        // Still between invocations - the next batch has not reached the
+        // guest - so the copy is exactly the state through `offset`.
+        if (checkpoint_after) {
+            co_await maybe_checkpoint_state(offset);
         }
     }
 }
@@ -950,6 +1056,10 @@ ss::future<> processor::run_producer_loop(
                 std::move(w.batches), std::move(w.partition_key));
           },
           max_concurrent_partition_writes);
+        // Everything through latest_offset is now written (or was already
+        // durable and skipped): a checkpoint of state through it may land.
+        _written_through[index] = latest_offset;
+        _written_cv.broadcast();
         // Every write above has returned, and each one awaits a quorum ack
         // of its output batch (rpc produce with consistency_level::
         // quorum_ack) - so these records are now as durable as anything a

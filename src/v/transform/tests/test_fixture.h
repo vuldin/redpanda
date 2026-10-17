@@ -97,6 +97,13 @@ private:
     bool _started = false;
     std::optional<std::vector<model::topic>> _output_topics;
     uint32_t _failures_remaining = 0;
+    uint64_t _batches_transformed = 0;
+
+public:
+    // Successful transform() calls, so a test can see a replay happen.
+    uint64_t batches_transformed() const { return _batches_transformed; }
+
+private:
     bool _shared_memory_region_registered = false;
     iobuf _shared_memory_content;
     std::optional<iobuf> _partition_key_to_emit;

@@ -64,6 +64,24 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
+    name = "state_envelope_test",
+    timeout = "short",
+    srcs = [
+        "state_envelope_test.cc",
+    ],
+    cpu = 1,
+    memory = "64MiB",
+    deps = [
+        "//src/v/bytes:iobuf",
+        "//src/v/model",
+        "//src/v/test_utils:gtest",
+        "//src/v/transform:state_envelope",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
     name = "memory_limiter_test",
     timeout = "short",
     srcs = [
@@ -209,6 +227,7 @@ redpanda_cc_gtest(
         "//src/v/transform:impl",
         "//src/v/transform:logger",
         "//src/v/transform:relay_source_env",
+        "//src/v/transform:state_envelope",
         "//src/v/utils:backoff_policy",
         "//src/v/utils:human",
         "@googletest//:gtest",

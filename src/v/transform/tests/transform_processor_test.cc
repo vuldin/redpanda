@@ -22,6 +22,7 @@
 #include "test_utils/random_bytes.h"
 #include "transform/relay_source.h"
 #include "transform/relay_source_env.h"
+#include "transform/state_envelope.h"
 #include "transform/tests/test_fixture.h"
 #include "transform/transform_processor.h"
 
@@ -317,6 +318,10 @@ public:
     }
     void prime_persisted_state(iobuf state) {
         _state_store->prime_state(std::move(state));
+    }
+    iobuf persisted_state() const { return _state_store->state().copy(); }
+    uint64_t batches_transformed() const {
+        return _engine->batches_transformed();
     }
     void cork_state_saves() { _state_store->cork_saves(); }
     void uncork_state_saves() { _state_store->uncork_saves(); }
@@ -1515,5 +1520,138 @@ INSTANTIATE_TEST_SUITE_P(
     fixture_param{.meta = with_relay_delivery("precommit"), .with_relay = true},
     fixture_param{
       .meta = with_relay_delivery("committed"), .with_relay = true}));
+
+// josh-426: a guest-state checkpoint carries the input offset it reflects,
+// and a restart replays the input from there, so the state and the input
+// cannot skew against each other on a crash and a deterministic guest
+// re-emits what it emitted before.
+using ProcessorStateReplayTestFixture = ProcessorTestFixture;
+
+namespace {
+bool wait_until(const std::function<bool()>& done) {
+    using namespace std::chrono_literals;
+    for (int i = 0; i < 500 && !done(); ++i) {
+        ss::sleep(10ms).get();
+    }
+    return done();
+}
+} // namespace
+
+TEST_P(ProcessorStateReplayTestFixture, CheckpointCarriesTheInputOffsetItReflects) {
+    set_shared_memory_registered(true);
+    ASSERT_TRUE(write_shared_memory(tests::random_iobuf()));
+    auto last = push_batch(make_records(1));
+    EXPECT_EQ(read_records(1).size(), 1u);
+    ASSERT_TRUE(wait_until([this] { return state_store_save_count() == 1; }));
+    auto u = unwrap_state(persisted_state());
+    ASSERT_TRUE(u.input_offset.has_value());
+    EXPECT_EQ(*u.input_offset, last);
+}
+
+// A checkpoint ahead of its outputs would, after a crash, resume past
+// outputs that were never written - ones a precommit relay consumer may
+// already have acted on. So it is not written until they are.
+TEST_P(ProcessorStateReplayTestFixture, ACheckpointWaitsUntilItsOutputsAreWritten) {
+    using namespace std::chrono_literals;
+    set_shared_memory_registered(true);
+    ASSERT_TRUE(write_shared_memory(tests::random_iobuf()));
+    const auto out = model::output_topic_index(0);
+    cork_sink(out);
+    auto batch = make_records(1);
+    push_batch(batch);
+    ss::sleep(200ms).get();
+    EXPECT_EQ(state_saves_started(), 0u)
+      << "the checkpoint was written before its output";
+    uncork_sink(out);
+    EXPECT_THAT(read_records(1), SameRecords(batch));
+    EXPECT_TRUE(wait_until([this] { return state_store_save_count() == 1; }));
+}
+
+// The restored state reflects offset 0 while every output has committed
+// through 2: the restart resumes at 1 and re-applies 1 and 2 to the state,
+// writes nothing again (both outputs were already durable), and hands
+// nothing to precommit relay consumers again (they had both). Then a new
+// record flows as usual.
+TEST_P(
+  ProcessorStateReplayTestFixture,
+  ARestartReplaysFromTheRestoredStateNotTheCommittedOffsets) {
+    using namespace std::chrono_literals;
+    set_shared_memory_registered(true);
+    auto state = tests::random_iobuf();
+    ASSERT_TRUE(write_shared_memory(state));
+    for (int i = 0; i < 3; ++i) {
+        push_batch(make_records(1));
+    }
+    EXPECT_EQ(read_records(3).size(), 3u);
+    ASSERT_TRUE(wait_for_all_committed());
+    ASSERT_TRUE(wait_until([this] { return state_store_save_count() >= 1; }));
+    auto transformed_before = batches_transformed();
+
+    stop();
+    prime_persisted_state(wrap_state(kafka::offset(0), state.copy()));
+    relay_source consumer(
+      relay(),
+      model::ntp(
+        model::kafka_namespace,
+        GetParam().meta.output_topics.front().tp,
+        testing::my_ntp.tp.partition));
+    consumer.start().get();
+    start();
+
+    EXPECT_TRUE(wait_until([&] {
+        return batches_transformed() == transformed_before + 2;
+    })) << "offsets 1 and 2 were not re-applied to the restored state";
+    auto restored = current_shared_memory();
+    ASSERT_TRUE(restored.has_value());
+    ss::sleep(100ms).get();
+    EXPECT_TRUE(sink_empty(model::output_topic_index(0)))
+      << "a replayed record's already durable output was written again";
+    EXPECT_EQ(drain_relay(consumer), 0)
+      << "a replayed record was relayed again";
+
+    auto fresh = make_records(1);
+    push_batch(fresh);
+    EXPECT_THAT(read_records(1), SameRecords(fresh));
+    EXPECT_TRUE(wait_for_relay(consumer, 1));
+    consumer.stop().get();
+    EXPECT_EQ(error_count(), 0);
+}
+
+// A checkpoint from before the envelope has no offset: the restart resumes
+// at the committed offsets, as it always did, and replays nothing.
+TEST_P(
+  ProcessorStateReplayTestFixture,
+  ACheckpointWithoutAnOffsetResumesAtTheCommittedOffsets) {
+    set_shared_memory_registered(true);
+    auto state = tests::random_iobuf();
+    ASSERT_TRUE(write_shared_memory(state));
+    for (int i = 0; i < 2; ++i) {
+        push_batch(make_records(1));
+    }
+    EXPECT_EQ(read_records(2).size(), 2u);
+    ASSERT_TRUE(wait_for_all_committed());
+    ASSERT_TRUE(wait_until([this] { return state_store_save_count() >= 1; }));
+    auto transformed_before = batches_transformed();
+
+    prime_persisted_state(state.copy());
+    restart();
+    tests::drain_task_queue().get();
+    auto restored = current_shared_memory();
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(*restored, state);
+    EXPECT_EQ(batches_transformed(), transformed_before);
+
+    auto fresh = make_records(1);
+    push_batch(fresh);
+    EXPECT_THAT(read_records(1), SameRecords(fresh));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  StateReplayProcessorTest,
+  ProcessorStateReplayTestFixture,
+  ::testing::Values(fixture_param{
+    .meta = with_relay_delivery("precommit"),
+    .with_state_store = true,
+    .with_relay = true}));
 
 } // namespace transform

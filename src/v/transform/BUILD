@@ -39,6 +39,19 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "state_envelope",
+    hdrs = [
+        "state_envelope.h",
+    ],
+    visibility = ["//src/v/transform:__subpackages__"],
+    deps = [
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:iobuf_parser",
+        "//src/v/model",
+    ],
+)
+
+redpanda_cc_library(
     name = "partitioned_writes",
     hdrs = [
         "partitioned_writes.h",
@@ -124,6 +137,7 @@ redpanda_cc_library(
         ":logger",
         ":partitioned_writes",
         ":relay_source_env",
+        ":state_envelope",
         "//src/v/config",
         "//src/v/metrics",
         "//src/v/model:batch_compression",
