@@ -381,6 +381,10 @@ public:
         return _probe._engine_start_latency.public_histogram_logform()
           .sample_count;
     }
+    uint64_t output_write_samples() const {
+        return _probe._output_write_latency.public_histogram_logform()
+          .sample_count;
+    }
     uint64_t state_restore_samples() const {
         return _probe._state_restore_latency.public_histogram_logform()
           .sample_count;
@@ -1653,5 +1657,17 @@ INSTANTIATE_TEST_SUITE_P(
     .meta = with_relay_delivery("precommit"),
     .with_state_store = true,
     .with_relay = true}));
+
+// josh-425: every output batch write is timed, so a run can split committed
+// relay delivery's wait into replication and the write path around it.
+TEST_P(ProcessorTestFixture, EveryOutputWriteIsTimed) {
+    auto before = output_write_samples();
+    for (int i = 0; i < 3; ++i) {
+        push_batch(make_records(1));
+        EXPECT_EQ(read_records(1).size(), 1u);
+    }
+    EXPECT_TRUE(wait_for_all_committed());
+    EXPECT_GE(output_write_samples(), before + 3);
+}
 
 } // namespace transform

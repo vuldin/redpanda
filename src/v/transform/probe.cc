@@ -117,6 +117,20 @@ void probe::setup_metrics(const model::transform_metadata& meta) {
 
     metric_defs.emplace_back(
       sm::make_histogram(
+        "output_write_latency_seconds",
+        sm::description(
+          "A histogram of how long one write of an output batch took, from "
+          "handing it to the output sink to the produce returning "
+          "(acknowledged by a quorum of the output partition's replicas). "
+          "Committed relay delivery waits for exactly this; compare its "
+          "_sum/_count with the broker's produce latency to see how much of "
+          "the wait is replication and how much the write path around it"),
+        labels,
+        [this] { return _output_write_latency.public_histogram_logform(); })
+        .aggregate({sm::shard_label}));
+
+    metric_defs.emplace_back(
+      sm::make_histogram(
         "startup_latency_seconds",
         sm::description(
           "A histogram of how long this partition's transform was dark: from "

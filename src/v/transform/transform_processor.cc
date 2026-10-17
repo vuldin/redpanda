@@ -1051,9 +1051,10 @@ ss::future<> processor::run_producer_loop(
           [sink](const pending_write& w) {
               return sink->output_partition(w.partition_key);
           },
-          [sink](pending_write& w) {
-              return sink->write(
-                std::move(w.batches), std::move(w.partition_key));
+          [this, sink](pending_write& w) {
+              return sink
+                ->write(std::move(w.batches), std::move(w.partition_key))
+                .finally([m = _probe->output_write_measurement()] {});
           },
           max_concurrent_partition_writes);
         // Everything through latest_offset is now written (or was already

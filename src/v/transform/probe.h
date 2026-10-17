@@ -132,6 +132,12 @@ public:
     std::unique_ptr<hist_t::measurement> offset_load_measurement() {
         return _offset_load_latency.auto_measure();
     }
+    // One output batch's write: from handing it to the sink to the produce
+    // returning, quorum-acknowledged. RELAY_DELIVERY=committed waits for
+    // exactly this before delivering (josh-425).
+    std::unique_ptr<hist_t::measurement> output_write_measurement() {
+        return _output_write_latency.auto_measure();
+    }
 
 private:
     friend class ProcessorTestFixture;
@@ -150,6 +156,7 @@ private:
       _processor_state;
     hist_t _input_delay;
     hist_t _e2e_latency;
+    hist_t _output_write_latency;
     hist_t _startup_latency;
     hist_t _processor_create_latency;
     hist_t _engine_start_latency;
